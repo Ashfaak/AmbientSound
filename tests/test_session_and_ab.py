@@ -303,3 +303,37 @@ def test_events_json_delete_take_session_and_visuals(tmp_path: Path) -> None:
     del_sess = manager.delete_session(summary.session_id)
     assert del_sess == {"session_id": summary.session_id, "deleted": True}
     assert not (settings.workspace_dir / "sessions" / summary.session_id).exists()
+
+
+def test_cross_branch_trimmed_ab_resolves_shared_ancestor_and_offset(tmp_path: Path) -> None:
+    settings = Settings(workspace_dir=tmp_path / ".ambientsound", allowed_roots=[tmp_path])
+    manager = SessionManager(settings)
+
+    sr = 44100
+    rng = np.random.default_rng(103)
+    audio = rng.normal(0.0, 0.02, size=(sr * 4, 2))
+    src_wav = save_wav(tmp_path / "branch.wav", audio, sr)
+    summary = manager.create_session(src_wav, name="Cross Branch")
+
+    b1 = manager.process_take(
+        summary.session_id,
+        "take_000",
+        [
+            {"filter_name": "trim_range", "params": {"start_s": 0.5, "end_s": 3.5}},
+            {"filter_name": "highpass_rumble", "params": {"cutoff_hz": 50.0}},
+        ],
+        label="Branch A",
+    )
+    b2 = manager.process_take(
+        summary.session_id,
+        "take_000",
+        [
+            {"filter_name": "trim_range", "params": {"start_s": 0.5, "end_s": 3.5}},
+            {"filter_name": "gain", "params": {"gain_db": 4.0}},
+        ],
+        label="Branch B",
+    )
+
+    ab = manager.create_ab_test(summary.session_id, b1.take_id, b2.take_id)
+    assert ab.original_take_id == "take_000"
+    assert abs(ab.original_offset_s - 0.5) < 1e-3

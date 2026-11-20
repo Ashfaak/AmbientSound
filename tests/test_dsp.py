@@ -511,4 +511,8 @@ def test_adaptive_band_attenuate_and_telemetry(tmp_path: Path) -> None:
         telemetry_out=tele_str,
     )
     assert len(tele_str) == 2
+    assert tele_str[0].input_lufs is not None
+    assert tele_str[0].output_lufs is not None
+    assert tele_str[1].input_lufs is not None
+    assert tele_str[1].output_lufs is not None
     assert tele_str[1].details["patched_spans"][0]["crossfade_ms"] == 55.0

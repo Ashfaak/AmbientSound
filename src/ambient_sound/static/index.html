@@ -607,9 +607,20 @@
       if (!state.payload) return;
       const ab = state.payload.ab_test;
       const sid = state.sessionId;
+      const origOff = Number(ab.original_offset_s || 0);
+      const candDur = Math.min(
+        state.payload.takes.a.metrics.duration_s || 0,
+        state.payload.takes.b.metrics.duration_s || 0
+      ) || state.payload.takes.original.metrics.duration_s || 0;
       const qs = state.windowed
         ? `start_s=${state.winStart.toFixed(2)}&end_s=${state.winEnd.toFixed(2)}&`
         : "";
+      let origQs = qs;
+      if (state.windowed && origOff > 0) {
+        origQs = `start_s=${(state.winStart + origOff).toFixed(2)}&end_s=${(state.winEnd + origOff).toFixed(2)}&`;
+      } else if (!state.windowed && origOff > 0 && candDur > 0) {
+        origQs = `start_s=${origOff.toFixed(2)}&end_s=${(origOff + candDur).toFixed(2)}&`;
+      }
       const map = {
         a_diff: `/api/sessions/${sid}/takes/${ab.take_a_id}/diff-spectrogram`,
         b_diff: `/api/sessions/${sid}/takes/${ab.take_b_id}/diff-spectrogram`,
@@ -617,7 +628,8 @@
         b_spec: `/api/sessions/${sid}/takes/${ab.take_b_id}/spectrogram`,
         orig_spec: `/api/sessions/${sid}/takes/${ab.original_take_id}/spectrogram`,
       };
-      el("specImg").src = `${map[state.specTab]}?${qs}t=${Date.now()}`;
+      const useOrigQs = state.specTab === "orig_spec" ? origQs : qs;
+      el("specImg").src = `${map[state.specTab]}?${useOrigQs}t=${Date.now()}`;
       for (const btn of el("specTabs").querySelectorAll(".tab-btn")) {
         btn.classList.toggle("active", btn.dataset.spec === state.specTab);
       }
@@ -663,13 +675,24 @@
       el("audioLoadStatus").textContent = "Loading audio buffers...";
 
       const qs = state.windowed
-        ? `?start_s=${state.winStart.toFixed(3)}&end_s=${state.winEnd.toFixed(3)}`
+        ? `start_s=${state.winStart.toFixed(3)}&end_s=${state.winEnd.toFixed(3)}`
         : "";
+      const origOff = Number(ab.original_offset_s || 0);
+      const candDur = Math.min(
+        state.payload.takes.a.metrics.duration_s || 0,
+        state.payload.takes.b.metrics.duration_s || 0
+      ) || state.payload.takes.original.metrics.duration_s || 0;
+      let origQs = qs;
+      if (state.windowed && origOff > 0) {
+        origQs = `?start_s=${(state.winStart + origOff).toFixed(3)}&end_s=${(state.winEnd + origOff).toFixed(3)}`;
+      } else if (!state.windowed && origOff > 0 && candDur > 0) {
+        origQs = `?start_s=${origOff.toFixed(3)}&end_s=${(origOff + candDur).toFixed(3)}`;
+      }
 
       const [bufA, bufB, bufOrig, bufResA, bufResB] = await Promise.all([
         decodeWavBuffer(`/api/sessions/${sid}/takes/${ab.take_a_id}/audio${qs}`),
         decodeWavBuffer(`/api/sessions/${sid}/takes/${ab.take_b_id}/audio${qs}`),
-        decodeWavBuffer(`/api/sessions/${sid}/takes/${ab.original_take_id}/audio${qs}`),
+        decodeWavBuffer(`/api/sessions/${sid}/takes/${ab.original_take_id}/audio${origQs}`),
         state.payload.takes.a.has_residual
           ? decodeWavBuffer(`/api/sessions/${sid}/takes/${ab.take_a_id}/residual${qs}`)
           : Promise.resolve(null),
@@ -679,7 +702,7 @@
       ]);
 
       state.buffers = { a: bufA, b: bufB, original: bufOrig, res_a: bufResA, res_b: bufResB };
-      state.duration = bufOrig ? bufOrig.duration : 0;
+      state.duration = bufA ? bufA.duration : (bufOrig ? bufOrig.duration : 0);
 
       el("curTime").textContent = `${state.winStart.toFixed(2)}s`;
       el("durTime").textContent = `${(state.winStart + state.duration).toFixed(2)}s`;
@@ -724,7 +747,10 @@
       el("blindBanner").style.display = payload.redacted ? "block" : "none";
       el("testNotes").textContent = ab.notes || "";
 
-      const fullDur = payload.takes.original.metrics.duration_s || 0;
+      const fullDur = Math.min(
+        payload.takes.a.metrics.duration_s || 0,
+        payload.takes.b.metrics.duration_s || 0
+      ) || payload.takes.original.metrics.duration_s || 0;
       if (fullDur > 90.0) {
         state.windowed = true;
         let ws = 0.0;

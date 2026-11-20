@@ -1,4 +1,4 @@
-# AmbientSound MCP — Agent Operational Instructions (`v0.3.0`)
+# AmbientSound MCP — Agent Operational Instructions (`v0.3.1`)
 
 > **Handover Guide for Any AI Model / MCP Agent**
 > Use this document as your complete operational manual for the **AmbientSound** MCP server—covering preflight verification, short and multi-hour (672 MB+) field recordings, wildlife/hive + traffic/machine cleanup, loudness-matched A/B listening feedback, and YouTube/ASMR mastering.
@@ -45,8 +45,8 @@ Your goal is to clean up **field and ambient soundscape recordings** (rain, bee 
 
 Core rules:
 1. **Ambience is the signal.** Avoid heavy `spectral_denoise` on rain, leaves, bees, or water—broadband gating creates metallic/swishy artifacts.
-2. **Patch, cut, or smoothly swell—don't hard-mute.**
-   - Use **`band_attenuate`** with `envelope_mode="swell"` and long `fade_ms` (`800–3000 ms`) for slow `5–20 s` passing cars/motorbikes when they occupy a distinct band.
+2. **Patch, cut, or adaptively attenuate—don't hard-mute.**
+   - Use **`band_attenuate`** with `envelope_mode="adaptive"` and `fade_ms` (`800–3000 ms`) for asymmetric `5–20 s` passing cars/motorbikes so peak reduction follows the real swell excess without hollowing quiet edges (`"swell"` is also available for symmetric bell curves).
    - Use **`ambience_patch`** (`crossfade_ms` up to `5000 ms`) to replace discrete distracting spans with clean matching texture.
    - Use **`cut_regions`** (`crossfade_ms=1000–2500 ms`) on long-form recordings (`1 hour+`) when an unrecoverable vehicle pass or speech stretch is cleaner to remove cleanly than filter.
 3. **Respect overlapping frequencies honestly.** Engine/tyre rumble (`80–1000 Hz`) overlaps `200–300 Hz` honeybee buzz fundamentals. High-pass filtering at `80–120 Hz` cleans subsonic wind/rumble safely below the bees, and `drone_notch` removes narrow machine lines, **but** no pure DSP filter can remove simultaneous broadband engine noise sitting inside `200–800 Hz` without thinning the hive—prefer **`cut_regions`** or **`ambience_patch`** from clean bee-only sections for heavy vehicle passes!
@@ -74,17 +74,17 @@ All tools return JSON objects (`dict`). Unmeasurable metrics (e.g., LUFS on `<0.
 | :--- | :--- | :--- |
 | `health_check` | `()` | Confirms `status`, `version`, `allowed_roots`, `ffmpeg_available`, `workspace_free_gb`, `streaming_threshold_s` (`120.0 s`), and `filter_count` (`15`). |
 | `list_filters` | `()` | Returns `{"filters": [...]}` with exact parameter schemas, bounds, and defaults. |
-| `create_session` | `(audio_path, name="", event_kinds=None, max_events=50, include_events=True)` | Ingests audio into `take_000` in bounded RAM (`shutil.copy2` for WAV; streaming `PCM_24` otherwise), runs streaming analysis (including `loudness_range_lu`, `noise_floor_dbfs`, `short_term_lufs_stats`, `short_term_lufs_timeline`), writes `events.json`, renders overview PNG (`n_fft=8192`). |
+| `create_session` | `(audio_path, name="", event_kinds=None, max_events=50, include_events=True)` | Ingests audio into `take_000` in bounded RAM (`shutil.copy2` for WAV; streaming `PCM_24` otherwise), runs streaming analysis (`loudness_range_lu`, `ambient_bed_dbfs`, `noise_floor_dbfs`, `high_freq_floor_dbfs`, `short_term_lufs_stats`, `short_term_lufs_timeline`), writes `events.json`, renders overview PNG (`n_fft=8192`). |
 | `list_sessions` | `()` | Returns `{"sessions": [...]}` summary list. |
 | `get_session_summary` | `(session_id, event_kinds=None, max_events=50, include_events=True)` | Returns `SessionSummary` (`takes`, `metrics`, `event_counts`, `step_metrics`, bounded `events`, `ab_tests`). |
-| `analyze_take` | `(session_id, take_id, sensitivity="medium", min_event_s=0.12, max_event_s=45.0, freq_range_hz=None, event_kinds=None, max_events=50, include_events=True)` | Full-file streaming analysis. Pass `min_event_s > 0.15` or `event_kinds=["slow_pass", "transient_distraction", "low_freq_rumble"]` to skip thousands of short impulsive clicks. |
+| `analyze_take` | `(session_id, take_id, sensitivity="medium", min_event_s=0.12, max_event_s=45.0, freq_range_hz=None, event_kinds=None, max_events=50, include_events=True)` | Full-file streaming analysis with `30–8000 Hz` median-PSD persistent tonal detection and dual-timescale `1.0 s` slow-pass hysteresis. Pass `min_event_s > 0.15` or `event_kinds=[...]` to skip short clicks. |
 | `analyze_region` | `(session_id, take_id, start_s=0.0, end_s=None, sensitivity="medium", min_event_s=0.12, max_event_s=45.0, freq_range_hz=None, event_kinds=None, max_events=50, include_events=True)` | Analyzes `[start_s, end_s]` with `-92.0 dBFS` gate floor and returns absolute recording timestamps (`+ start_s`). |
 | `render_spectrogram` | `(session_id, take_id, compare_to_take_id="", start_s=None, end_s=None)` | Renders full overview (`>60 s` sampled) or zoomed (`<=60 s`) `n_fft=8192` PNG (suppressing `>40` click markers on waveform) and gain-matched Before/After/Diff PNGs with `Patched` spans shaded. |
-| `process_take` | `(session_id, parent_take_id, steps, label="", notes="", event_kinds=None, max_events=50, include_events=True)` | Runs DSP recipe sequentially (`>120 s` streams file-to-file), writes immutable `take_NNN`, tracks `source_offset_s`/`timeline_modified`, records per-step `step_metrics` & donor provenance, and renders visuals. |
-| `create_ab_test` | `(session_id, take_a_id, take_b_id, focus_start_s=None, focus_end_s=None, blind=False, notes="", original_take_id=None, match_original=False)` | Creates attenuation-only A/B test. `original_take_id=None` auto-selects the earliest ancestor matching both candidates' timeline (e.g., `trim_range` preview root). `match_original=False` (default) matches LUFS between A and B so mastered `-14 LUFS` takes aren't dropped `-35 dB` to a quiet original; set `match_original=True` to include Original in leveling. |
+| `process_take` | `(session_id, parent_take_id, steps, label="", notes="", event_kinds=None, max_events=50, include_events=True)` | Runs DSP recipe sequentially (`>120 s` streams file-to-file), writes immutable `take_NNN`, tracks `source_offset_s`/`timeline_modified`, records per-step `step_metrics` (including RMS, peak & LUFS) & donor provenance, and renders visuals. |
+| `create_ab_test` | `(session_id, take_a_id, take_b_id, focus_start_s=None, focus_end_s=None, blind=False, notes="", original_take_id=None, match_original=False)` | Creates attenuation-only A/B test. `original_take_id=None` auto-selects the shared common ancestor (`take_a`/`take_b` lineage intersection) and computes `original_offset_s` so trimmed previews align automatically. `match_original=False` matches LUFS between A and B. |
 | `list_ab_tests` | `(session_id)` | Returns `{"ab_tests": [...]}` with verdicts and `ui_url`s. |
 | `get_ab_feedback` | `(session_id, ab_id)` | Retrieves `verdict` (`winner`, `artifact_tags`, `comment`, `submitted_at`). |
-| `delete_take` | `(session_id, take_id, cascade=False)` | Deletes an abandoned non-root take (`take_000` protected) and orphaned A/B tests to reclaim workspace disk. |
+| `delete_take` | `(session_id, take_id, cascade=False)` | Deletes an abandoned non-root take (`take_000` protected) and orphaned A/B tests; returns an explicit `ToolError` naming child takes and `cascade=True` if children exist. |
 | `delete_session` | `(session_id)` | Permanently deletes an entire session directory and its takes. |
 | `export_take` | `(session_id, take_id, output_path, format="wav")` | Stream-exports take to `wav` (24-bit), `flac` (24-bit), `mp3` (320k), or `ogg`. |
 

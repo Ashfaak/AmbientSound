@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ambient-sound"
-version = "0.3.0"
+version = "0.3.1"
 description = "MCP-driven ambient audio distraction removal and loudness-matched A/B listening studio"
 readme = "README.md"
 license = "Apache-2.0"

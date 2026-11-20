@@ -63,6 +63,8 @@ class AudioMetrics(BaseModel):
     tonal_peaks_hz: list[float] = Field(default_factory=list)
     loudness_range_lu: float | None = None
     noise_floor_dbfs: float | None = None
+    ambient_bed_dbfs: float | None = None
+    high_freq_floor_dbfs: float | None = None
     short_term_lufs_stats: dict[str, float] | None = None
     short_term_lufs_timeline: list[dict[str, float]] = Field(default_factory=list)
 
@@ -138,6 +140,7 @@ class ABTestRecord(BaseModel):
     take_a_id: str
     take_b_id: str
     original_take_id: str = "take_000"
+    original_offset_s: float = 0.0
     focus_start_s: float | None = None
     focus_end_s: float | None = None
     blind: bool = False

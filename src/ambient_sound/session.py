@@ -525,10 +525,21 @@ class SessionManager:
         take_a: TakeRecord,
         take_b: TakeRecord,
         explicit_original_id: str | None,
-    ) -> str:
+    ) -> tuple[str, float]:
+        def _align_offset(ref: TakeRecord) -> float:
+            if (
+                not take_a.timeline_modified
+                and not take_b.timeline_modified
+                and not ref.timeline_modified
+                and abs(take_a.source_offset_s - take_b.source_offset_s) <= 0.05
+                and take_a.source_offset_s >= ref.source_offset_s
+            ):
+                return round(take_a.source_offset_s - ref.source_offset_s, 4)
+            return 0.0
+
         if explicit_original_id and explicit_original_id.strip():
             ref = self.get_take(summary.session_id, explicit_original_id.strip())
-            return ref.take_id
+            return ref.take_id, _align_offset(ref)
 
         take_map = {t.take_id: t for t in summary.takes}
 
@@ -558,17 +569,19 @@ class SessionManager:
         chain_b = _lineage(take_b.take_id)
         set_b = {t.take_id for t in chain_b}
 
-        # Earliest shared ancestor matching both candidate timelines
+        # Earliest shared common ancestor matching both candidate timelines
         for anc in chain_a:
             if anc.take_id in set_b and _matches_both(anc):
-                return anc.take_id
+                return anc.take_id, 0.0
 
-        # Earliest ancestor of A (e.g., trimmed preview root) matching timeline & duration
+        # Otherwise deepest shared common ancestor (never another branch) with time offset
+        lca: TakeRecord | None = None
         for anc in chain_a:
-            if anc.take_id not in {take_a.take_id, take_b.take_id} and _matches_both(anc):
-                return anc.take_id
-
-        return "take_000" if "take_000" in take_map else chain_a[0].take_id
+            if anc.take_id in set_b:
+                lca = anc
+        if lca is None:
+            lca = take_map.get("take_000", chain_a[0])
+        return lca.take_id, _align_offset(lca)
 
     def create_ab_test(
         self,
@@ -586,7 +599,7 @@ class SessionManager:
         summary = self.get_session(session_id)
         take_a = self.get_take(session_id, take_a_id)
         take_b = self.get_take(session_id, take_b_id)
-        resolved_orig_id = self._resolve_original_take_id(
+        resolved_orig_id, resolved_orig_offset = self._resolve_original_take_id(
             summary, take_a, take_b, original_take_id
         )
         take_o = self.get_take(session_id, resolved_orig_id)
@@ -621,6 +634,7 @@ class SessionManager:
             take_a_id=take_a_id,
             take_b_id=take_b_id,
             original_take_id=resolved_orig_id,
+            original_offset_s=resolved_orig_offset,
             focus_start_s=focus_start_s,
             focus_end_s=focus_end_s,
             blind=blind,

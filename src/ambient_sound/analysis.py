@@ -8,7 +8,7 @@ from typing import Literal
 
 import numpy as np
 import pyloudnorm as pyln
-from scipy import signal
+from scipy import ndimage, signal
 
 from ambient_sound.io_audio import (
     ensure_2d_audio,
@@ -24,6 +24,12 @@ _SENSITIVITY_PARAMS: dict[str, tuple[float, float]] = {
     "low": (10.0, 5.0),
     "medium": (7.0, 3.8),
     "high": (4.5, 2.6),
+}
+
+_SLOW_SENSITIVITY_PARAMS: dict[str, tuple[float, float]] = {
+    "low": (7.0, 5.5),
+    "medium": (5.0, 4.5),
+    "high": (3.5, 3.2),
 }
 
 _RUMBLE_SENSITIVITY_PARAMS: dict[str, tuple[float, float]] = {
@@ -381,50 +387,71 @@ def _detect_tonal_peaks(
     psd: np.ndarray,
     sample_rate: int,
     exclude_freqs: list[float],
-    freqs_low: np.ndarray | None = None,
-    segment_psds_low: list[np.ndarray] | None = None,
+    freqs_band: np.ndarray | None = None,
+    segment_psds_band: list[np.ndarray] | None = None,
 ) -> list[float]:
-    """Detect persistent narrowband machine/drone tonal peaks between 30 Hz and 1000 Hz."""
+    """Detect persistent narrowband tonal peaks (30-8000 Hz) via median-PSD & constant-Q sides."""
     nyquist = sample_rate * 0.5
-    max_f = min(1000.0, nyquist * 0.85)
+    max_f = min(8000.0, nyquist * 0.85)
     if freqs.size < 32 or max_f <= 40.0:
         return []
 
-    psd_db = 10.0 * np.log10(np.maximum(psd, 1e-24))
-    band_indices = np.flatnonzero((freqs >= 30.0) & (freqs <= max_f))
+    check_persistence = (
+        segment_psds_band is not None
+        and len(segment_psds_band) >= 3
+        and freqs_band is not None
+        and freqs_band.size >= 32
+    )
+    if check_persistence:
+        assert freqs_band is not None and segment_psds_band is not None
+        seg_mat = np.asarray(segment_psds_band, dtype=np.float64)
+        work_freqs = freqs_band
+        work_psd = np.median(seg_mat, axis=0)
+        seg_dbs = 10.0 * np.log10(np.maximum(seg_mat, 1e-24))
+    else:
+        work_freqs = freqs
+        work_psd = psd
+        seg_dbs = None
+
+    psd_db = 10.0 * np.log10(np.maximum(work_psd, 1e-24))
+    band_indices = np.flatnonzero((work_freqs >= 30.0) & (work_freqs <= max_f))
     candidates: list[tuple[float, float]] = []
 
     for idx in band_indices:
-        if idx <= 0 or idx >= freqs.size - 1:
+        if idx <= 0 or idx >= work_freqs.size - 1:
             continue
         if psd_db[idx] < psd_db[idx - 1] or psd_db[idx] < psd_db[idx + 1]:
             continue
-        f_cand = float(freqs[idx])
+        f_cand = float(work_freqs[idx])
         if any(abs(f_cand - ex) <= 4.5 for ex in exclude_freqs):
             continue
+        inner = max(6.0, 0.03 * f_cand)
+        outer = max(22.0, 0.12 * f_cand)
         peak_val = float(psd_db[idx])
         prom = _bilateral_prominence_db(
-            freqs, psd_db, f_cand, peak_val, 12.0, nyquist, inner_gap_hz=6.0, outer_span_hz=22.0
+            work_freqs,
+            psd_db,
+            f_cand,
+            peak_val,
+            12.0,
+            nyquist,
+            inner_gap_hz=inner,
+            outer_span_hz=outer,
         )
-        if prom is None or prom <= 7.0 or peak_val <= -108.0:
+        if prom is None or prom <= 7.0 or peak_val <= -112.0:
             continue
 
-        if segment_psds_low is not None and len(segment_psds_low) >= 3 and freqs_low is not None:
-            p_mask = (freqs_low >= f_cand - 3.5) & (freqs_low <= f_cand + 3.5)
-            l_mask = (freqs_low >= max(12.0, f_cand - 22.0)) & (freqs_low <= f_cand - 6.0)
-            r_mask = (freqs_low >= f_cand + 6.0) & (freqs_low <= min(nyquist, f_cand + 22.0))
+        if check_persistence and seg_dbs is not None and freqs_band is not None:
+            half_p = max(3.5, 0.01 * f_cand)
+            p_mask = (freqs_band >= f_cand - half_p) & (freqs_band <= f_cand + half_p)
+            l_mask = (freqs_band >= max(12.0, f_cand - outer)) & (freqs_band <= f_cand - inner)
+            r_mask = (freqs_band >= f_cand + inner) & (freqs_band <= min(nyquist, f_cand + outer))
             if np.any(p_mask) and np.any(l_mask) and np.any(r_mask):
-                persistent_segs = 0
-                for seg_psd in segment_psds_low:
-                    seg_db = 10.0 * np.log10(np.maximum(seg_psd, 1e-24))
-                    seg_pk = float(np.max(seg_db[p_mask]))
-                    seg_prom = min(
-                        seg_pk - float(np.median(seg_db[l_mask])),
-                        seg_pk - float(np.median(seg_db[r_mask])),
-                    )
-                    if seg_prom >= 4.5:
-                        persistent_segs += 1
-                if persistent_segs / float(len(segment_psds_low)) < 0.60:
+                pks = np.max(seg_dbs[:, p_mask], axis=1)
+                l_meds = np.median(seg_dbs[:, l_mask], axis=1)
+                r_meds = np.median(seg_dbs[:, r_mask], axis=1)
+                seg_proms = np.minimum(pks - l_meds, pks - r_meds)
+                if float(np.mean(seg_proms >= 6.0)) < 0.60:
                     continue
 
         candidates.append((f_cand, prom))
@@ -432,7 +459,8 @@ def _detect_tonal_peaks(
     candidates.sort(key=lambda pair: pair[1], reverse=True)
     selected: list[float] = []
     for f_cand, _ in candidates:
-        if any(abs(f_cand - s) < 6.0 for s in selected):
+        min_spacing = max(6.0, 0.04 * f_cand)
+        if any(abs(f_cand - s) < min_spacing for s in selected):
             continue
         selected.append(round(f_cand, 1))
         if len(selected) >= 12:
@@ -582,8 +610,43 @@ def _foreground_events_from_curve(
     med = float(np.median(rms_db))
     mad = float(np.median(np.abs(rms_db - med))) * 1.4826
     threshold = max(med + excess_req, med + mad_mult * max(mad, 1.0))
-    mask = (rms_db > threshold) & (rms_db > -92.0)
-    spans = _merge_intervals(mask, times, win_dur_s, max_gap_s=0.50)
+    fast_mask = (rms_db > threshold) & (rms_db > -92.0)
+    fast_spans = _merge_intervals(fast_mask, times, win_dur_s, max_gap_s=0.50)
+
+    slow_spans: list[tuple[float, float]] = []
+    hop_s = float(times[1] - times[0]) if times.size > 1 else win_dur_s
+    k_1s = max(1, int(round(1.0 / max(hop_s, 1e-3))))
+    if rms_db.size >= max(8, k_1s):
+        sm = ndimage.uniform_filter1d(rms_db, size=k_1s, mode="nearest")
+        med_sm = float(np.median(sm))
+        mad_sm = float(np.median(np.abs(sm - med_sm))) * 1.4826
+        s_ex, s_mad = _SLOW_SENSITIVITY_PARAMS.get(
+            sensitivity, _SLOW_SENSITIVITY_PARAMS["medium"]
+        )
+        thr_sm = max(med_sm + s_ex, med_sm + s_mad * max(mad_sm, 0.5))
+        ext_thr = med_sm + max(1.8, 1.8 * max(mad_sm, 0.5))
+        raw_slow = _merge_intervals(
+            (sm > thr_sm) & (sm > -92.0), times, win_dur_s, max_gap_s=1.5
+        )
+        for s0, e0 in raw_slow:
+            i0 = max(0, min(sm.size - 1, int(np.searchsorted(times, s0, side="left"))))
+            i1 = max(i0, min(sm.size - 1, int(np.searchsorted(times, e0 - win_dur_s, side="left"))))
+            while i0 > 0 and sm[i0 - 1] > ext_thr:
+                i0 -= 1
+            while i1 < sm.size - 1 and sm[i1 + 1] > ext_thr:
+                i1 += 1
+            ns = float(times[i0])
+            ne = float(times[i1]) + win_dur_s
+            if (ne - ns) >= max(2.5, min_event_s):
+                slow_spans.append((ns, ne))
+
+    combined = sorted([*fast_spans, *slow_spans], key=lambda pair: (pair[0], pair[1]))
+    spans: list[tuple[float, float]] = []
+    for cs, ce in combined:
+        if spans and cs - spans[-1][1] <= 0.50:
+            spans[-1] = (spans[-1][0], max(spans[-1][1], ce))
+        else:
+            spans.append((cs, ce))
 
     events: list[DistractionEvent] = []
     for s, e in spans:
@@ -639,6 +702,7 @@ def _build_global_events(
     time_offset_s: float,
     hum_peaks_hz: list[float],
     tonal_peaks_hz: list[float],
+    freq_range_hz: tuple[float, float] | None = None,
 ) -> list[DistractionEvent]:
     events: list[DistractionEvent] = []
     s_abs = round(time_offset_s, 3)
@@ -661,20 +725,21 @@ def _build_global_events(
                 notes=f"Detected {base_guess:.0f} Hz harmonic hum peaks at {hum_peaks_hz} Hz.",
             )
         )
-    if tonal_peaks_hz:
+    for freq_hz in tonal_peaks_hz:
+        if freq_range_hz is not None and (
+            freq_hz < float(freq_range_hz[0]) - 10.0 or freq_hz > float(freq_range_hz[1]) + 10.0
+        ):
+            continue
         events.append(
             DistractionEvent(
                 id="pending",
                 start_s=s_abs,
                 end_s=e_abs,
                 kind="machine_drone",
-                severity="medium" if len(tonal_peaks_hz) == 1 else "high",
-                freq_band_hz=(
-                    round(min(tonal_peaks_hz) - 5.0, 1),
-                    round(max(tonal_peaks_hz) + 5.0, 1),
-                ),
+                severity="medium",
+                freq_band_hz=(round(max(10.0, freq_hz - 5.0), 1), round(freq_hz + 5.0, 1)),
                 peak_db=None,
-                notes=f"Detected persistent tonal drone peaks at {tonal_peaks_hz} Hz.",
+                notes=f"Detected persistent tonal drone peak at {freq_hz} Hz.",
             )
         )
     return events
@@ -684,8 +749,8 @@ def _finalize_spectral_summary(
     freqs: np.ndarray,
     psd: np.ndarray,
     sample_rate: int,
-    freqs_low: np.ndarray | None = None,
-    segment_psds_low: list[np.ndarray] | None = None,
+    freqs_band: np.ndarray | None = None,
+    segment_psds_band: list[np.ndarray] | None = None,
 ) -> tuple[float | None, float | None, float | None, float | None, list[float], list[float]]:
     psd_sum = float(np.sum(psd))
     if psd_sum <= 0.0:
@@ -716,20 +781,25 @@ def _finalize_spectral_summary(
         psd,
         sample_rate,
         hum_peaks,
-        freqs_low=freqs_low,
-        segment_psds_low=segment_psds_low,
+        freqs_band=freqs_band,
+        segment_psds_band=segment_psds_band,
     )
     return centroid_hz, rolloff_hz, flatness, rumble_ratio_db, hum_peaks, tonal_peaks
 
 
-def _noise_floor_from_chunk_rms(chunk_rms_db: list[float] | np.ndarray) -> float | None:
+def _floor_stats_from_chunk_rms(
+    chunk_rms_db: list[float] | np.ndarray,
+) -> tuple[float | None, float | None]:
     arr = np.asarray(chunk_rms_db, dtype=np.float64)
     if arr.size == 0:
-        return None
+        return None, None
     valid = arr[np.isfinite(arr)]
     if valid.size == 0:
-        return None
-    return _finite_or_none(float(np.percentile(valid, 10)), digits=2)
+        return None, None
+    return (
+        _finite_or_none(float(np.percentile(valid, 10)), digits=2),
+        _finite_or_none(float(np.percentile(valid, 50)), digits=2),
+    )
 
 
 def analyze_audio(
@@ -780,9 +850,24 @@ def analyze_audio(
             axis=(1, 2),
         )
         floor_db_arr = 10.0 * np.log10(np.maximum(sq_bins, 1e-24))
-        noise_floor_dbfs = _noise_floor_from_chunk_rms(floor_db_arr)
+        noise_floor_dbfs, ambient_bed_dbfs = _floor_stats_from_chunk_rms(floor_db_arr)
     else:
         noise_floor_dbfs = rms_dbfs
+        ambient_bed_dbfs = rms_dbfs
+
+    high_freq_floor_dbfs: float | None = None
+    if sample_rate > 14000 and n_floor_bins >= 1 and num_samples >= 64:
+        sos_hf_f = signal.butter(
+            4, min(6000.0, sample_rate * 0.35), btype="highpass", fs=sample_rate, output="sos"
+        )
+        hf_mono = signal.sosfiltfilt(sos_hf_f, mono)
+        hf_sq = np.mean(
+            (hf_mono[: n_floor_bins * floor_win] ** 2).reshape(n_floor_bins, floor_win),
+            axis=1,
+        )
+        high_freq_floor_dbfs, _ = _floor_stats_from_chunk_rms(
+            10.0 * np.log10(np.maximum(hf_sq, 1e-24))
+        )
 
     integrated_lufs: float | None = None
     loudness_range_lu: float | None = None
@@ -821,9 +906,9 @@ def analyze_audio(
     if num_samples >= 64 and float(np.max(np.abs(mono))) > 1e-12:
         nperseg = min(num_samples, 16384)
         freqs_ref, psd_ref = signal.welch(mono, fs=sample_rate, nperseg=nperseg)
-        low_mask = freqs_ref <= 1100.0
-        freqs_low = freqs_ref[low_mask]
-        segment_psds_low: list[np.ndarray] = []
+        band_mask = freqs_ref <= 8500.0
+        freqs_band = freqs_ref[band_mask]
+        segment_psds_band: list[np.ndarray] = []
         if duration_s >= 15.0:
             n_segs = min(12, max(3, int(duration_s // 5.0)))
             seg_len = num_samples // n_segs
@@ -831,7 +916,7 @@ def analyze_audio(
                 for seg_idx in range(n_segs):
                     chunk = mono[seg_idx * seg_len : (seg_idx + 1) * seg_len]
                     _, p_seg = signal.welch(chunk, fs=sample_rate, nperseg=nperseg)
-                    segment_psds_low.append(p_seg[low_mask])
+                    segment_psds_band.append(p_seg[band_mask])
         (
             centroid_hz,
             rolloff_hz,
@@ -843,12 +928,16 @@ def analyze_audio(
             freqs_ref,
             psd_ref,
             sample_rate,
-            freqs_low=freqs_low,
-            segment_psds_low=segment_psds_low,
+            freqs_band=freqs_band,
+            segment_psds_band=segment_psds_band,
         )
 
     events: list[DistractionEvent] = _build_global_events(
-        duration_s, time_offset_s, hum_peaks_hz, tonal_peaks_hz
+        duration_s,
+        time_offset_s,
+        hum_peaks_hz,
+        tonal_peaks_hz,
+        freq_range_hz=freq_range_hz,
     )
 
     # Rumble detector
@@ -897,7 +986,7 @@ def analyze_audio(
         med = float(np.median(env))
         sigma = max(float(np.median(np.abs(env - med))) * 1.4826, 1e-7)
         z = (env - med) / sigma
-        hit_idx = np.flatnonzero((z > 10.0) & (env > 5e-3))
+        hit_idx = np.flatnonzero((z > 10.0) & (env > 1e-4))
         hits = [
             (int(i), float(np.max(np.abs(arr[i]))), float(z[i]))
             for i in hit_idx
@@ -1023,6 +1112,8 @@ def analyze_audio(
         tonal_peaks_hz=tonal_peaks_hz,
         loudness_range_lu=loudness_range_lu,
         noise_floor_dbfs=noise_floor_dbfs,
+        ambient_bed_dbfs=ambient_bed_dbfs,
+        high_freq_floor_dbfs=high_freq_floor_dbfs,
         short_term_lufs_stats=short_term_lufs_stats,
         short_term_lufs_timeline=short_term_lufs_timeline,
     )
@@ -1090,13 +1181,26 @@ def analyze_file(
     freqs_ref = np.fft.rfftfreq(nperseg, d=1.0 / sr)
     psd_accum = np.zeros_like(freqs_ref, dtype=np.float64)
     psd_weight = 0
-    low_mask = freqs_ref <= 1100.0
-    freqs_low = freqs_ref[low_mask]
-    segment_psds_low: list[np.ndarray] = []
+    band_mask = freqs_ref <= 8500.0
+    freqs_band = freqs_ref[band_mask]
+    segment_psds_band: list[np.ndarray] = []
 
     floor_hop = max(1, int(0.1 * sr))
     floor_tail = np.zeros(0, dtype=np.float64)
     floor_db_list: list[float] = []
+
+    sos_hf_floor = (
+        signal.butter(4, min(6000.0, sr * 0.35), btype="highpass", fs=sr, output="sos")
+        if sr > 14000
+        else None
+    )
+    zi_hf_floor = (
+        np.zeros((sos_hf_floor.shape[0], 2), dtype=np.float64)
+        if sos_hf_floor is not None
+        else None
+    )
+    hf_floor_tail = np.zeros(0, dtype=np.float64)
+    hf_floor_db_list: list[float] = []
 
     # Stateful filters for rumble, click, and foreground curves
     sos_lp = signal.butter(4, min(80.0, sr * 0.35), btype="lowpass", fs=sr, output="sos")
@@ -1170,11 +1274,23 @@ def analyze_file(
         tp_acc.update(block)
 
         mono = np.mean(block, axis=1)
+        if sos_hf_floor is not None and zi_hf_floor is not None:
+            hf_b, zi_hf_floor = signal.sosfilt(sos_hf_floor, mono, zi=zi_hf_floor)
+            hf_sq = hf_b * hf_b
+            hf_cat = np.concatenate([hf_floor_tail, hf_sq]) if hf_floor_tail.size else hf_sq
+            n_hf = hf_cat.size // floor_hop
+            if n_hf > 0:
+                hf_mat = hf_cat[: n_hf * floor_hop].reshape(n_hf, floor_hop)
+                hf_floor_db_list.extend(10.0 * np.log10(np.maximum(np.mean(hf_mat, axis=1), 1e-24)))
+                hf_floor_tail = hf_cat[n_hf * floor_hop :]
+            else:
+                hf_floor_tail = hf_cat
+
         if mono.size >= nperseg:
             _, p_b = signal.welch(mono, fs=sr, nperseg=nperseg)
             psd_accum += p_b * n_b
             psd_weight += n_b
-            segment_psds_low.append(p_b[low_mask].copy())
+            segment_psds_band.append(p_b[band_mask].copy())
 
         # Rumble curve (125 ms frames)
         if allowed_kinds is None or "low_freq_rumble" in allowed_kinds:
@@ -1196,7 +1312,7 @@ def analyze_file(
             med_b = float(np.median(env_b))
             sig_b = max(float(np.median(np.abs(env_b - med_b))) * 1.4826, 1e-7)
             z_b = (env_b - med_b) / sig_b
-            hits_b = np.flatnonzero((z_b > 10.0) & (env_b > 5e-3))
+            hits_b = np.flatnonzero((z_b > 10.0) & (env_b > 1e-4))
             if hits_b.size > 0:
                 for idx_h in hits_b[:2000]:
                     i_h = int(idx_h)
@@ -1243,7 +1359,14 @@ def analyze_file(
         else None
     )
     dc_offset = _finite_or_none(sum_all / (total_frames * ch), digits=6)
-    noise_floor_dbfs = _noise_floor_from_chunk_rms(floor_db_list) if floor_db_list else rms_dbfs
+    if floor_db_list:
+        noise_floor_dbfs, ambient_bed_dbfs = _floor_stats_from_chunk_rms(floor_db_list)
+    else:
+        noise_floor_dbfs = rms_dbfs
+        ambient_bed_dbfs = rms_dbfs
+    high_freq_floor_dbfs = (
+        _floor_stats_from_chunk_rms(hf_floor_db_list)[0] if hf_floor_db_list else None
+    )
 
     integrated_lufs: float | None = None
     loudness_range_lu: float | None = None
@@ -1287,12 +1410,16 @@ def analyze_file(
             freqs_ref,
             psd_mean,
             sr,
-            freqs_low=freqs_low,
-            segment_psds_low=segment_psds_low,
+            freqs_band=freqs_band,
+            segment_psds_band=segment_psds_band,
         )
 
     events: list[DistractionEvent] = _build_global_events(
-        duration_s, s0, hum_peaks_hz, tonal_peaks_hz
+        duration_s,
+        s0,
+        hum_peaks_hz,
+        tonal_peaks_hz,
+        freq_range_hz=freq_range_hz,
     )
 
     if rumble_db_list and (allowed_kinds is None or "low_freq_rumble" in allowed_kinds):
@@ -1400,6 +1527,8 @@ def analyze_file(
         tonal_peaks_hz=tonal_peaks_hz,
         loudness_range_lu=loudness_range_lu,
         noise_floor_dbfs=noise_floor_dbfs,
+        ambient_bed_dbfs=ambient_bed_dbfs,
+        high_freq_floor_dbfs=high_freq_floor_dbfs,
         short_term_lufs_stats=short_term_lufs_stats,
         short_term_lufs_timeline=short_term_lufs_timeline,
     )

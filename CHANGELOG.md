@@ -12,6 +12,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Phase 3: Text-queried target distraction separation (`AudioSep` / `CLAPSep`) behind license-aware model opt-in controls.
 - Phase 4: Multi-take history DAG visualizer and optional external `ferraus` CLI backend adapter.
 
+## [0.3.1] - 2026-11-20
+
+### Fixed
+- **Tonal Persistence & Constant-Q Sidebands:** Switched whole-file tonal peak discovery (`30–8000 Hz`, up from `1000 Hz`) to elementwise segment-median Welch PSD with constant-Q bilateral sidebands (`max(6 Hz, 3% fc)` to `max(22 Hz, 12% fc)`) and `>= 6.0 dB` prominence in `>= 60%` of segments—eliminating false whole-file `machine_drone` labels on loud brief passes (like `167 Hz`) while detecting steady resonant lines above `1 kHz` (`~2686 Hz`).
+- **Dual-Timescale Slow-Pass Detection:** Added a `1.0 s` smoothed curve + hysteresis edge expansion pass (`>= 2.5 s`) alongside the fast `50 ms` detector in `_foreground_events_from_curve`, catching gentle vehicle passes and pass tails that blend into noisy short-window beds.
+- **Cross-Branch A/B Original Alignment:** Restricted automatic `original_take_id` resolution strictly to shared common ancestors (`set_a & set_b`), adding `original_offset_s` so even separate trimmed branches replay the time-aligned ancestor slice (never another candidate branch).
+- **Streaming Per-Step LUFS Telemetry:** `_stream_local_batch` and `apply_recipe_streaming` now accumulate ITU-R BS.1770 LUFS alongside RMS/peak per step so `step_metrics` populates `input_lufs` / `output_lufs` across every streaming step.
+- **Actionable MCP Errors:** Surfaced `ValueError`, `FileNotFoundError`, and `PermissionError` via `ToolError(str(exc))` so callers see child take IDs and `cascade=True` instructions on `delete_take`, sandbox errors, and missing IDs.
+- **Bed vs Hiss Clarity, Narrow Tonal Events & Gain-Invariant Clicks:** Added `ambient_bed_dbfs` (50th-percentile 100 ms RMS) and `high_freq_floor_dbfs` (10th-percentile `> 6 kHz` high-passed RMS) alongside `noise_floor_dbfs`; emitted one narrowband `machine_drone` event (`±5 Hz`) per persistent peak (honoring `freq_range_hz`); lowered the click gate amplitude floor from `5e-3` to `1e-4` so click counts stay invariant across gain changes; returned `events_truncated=False` when `include_events=False`; and updated `instructions.md` Section 1 to recommend `envelope_mode="adaptive"`.
+
 ## [0.3.0] - 2026-11-20
 
 ### Added

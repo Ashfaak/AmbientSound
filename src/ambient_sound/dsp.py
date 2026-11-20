@@ -1471,17 +1471,22 @@ def _stats_from_accum(
     return rms_db, pk_db
 
 
-def _probe_stream_rms_peak(wav_path: Path) -> tuple[float | None, float | None]:
+def _probe_stream_levels(wav_path: Path) -> tuple[float | None, float | None, float | None]:
+    info = probe_audio(wav_path)
     sum_sq = 0.0
     peak_lin = 0.0
     count = 0
+    lufs_acc = StreamingLUFS(info.sample_rate, info.channels)
     for _, block in iter_audio_blocks(wav_path, block_seconds=30.0, dtype="float64"):
         if block.size == 0:
             continue
         sum_sq += float(np.sum(block * block))
         peak_lin = max(peak_lin, float(np.max(np.abs(block))))
         count += block.size
-    return _stats_from_accum(sum_sq, peak_lin, count)
+        lufs_acc.update(block)
+    rms_db, pk_db = _stats_from_accum(sum_sq, peak_lin, count)
+    lufs_val = lufs_acc.finalize() if count > 0 and sum_sq > 0.0 else None
+    return rms_db, pk_db, lufs_val
 
 
 def _stream_local_batch(
@@ -1509,6 +1514,11 @@ def _stream_local_batch(
     stage_sum_sq = [0.0] * (n_steps + 1)
     stage_peak = [0.0] * (n_steps + 1)
     stage_count = [0] * (n_steps + 1)
+    lufs_accs = (
+        [StreamingLUFS(sr, ch) for _ in range(n_steps + 1)]
+        if step_telemetry_out is not None
+        else []
+    )
 
     block_frames = max(1024, int(round(block_seconds * sr)))
     with sf.SoundFile(
@@ -1539,6 +1549,7 @@ def _stream_local_batch(
                     stage_sum_sq[0] += float(np.sum(c0 * c0))
                     stage_peak[0] = max(stage_peak[0], float(np.max(np.abs(c0))))
                     stage_count[0] += c0.size
+                    lufs_accs[0].update(c0)
                 for j, sh in enumerate(shifted):
                     cur = ensure_2d_audio(_FILTER_HANDLERS[sh.filter_name](cur, sr, **sh.params))
                     cj = cur[trim_l : trim_l + core_len]
@@ -1546,6 +1557,7 @@ def _stream_local_batch(
                         stage_sum_sq[j + 1] += float(np.sum(cj * cj))
                         stage_peak[j + 1] = max(stage_peak[j + 1], float(np.max(np.abs(cj))))
                         stage_count[j + 1] += cj.size
+                        lufs_accs[j + 1].update(cj)
                 processed = cur
             else:
                 processed = apply_recipe(cur, sr, shifted)
@@ -1554,6 +1566,7 @@ def _stream_local_batch(
             pos = core_end
 
     if step_telemetry_out is not None:
+        stage_lufs = [acc.finalize() for acc in lufs_accs]
         for j, st in enumerate(steps):
             in_rms, in_pk = _stats_from_accum(stage_sum_sq[j], stage_peak[j], stage_count[j])
             out_rms, out_pk = _stats_from_accum(
@@ -1568,6 +1581,8 @@ def _stream_local_batch(
                     output_rms_dbfs=out_rms,
                     input_peak_dbfs=in_pk,
                     output_peak_dbfs=out_pk,
+                    input_lufs=stage_lufs[j],
+                    output_lufs=stage_lufs[j + 1],
                 )
             )
 
@@ -2059,7 +2074,7 @@ def apply_recipe_streaming(
         cur_wav = src
         stage_idx = 0
         i = 0
-        prev_rms_pk: tuple[float | None, float | None] | None = None
+        prev_levels: tuple[float | None, float | None, float | None] | None = None
         while i < len(parsed):
             st = parsed[i]
             if st.filter_name in _LOCAL_STREAMABLE_FILTERS:
@@ -2080,16 +2095,17 @@ def apply_recipe_streaming(
                 )
                 if telemetry_out is not None and batch_tele:
                     telemetry_out.extend(batch_tele)
-                    prev_rms_pk = (
+                    prev_levels = (
                         batch_tele[-1].output_rms_dbfs,
                         batch_tele[-1].output_peak_dbfs,
+                        batch_tele[-1].output_lufs,
                     )
                 cur_wav = next_wav
                 stage_idx += 1
                 continue
 
-            if telemetry_out is not None and prev_rms_pk is None:
-                prev_rms_pk = _probe_stream_rms_peak(cur_wav)
+            if telemetry_out is not None and prev_levels is None:
+                prev_levels = _probe_stream_levels(cur_wav)
 
             next_wav = tmp / f"stage_{stage_idx:03d}.wav"
             step_details: dict[str, Any] = {}
@@ -2112,9 +2128,10 @@ def apply_recipe_streaming(
                 step_details = norm_info
 
             if telemetry_out is not None:
-                out_rms_pk = _probe_stream_rms_peak(next_wav)
-                in_rms, in_pk = prev_rms_pk or (None, None)
-                out_rms, out_pk = out_rms_pk
+                out_rms, out_pk, probed_lufs = _probe_stream_levels(next_wav)
+                in_rms, in_pk, prev_lufs = prev_levels or (None, None, None)
+                eff_in_lufs = in_lufs if in_lufs is not None else prev_lufs
+                eff_out_lufs = out_lufs if out_lufs is not None else probed_lufs
                 telemetry_out.append(
                     StepTelemetry(
                         step_index=i,
@@ -2124,12 +2141,12 @@ def apply_recipe_streaming(
                         output_rms_dbfs=out_rms,
                         input_peak_dbfs=in_pk,
                         output_peak_dbfs=out_pk,
-                        input_lufs=in_lufs,
-                        output_lufs=out_lufs,
+                        input_lufs=eff_in_lufs,
+                        output_lufs=eff_out_lufs,
                         details=step_details,
                     )
                 )
-                prev_rms_pk = out_rms_pk
+                prev_levels = (out_rms, out_pk, eff_out_lufs)
 
             cur_wav = next_wav
             stage_idx += 1

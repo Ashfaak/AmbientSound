@@ -224,3 +224,53 @@ def test_bilateral_hum_and_persistent_tonal_detection() -> None:
     m_drone, _ = analyze_audio(bed + steady_220 + brief_410, sr)
     assert any(abs(f - 220.0) <= 5.0 for f in m_drone.tonal_peaks_hz)
     assert not any(abs(f - 410.0) <= 8.0 for f in m_drone.tonal_peaks_hz)
+
+
+def test_constant_q_tonal_median_and_slow_pass_hysteresis() -> None:
+    sr = 16000
+    dur = 20.0
+    n = int(sr * dur)
+    t = np.arange(n, dtype=np.float64) / sr
+    bed = _make_pink_bed(n, 2, seed=91)
+
+    # Steady resonant 2680 Hz line (>1 kHz) + VERY loud brief 167 Hz tone only in [6.0..7.5 s]
+    res_2680 = (
+        0.008 * np.sin(2.0 * np.pi * 2678.0 * t) + 0.007 * np.sin(2.0 * np.pi * 2684.0 * t)
+    )[:, np.newaxis]
+    brief_167 = np.zeros_like(bed)
+    b0, b1 = int(6.0 * sr), int(7.5 * sr)
+    brief_167[b0:b1, :] = (0.14 * np.sin(2.0 * np.pi * 167.0 * t[b0:b1]))[:, np.newaxis]
+
+    # Gentle +6 dB slow 6.0 s vehicle swell across 10.5..16.5 s with trailing tail
+    p0, p1 = int(10.5 * sr), int(16.5 * sr)
+    env = np.hanning(p1 - p0)
+    slow_pass = np.zeros_like(bed)
+    slow_pass[p0:p1, :] = (0.045 * env * np.sin(2.0 * np.pi * 110.0 * t[p0:p1]))[:, np.newaxis]
+
+    m, events = analyze_audio(bed + res_2680 + brief_167 + slow_pass, sr, sensitivity="medium")
+    assert any(abs(f - 2680.0) <= 12.0 for f in m.tonal_peaks_hz)
+    assert not any(abs(f - 167.0) <= 6.0 for f in m.tonal_peaks_hz)
+
+    assert m.ambient_bed_dbfs is not None
+    assert m.high_freq_floor_dbfs is not None
+    assert m.high_freq_floor_dbfs < m.ambient_bed_dbfs
+
+    slow_ev = [ev for ev in events if ev.kind == "slow_pass"]
+    assert any(ev.start_s <= 12.0 and ev.end_s >= 15.0 for ev in slow_ev)
+
+    drone_ev = [ev for ev in events if ev.kind == "machine_drone"]
+    assert drone_ev and all(
+        ev.freq_band_hz is not None and (ev.freq_band_hz[1] - ev.freq_band_hz[0]) <= 11.0
+        for ev in drone_ev
+    )
+
+    # Gain-invariant click count check (+0 dB vs +6 dB)
+    quiet_clicks = _make_pink_bed(sr * 2, 2, seed=12) * 0.05
+    quiet_clicks[int(0.5 * sr) : int(0.5 * sr) + 4, :] += 0.004
+    quiet_clicks[int(1.2 * sr) : int(1.2 * sr) + 4, :] += 0.004
+    _, ev_0 = analyze_audio(quiet_clicks, sr)
+    _, ev_6 = analyze_audio(quiet_clicks * (10.0 ** (6.0 / 20.0)), sr)
+    clicks_0 = [e for e in ev_0 if e.kind == "impulsive_click"]
+    clicks_6 = [e for e in ev_6 if e.kind == "impulsive_click"]
+    assert len(clicks_0) == 2
+    assert len(clicks_0) == len(clicks_6)

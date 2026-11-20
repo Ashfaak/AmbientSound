@@ -161,6 +161,7 @@ def test_mcp_tool_workflow_and_sandboxing(tmp_path: Path) -> None:
     )
     assert len(summary["takes"]) == 3
     assert summary["takes"][0]["events"] == []
+    assert summary["takes"][0]["events_truncated"] is False
     assert "event_counts" in summary["takes"][0]
     assert "events_total" in summary["takes"][0]
     assert "step_metrics" in take1 and len(take1["step_metrics"]) == 1
@@ -177,6 +178,26 @@ def test_mcp_tool_workflow_and_sandboxing(tmp_path: Path) -> None:
     )
     assert analyzed_filtered["events_truncated"] is False
     assert all(e["kind"] == "slow_pass" for e in analyzed_filtered["events"])
+
+    take_child = _call_tool_json(
+        mcp,
+        "process_take",
+        {
+            "session_id": sid,
+            "parent_take_id": take1["take_id"],
+            "steps": [{"filter_name": "gain", "params": {"gain_db": -1.0}}],
+            "label": "Child of take1",
+        },
+    )
+    with pytest.raises(ToolError) as exc_info:
+        asyncio.run(
+            mcp.call_tool(
+                "delete_take",
+                {"session_id": sid, "take_id": take1["take_id"], "cascade": False},
+            )
+        )
+    assert take_child["take_id"] in str(exc_info.value)
+    assert "cascade=True" in str(exc_info.value)
 
     del_t2 = _call_tool_json(
         mcp, "delete_take", {"session_id": sid, "take_id": take2["take_id"]}

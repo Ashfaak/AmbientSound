@@ -6,9 +6,12 @@ import logging
 import platform
 import shutil
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 from ambient_sound import __version__
 from ambient_sound.analysis import (
@@ -28,6 +31,14 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("ambient_sound.mcp")
+
+
+@contextmanager
+def _mcp_errors() -> Iterator[None]:
+    try:
+        yield
+    except (ValueError, FileNotFoundError, PermissionError) as exc:
+        raise ToolError(str(exc)) from exc
 
 
 def _parse_freq_range(freq_range_hz: list[float] | None) -> tuple[float, float] | None:
@@ -53,15 +64,14 @@ def _compact_events_payload(
                 total_filtered = sum(stored_counts.get(k, 0) for k in allowed)
             else:
                 total_filtered = sum(stored_counts.values())
-            truncated = total_filtered > 0
         else:
-            _, _, total_filtered, truncated = summarize_events(
+            _, _, total_filtered, _ = summarize_events(
                 events, event_kinds=event_kinds, max_events=0
             )
         return {
             "event_counts": counts,
             "events_total": total_filtered,
-            "events_truncated": truncated,
+            "events_truncated": False,
             "events": [],
         }
     bounded, computed_counts, total_filtered, truncated = summarize_events(
@@ -139,19 +149,20 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
         include_events: bool = True,
     ) -> dict[str, Any]:
         """Ingest audio into a non-destructive session (take_000) in bounded RAM."""
-        summary = manager.create_session(audio_path, name=name)
-        payload = summary.model_dump()
-        payload["takes"] = [
-            _format_take_payload(
-                manager,
-                t,
-                event_kinds=event_kinds,
-                max_events=max_events,
-                include_events=include_events,
-            )
-            for t in summary.takes
-        ]
-        return payload
+        with _mcp_errors():
+            summary = manager.create_session(audio_path, name=name)
+            payload = summary.model_dump()
+            payload["takes"] = [
+                _format_take_payload(
+                    manager,
+                    t,
+                    event_kinds=event_kinds,
+                    max_events=max_events,
+                    include_events=include_events,
+                )
+                for t in summary.takes
+            ]
+            return payload
 
     @mcp.tool()
     def list_sessions() -> dict[str, Any]:
@@ -178,19 +189,20 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
         include_events: bool = True,
     ) -> dict[str, Any]:
         """Return session metadata, takes, metrics, bounded events, and A/B tests."""
-        summary = manager.get_session(session_id)
-        payload = summary.model_dump()
-        payload["takes"] = [
-            _format_take_payload(
-                manager,
-                t,
-                event_kinds=event_kinds,
-                max_events=max_events,
-                include_events=include_events,
-            )
-            for t in summary.takes
-        ]
-        return payload
+        with _mcp_errors():
+            summary = manager.get_session(session_id)
+            payload = summary.model_dump()
+            payload["takes"] = [
+                _format_take_payload(
+                    manager,
+                    t,
+                    event_kinds=event_kinds,
+                    max_events=max_events,
+                    include_events=include_events,
+                )
+                for t in summary.takes
+            ]
+            return payload
 
     @mcp.tool()
     def analyze_take(
@@ -205,21 +217,22 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
         include_events: bool = True,
     ) -> dict[str, Any]:
         """Compute psychoacoustic metrics and configurable distraction events for a full take."""
-        metrics, events = manager.analyze_take(
-            session_id,
-            take_id,
-            sensitivity=sensitivity,
-            min_event_s=min_event_s,
-            max_event_s=max_event_s,
-            freq_range_hz=_parse_freq_range(freq_range_hz),
-            event_kinds=event_kinds,
-        )
-        return {
-            "session_id": session_id,
-            "take_id": take_id,
-            "metrics": metrics.model_dump(),
-            **_compact_events_payload(events, event_kinds, max_events, include_events),
-        }
+        with _mcp_errors():
+            metrics, events = manager.analyze_take(
+                session_id,
+                take_id,
+                sensitivity=sensitivity,
+                min_event_s=min_event_s,
+                max_event_s=max_event_s,
+                freq_range_hz=_parse_freq_range(freq_range_hz),
+                event_kinds=event_kinds,
+            )
+            return {
+                "session_id": session_id,
+                "take_id": take_id,
+                "metrics": metrics.model_dump(),
+                **_compact_events_payload(events, event_kinds, max_events, include_events),
+            }
 
     @mcp.tool()
     def analyze_region(
@@ -236,24 +249,25 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
         include_events: bool = True,
     ) -> dict[str, Any]:
         """Analyze a specific [start_s, end_s] time window with custom sensitivity & freq filter."""
-        metrics, events = manager.analyze_region(
-            session_id,
-            take_id,
-            start_s=start_s,
-            end_s=end_s,
-            sensitivity=sensitivity,
-            min_event_s=min_event_s,
-            max_event_s=max_event_s,
-            freq_range_hz=_parse_freq_range(freq_range_hz),
-            event_kinds=event_kinds,
-        )
-        return {
-            "session_id": session_id,
-            "take_id": take_id,
-            "window": {"start_s": start_s, "end_s": end_s},
-            "metrics": metrics.model_dump(),
-            **_compact_events_payload(events, event_kinds, max_events, include_events),
-        }
+        with _mcp_errors():
+            metrics, events = manager.analyze_region(
+                session_id,
+                take_id,
+                start_s=start_s,
+                end_s=end_s,
+                sensitivity=sensitivity,
+                min_event_s=min_event_s,
+                max_event_s=max_event_s,
+                freq_range_hz=_parse_freq_range(freq_range_hz),
+                event_kinds=event_kinds,
+            )
+            return {
+                "session_id": session_id,
+                "take_id": take_id,
+                "window": {"start_s": start_s, "end_s": end_s},
+                "metrics": metrics.model_dump(),
+                **_compact_events_payload(events, event_kinds, max_events, include_events),
+            }
 
     @mcp.tool()
     def render_spectrogram(
@@ -264,13 +278,14 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
         end_s: float | None = None,
     ) -> dict[str, str]:
         """Render overview or zoomed [start_s, end_s] spectrogram and optional 3-panel diff PNG."""
-        return manager.render_take_visuals(
-            session_id,
-            take_id,
-            compare_to_take_id=compare_to_take_id,
-            start_s=start_s,
-            end_s=end_s,
-        )
+        with _mcp_errors():
+            return manager.render_take_visuals(
+                session_id,
+                take_id,
+                compare_to_take_id=compare_to_take_id,
+                start_s=start_s,
+                end_s=end_s,
+            )
 
     @mcp.tool()
     def process_take(
@@ -284,20 +299,21 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
         include_events: bool = True,
     ) -> dict[str, Any]:
         """Apply an ordered DSP filter recipe to parent_take_id as a new immutable take."""
-        record = manager.process_take(
-            session_id=session_id,
-            parent_take_id=parent_take_id,
-            steps=steps,
-            label=label,
-            notes=notes,
-        )
-        return _format_take_payload(
-            manager,
-            record,
-            event_kinds=event_kinds,
-            max_events=max_events,
-            include_events=include_events,
-        )
+        with _mcp_errors():
+            record = manager.process_take(
+                session_id=session_id,
+                parent_take_id=parent_take_id,
+                steps=steps,
+                label=label,
+                notes=notes,
+            )
+            return _format_take_payload(
+                manager,
+                record,
+                event_kinds=event_kinds,
+                max_events=max_events,
+                include_events=include_events,
+            )
 
     @mcp.tool()
     def create_ab_test(
@@ -312,21 +328,22 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
         match_original: bool = False,
     ) -> dict[str, Any]:
         """Register a loudness-matched A/B listening test and return the local studio URL."""
-        record = manager.create_ab_test(
-            session_id=session_id,
-            take_a_id=take_a_id,
-            take_b_id=take_b_id,
-            focus_start_s=focus_start_s,
-            focus_end_s=focus_end_s,
-            blind=blind,
-            notes=notes,
-            original_take_id=original_take_id,
-            match_original=match_original,
-        )
-        payload = record.model_dump()
-        payload["ui_url"] = manager.ab_ui_url(session_id, record.ab_id)
-        payload["workspace_dir"] = str(cfg.workspace_dir)
-        return payload
+        with _mcp_errors():
+            record = manager.create_ab_test(
+                session_id=session_id,
+                take_a_id=take_a_id,
+                take_b_id=take_b_id,
+                focus_start_s=focus_start_s,
+                focus_end_s=focus_end_s,
+                blind=blind,
+                notes=notes,
+                original_take_id=original_take_id,
+                match_original=match_original,
+            )
+            payload = record.model_dump()
+            payload["ui_url"] = manager.ab_ui_url(session_id, record.ab_id)
+            payload["workspace_dir"] = str(cfg.workspace_dir)
+            return payload
 
     @mcp.tool()
     def delete_take(
@@ -335,36 +352,40 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
         cascade: bool = False,
     ) -> dict[str, Any]:
         """Delete an abandoned non-root take (with optional cascade) to reclaim workspace disk."""
-        return manager.delete_take(session_id, take_id, cascade=cascade)
+        with _mcp_errors():
+            return manager.delete_take(session_id, take_id, cascade=cascade)
 
     @mcp.tool()
     def delete_session(session_id: str) -> dict[str, Any]:
         """Permanently delete a session directory and all its takes and A/B tests."""
-        return manager.delete_session(session_id)
+        with _mcp_errors():
+            return manager.delete_session(session_id)
 
     @mcp.tool()
     def list_ab_tests(session_id: str) -> dict[str, Any]:
         """List all A/B tests and recorded human verdicts for a session."""
-        return {
-            "workspace_dir": str(cfg.workspace_dir),
-            "ab_tests": [
-                {
-                    **ab.model_dump(),
-                    "ui_url": manager.ab_ui_url(session_id, ab.ab_id),
-                }
-                for ab in manager.list_ab_tests(session_id)
-            ],
-        }
+        with _mcp_errors():
+            return {
+                "workspace_dir": str(cfg.workspace_dir),
+                "ab_tests": [
+                    {
+                        **ab.model_dump(),
+                        "ui_url": manager.ab_ui_url(session_id, ab.ab_id),
+                    }
+                    for ab in manager.list_ab_tests(session_id)
+                ],
+            }
 
     @mcp.tool()
     def get_ab_feedback(session_id: str, ab_id: str) -> dict[str, Any]:
         """Retrieve human listening winner, artifact tags, and comments for an A/B test."""
-        ab = manager.get_ab_test(session_id, ab_id)
-        return {
-            **ab.model_dump(),
-            "ui_url": manager.ab_ui_url(session_id, ab.ab_id),
-            "workspace_dir": str(cfg.workspace_dir),
-        }
+        with _mcp_errors():
+            ab = manager.get_ab_test(session_id, ab_id)
+            return {
+                **ab.model_dump(),
+                "ui_url": manager.ab_ui_url(session_id, ab.ab_id),
+                "workspace_dir": str(cfg.workspace_dir),
+            }
 
     @mcp.tool()
     def export_take(
@@ -374,13 +395,14 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
         format: str = "wav",
     ) -> dict[str, str]:
         """Export a take to wav, flac, mp3, or ogg inside AMBIENTSOUND_ALLOWED_ROOTS."""
-        out = manager.export_take(session_id, take_id, output_path, audio_format=format)
-        return {
-            "session_id": session_id,
-            "take_id": take_id,
-            "format": format.lower(),
-            "output_path": str(out),
-        }
+        with _mcp_errors():
+            out = manager.export_take(session_id, take_id, output_path, audio_format=format)
+            return {
+                "session_id": session_id,
+                "take_id": take_id,
+                "format": format.lower(),
+                "output_path": str(out),
+            }
 
     return mcp
 
