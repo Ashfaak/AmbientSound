@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Phase 3: Text-queried target distraction separation (`AudioSep` / `CLAPSep`) behind license-aware model opt-in controls.
 - Phase 4: Multi-take history DAG visualizer and optional external `ferraus` CLI backend adapter.
 
+## [0.2.1] - 2026-11-20
+
+### Fixed
+- Default `AMBIENTSOUND_WORKSPACE` now resolves to `~/.ambientsound` instead of `CWD/.ambientsound`, preventing session-list mismatches when the MCP server and Web UI launch from different working directories.
+- Added `--workspace <path>` to `ambient-sound-ui` / `ambient-sound ui`, added `/api/info`, included `workspace_dir` in A/B MCP tool responses, and surfaced a clear missing-session banner in the A/B Studio UI instead of silently falling back to the demo session.
+
 ## [0.2.0] - 2026-11-20
 
 ### Added

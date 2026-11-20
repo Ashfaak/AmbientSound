@@ -32,7 +32,7 @@ Tell the user:
    ```
 3. Ensure dependencies are installed once in the AmbientSound folder (`uv sync --python 3.12 --all-groups`), then restart/reconnect the session so the MCP server loads.
 4. Once connected, **call `health_check()` first** to verify `status: "ok"`, `allowed_roots`, `ffmpeg_available`, and `workspace_free_gb`.
-5. For A/B listening steps, remind the user to start the local studio UI in a terminal:
+5. For A/B listening steps, remind the user to start the local studio UI in a terminal (passing `--workspace` only if `AMBIENTSOUND_WORKSPACE` differs from the default `~/.ambientsound`):
    ```bash
    uv run ambient-sound-ui
    ```
@@ -58,7 +58,7 @@ Core rules:
 
 | Variable | Default | Purpose |
 | :--- | :--- | :--- |
-| `AMBIENTSOUND_WORKSPACE` | `./.ambientsound` | Session workspace directory (note: long 1-hour WAVs write ~672 MB per take). |
+| `AMBIENTSOUND_WORKSPACE` | `~/.ambientsound` | Shared session workspace directory (note: long 1-hour WAVs write ~672 MB per take). |
 | `AMBIENTSOUND_ALLOWED_ROOTS` | `CWD` + `workspace_dir` | OS path-separator list of directories `create_session` / `export_take` may read/write. |
 | `AMBIENTSOUND_UI_HOST` | `127.0.0.1` | Hostname used in `ui_url`. |
 | `AMBIENTSOUND_UI_PORT` | `8765` | Port used in `ui_url`. |
@@ -81,7 +81,7 @@ All tools return JSON objects (`dict`). Unmeasurable metrics (e.g., LUFS on `<0.
 | `analyze_region` | `(session_id, take_id, start_s=0.0, end_s=None, sensitivity="medium", min_event_s=0.12, max_event_s=45.0, freq_range_hz=None)` | Analyzes a specific `[start_s, end_s]` window and returns absolute recording timestamps (`+ start_s`). |
 | `render_spectrogram` | `(session_id, take_id, compare_to_take_id="", start_s=None, end_s=None)` | Renders full overview (`>60 s` sampled) or zoomed high-res (`<=60 s` slice) waveform+spectrogram and optional Before/After/Removed Residual PNGs. |
 | `process_take` | `(session_id, parent_take_id, steps, label="", notes="")` | Runs DSP recipe (automatically streams file-to-file when parent `>120 s`), writes immutable `take_NNN`, analyzes output, renders visuals. |
-| `create_ab_test` | `(session_id, take_a_id, take_b_id, focus_start_s=None, focus_end_s=None, blind=False, notes="")` | Creates attenuation-only LUFS-matched A/B test (`gain_db_* <= 0.0`) + `ui_url`. |
+| `create_ab_test` | `(session_id, take_a_id, take_b_id, focus_start_s=None, focus_end_s=None, blind=False, notes="")` | Creates attenuation-only LUFS-matched A/B test (`gain_db_* <= 0.0`), `ui_url`, and active `workspace_dir`. |
 | `list_ab_tests` | `(session_id)` | Returns `{"ab_tests": [...]}` with verdicts and `ui_url`s. |
 | `get_ab_feedback` | `(session_id, ab_id)` | Retrieves `verdict` (`winner`, `artifact_tags`, `comment`, `submitted_at`). |
 | `export_take` | `(session_id, take_id, output_path, format="wav")` | Stream-exports take to `wav` (24-bit), `flac` (24-bit), `mp3` (320k), or `ogg`. |

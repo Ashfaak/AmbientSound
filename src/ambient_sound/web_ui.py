@@ -93,6 +93,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=500, detail="UI static asset missing.")
         return HTMLResponse(html_path.read_text(encoding="utf-8"))
 
+    @app.get("/api/info")
+    def api_info() -> dict[str, str]:
+        return {
+            "version": __version__,
+            "workspace_dir": str(cfg.workspace_dir),
+        }
+
     @app.get("/api/sessions")
     def api_list_sessions() -> list[dict[str, Any]]:
         return [
@@ -255,8 +262,22 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Run AmbientSound local A/B Listening Studio")
     parser.add_argument("--host", default=None, help="Bind host (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=None, help="Bind port (default: 8765)")
+    parser.add_argument(
+        "--workspace",
+        default=None,
+        help="Session workspace directory (default: ~/.ambientsound or AMBIENTSOUND_WORKSPACE)",
+    )
     args = parser.parse_args(argv)
     settings = Settings.from_env()
+    if args.workspace:
+        ws = Path(args.workspace)
+        settings = Settings(
+            workspace_dir=ws,
+            allowed_roots=[*settings.allowed_roots, ws],
+            allow_noncommercial=settings.allow_noncommercial,
+            ui_host=settings.ui_host,
+            ui_port=settings.ui_port,
+        )
     run_ui(
         host=args.host or settings.ui_host,
         port=args.port or settings.ui_port,

@@ -10,6 +10,7 @@ Persistent architecture decisions, verified environment facts, invariants, and a
 - **License:** `Apache-2.0` (`LICENSE` + `NOTICE`). Strictly permissive runtime/dev dependencies only (no GPL/AGPL Python imports).
 - **Primary Stack:** Python 3.12 (`uv` environment), `mcp>=2.0.0` (`MCPServer`, `stdio`), `numpy`, `scipy`, `soundfile`, `pyloudnorm`, `matplotlib`, `fastapi`, `uvicorn`, `pydantic`.
 - **Streaming Architecture:** Recordings `> 120.0 s` (`STREAMING_THRESHOLD_S`) automatically execute block-wise on disk (`PCM_24` takes, zero full-file 2.76 GB arrays or duplicate `residual.wav`), with dynamic sliced residual computation and Windowed Audition Mode (`<= 90 s` slices) in the Web UI.
+- **Shared Default Workspace (`v0.2.1`):** Default `workspace_dir` is `~/.ambientsound` (override via `AMBIENTSOUND_WORKSPACE` or `ambient-sound-ui --workspace`), ensuring MCP servers and the Web UI share the same session store across working directories.
 - **UI Stack:** Zero-build FastAPI + Web Audio API dark studio served on `127.0.0.1:8765`.
 - **Clean-Room Policy:** Skip reverse engineering. Keep any external black-box feature checklist strictly inside gitignored `.local/`. Never mention proprietary audio editors or vendors in tracked files or commits.
 

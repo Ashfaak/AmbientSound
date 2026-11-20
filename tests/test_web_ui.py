@@ -40,6 +40,14 @@ def test_web_ui_endpoints_and_blind_redaction(tmp_path: Path) -> None:
     r_home = client.get("/")
     assert r_home.status_code == 200
     assert "AmbientSound A/B Listening Studio" in r_home.text
+    assert "missingBanner" in r_home.text
+    assert "/api/info" in r_home.text
+
+    r_info = client.get("/api/info")
+    assert r_info.status_code == 200
+    info_data = r_info.json()
+    assert info_data["workspace_dir"] == str(settings.workspace_dir)
+    assert "version" in info_data
 
     r_sessions = client.get("/api/sessions")
     assert r_sessions.status_code == 200

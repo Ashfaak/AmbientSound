@@ -205,19 +205,21 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
         )
         payload = record.model_dump()
         payload["ui_url"] = manager.ab_ui_url(session_id, record.ab_id)
+        payload["workspace_dir"] = str(cfg.workspace_dir)
         return payload
 
     @mcp.tool()
     def list_ab_tests(session_id: str) -> dict[str, Any]:
         """List all A/B tests and recorded human verdicts for a session."""
         return {
+            "workspace_dir": str(cfg.workspace_dir),
             "ab_tests": [
                 {
                     **ab.model_dump(),
                     "ui_url": manager.ab_ui_url(session_id, ab.ab_id),
                 }
                 for ab in manager.list_ab_tests(session_id)
-            ]
+            ],
         }
 
     @mcp.tool()
@@ -227,6 +229,7 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
         return {
             **ab.model_dump(),
             "ui_url": manager.ab_ui_url(session_id, ab.ab_id),
+            "workspace_dir": str(cfg.workspace_dir),
         }
 
     @mcp.tool()

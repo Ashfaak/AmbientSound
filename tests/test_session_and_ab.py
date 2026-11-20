@@ -134,3 +134,11 @@ def test_streaming_session_pipeline_and_windowed_visuals(
     long_lo_wav = save_wav(tmp_path / "overview_65s.wav", long_mono, sr_lo, subtype="PCM_16")
     ov_png = render_file_spectrogram_png(long_lo_wav, tmp_path / "overview.png")
     assert ov_png.exists()
+
+
+def test_default_workspace_uses_shared_home_directory(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AMBIENTSOUND_WORKSPACE", raising=False)
+    monkeypatch.delenv("AMBIENTSOUND_ALLOWED_ROOTS", raising=False)
+    cfg = Settings.from_env()
+    assert cfg.workspace_dir == (Path.home() / ".ambientsound").resolve()
+    assert cfg.workspace_dir in cfg.allowed_roots

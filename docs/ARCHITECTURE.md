@@ -60,10 +60,10 @@ flowchart TB
 
 ## 3. Session Workspace Layout
 
-Every workspace lives under `AMBIENTSOUND_WORKSPACE` (default `./.ambientsound/`):
+Every workspace lives under `AMBIENTSOUND_WORKSPACE` (default `~/.ambientsound/`):
 
 ```text
-.ambientsound/
+~/.ambientsound/
   sessions/
     <session_id>/
       session.json               # Canonical SessionSummary (takes + A/B tests)

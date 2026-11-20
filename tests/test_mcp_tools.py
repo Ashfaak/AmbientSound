@@ -141,6 +141,7 @@ def test_mcp_tool_workflow_and_sandboxing(tmp_path: Path) -> None:
         },
     )
     assert "ui_url" in ab
+    assert ab["workspace_dir"] == str(settings.workspace_dir)
     assert ab["ab_id"] == "ab_001"
 
     ab_list_res = _call_tool_json(mcp, "list_ab_tests", {"session_id": sid})

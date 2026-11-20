@@ -151,6 +151,11 @@ def main(argv: list[str] | None = None) -> None:
     ui_parser = sub.add_parser("ui", help="Run the local A/B listening studio web server")
     ui_parser.add_argument("--host", default=None, help="Bind host (default: 127.0.0.1)")
     ui_parser.add_argument("--port", type=int, default=None, help="Bind port (default: 8765)")
+    ui_parser.add_argument(
+        "--workspace",
+        default=None,
+        help="Session workspace directory (default: ~/.ambientsound or AMBIENTSOUND_WORKSPACE)",
+    )
 
     analyze_parser = sub.add_parser("analyze", help="Analyze an audio file and print JSON metrics")
     analyze_parser.add_argument("audio_path", help="Path to audio file")
@@ -165,6 +170,15 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     if args.command == "ui":
+        if args.workspace:
+            ws = Path(args.workspace)
+            settings = Settings(
+                workspace_dir=ws,
+                allowed_roots=[*settings.allowed_roots, ws],
+                allow_noncommercial=settings.allow_noncommercial,
+                ui_host=settings.ui_host,
+                ui_port=settings.ui_port,
+            )
         run_ui(
             host=args.host or settings.ui_host,
             port=args.port or settings.ui_port,

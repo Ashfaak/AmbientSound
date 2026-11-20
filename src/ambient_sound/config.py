@@ -13,11 +13,15 @@ def _parse_bool(raw: str | None, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _default_workspace_dir() -> Path:
+    return (Path.home() / ".ambientsound").resolve()
+
+
 @dataclass(slots=True)
 class Settings:
     """Runtime settings for AmbientSound workspaces, sandboxing, and UI."""
 
-    workspace_dir: Path = field(default_factory=lambda: Path.cwd() / ".ambientsound")
+    workspace_dir: Path = field(default_factory=_default_workspace_dir)
     allowed_roots: list[Path] = field(default_factory=list)
     allow_noncommercial: bool = False
     ui_host: str = "127.0.0.1"
@@ -40,7 +44,7 @@ class Settings:
         workspace_dir = (
             Path(workspace_raw).expanduser().resolve()
             if workspace_raw
-            else (Path.cwd() / ".ambientsound").resolve()
+            else _default_workspace_dir()
         )
 
         roots_raw = os.environ.get("AMBIENTSOUND_ALLOWED_ROOTS")
