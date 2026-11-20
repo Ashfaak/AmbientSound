@@ -11,6 +11,7 @@ from ambient_sound.analysis import analyze_audio, chunked_true_peak_linear
 from ambient_sound.dsp import (
     apply_recipe,
     apply_recipe_streaming,
+    apply_recipe_with_telemetry,
     compute_residual,
     list_filter_specs,
 )
@@ -25,14 +26,22 @@ def _rms_db(x: np.ndarray) -> float:
 def test_filter_specs_registered() -> None:
     specs = list_filter_specs()
     names = {s["name"] for s in specs}
+    assert len(specs) == 15
     assert {
         "highpass_rumble",
         "dehum_notch",
+        "drone_notch",
         "declick_impulse",
         "spectral_denoise",
         "band_attenuate",
         "ambience_patch",
+        "trim_range",
+        "cut_regions",
+        "fade_edges",
+        "gain",
         "parametric_eq",
+        "soft_compress",
+        "true_peak_limiter",
         "loudness_normalize",
     }.issubset(names)
 
@@ -344,3 +353,162 @@ def test_batched_spans_and_streaming_pipeline(tmp_path: Path) -> None:
     assert loaded.shape == noisy.shape
     lufs = pyln.Meter(sr).integrated_loudness(loaded)
     assert abs(lufs - (-16.0)) < 1.0
+
+
+def test_gain_and_limit_peaks_mastering_in_memory_and_streaming(tmp_path: Path) -> None:
+    sr = 44100
+    n = sr * 4
+    rng = np.random.default_rng(88)
+    # Quiet ~ -44 LUFS spiky ambient audio
+    spiky = rng.normal(0.0, 0.004, size=(n, 2))
+    for k in range(1, 9):
+        idx = int(k * 0.4 * sr)
+        spiky[idx : idx + 6, :] += 0.08
+
+    gained = apply_recipe(spiky, sr, [{"filter_name": "gain", "params": {"gain_db": 12.0}}])
+    assert abs((_rms_db(gained) - _rms_db(spiky)) - 12.0) < 0.1
+
+    no_limit = apply_recipe(
+        spiky,
+        sr,
+        [
+            {
+                "filter_name": "loudness_normalize",
+                "params": {
+                    "target_lufs": -14.0,
+                    "true_peak_ceiling_dbtp": -1.0,
+                    "limit_peaks": False,
+                },
+            }
+        ],
+    )
+    assert pyln.Meter(sr).integrated_loudness(no_limit) < -18.0
+
+    limited = apply_recipe(
+        spiky,
+        sr,
+        [
+            {
+                "filter_name": "loudness_normalize",
+                "params": {
+                    "target_lufs": -14.0,
+                    "true_peak_ceiling_dbtp": -1.0,
+                    "limit_peaks": True,
+                },
+            }
+        ],
+    )
+    lufs_mem = pyln.Meter(sr).integrated_loudness(limited)
+    tp_mem = 20.0 * np.log10(max(chunked_true_peak_linear(limited), 1e-12))
+    assert abs(lufs_mem - (-14.0)) <= 0.8
+    assert tp_mem <= -0.95
+
+    src_wav = save_wav(tmp_path / "quiet_spiky.wav", spiky, sr, subtype="PCM_24")
+    dst_wav = tmp_path / "master_limited.wav"
+    tele = []
+    apply_recipe_streaming(
+        src_wav,
+        dst_wav,
+        [
+            {
+                "filter_name": "loudness_normalize",
+                "params": {
+                    "target_lufs": -14.0,
+                    "true_peak_ceiling_dbtp": -1.0,
+                    "limit_peaks": True,
+                },
+            }
+        ],
+        subtype="PCM_24",
+        block_seconds=2.0,
+        telemetry_out=tele,
+    )
+    loaded, _ = load_audio(dst_wav)
+    lufs_str = pyln.Meter(sr).integrated_loudness(loaded)
+    tp_str = 20.0 * np.log10(max(chunked_true_peak_linear(loaded), 1e-12))
+    assert abs(lufs_str - (-14.0)) <= 0.8
+    assert tp_str <= -0.95
+    assert len(tele) == 1
+    assert tele[0].details.get("peak_limited") is True
+
+
+def test_adaptive_band_attenuate_and_telemetry(tmp_path: Path) -> None:
+    sr = 44100
+    n = sr * 6
+    t = np.arange(n, dtype=np.float64) / sr
+    rng = np.random.default_rng(64)
+    bed = rng.normal(0.0, 0.02, size=(n, 2))
+
+    # Asymmetric 140 Hz distraction concentrated at 1.4..2.3 s inside a wide 1.0..5.0 s span
+    noisy = bed.copy()
+    p0, p1 = int(1.4 * sr), int(2.3 * sr)
+    noisy[p0:p1, :] += (0.20 * np.sin(2.0 * np.pi * 140.0 * t[p0:p1]))[:, None]
+
+    adaptive = apply_recipe(
+        noisy,
+        sr,
+        [
+            {
+                "filter_name": "band_attenuate",
+                "params": {
+                    "start_s": 1.0,
+                    "end_s": 5.0,
+                    "low_hz": 80.0,
+                    "high_hz": 220.0,
+                    "attenuation_db": -20.0,
+                    "fade_ms": 200.0,
+                    "envelope_mode": "adaptive",
+                },
+            }
+        ],
+    )
+    assert _rms_db(adaptive[int(1.6 * sr) : int(2.1 * sr)]) < (
+        _rms_db(noisy[int(1.6 * sr) : int(2.1 * sr)]) - 10.0
+    )
+    # Clean region inside the same 1..5 s span must NOT be hollowed out
+    assert (
+        abs(
+            _rms_db(adaptive[int(3.2 * sr) : int(4.4 * sr)])
+            - _rms_db(noisy[int(3.2 * sr) : int(4.4 * sr)])
+        )
+        < 2.5
+    )
+
+    _, tele_mem = apply_recipe_with_telemetry(
+        noisy,
+        sr,
+        [
+            {"filter_name": "highpass_rumble", "params": {"cutoff_hz": 50.0}},
+            {
+                "filter_name": "ambience_patch",
+                "params": {
+                    "spans": [{"start_s": 1.4, "end_s": 2.3, "crossfade_ms": 60.0}]
+                },
+            },
+        ],
+    )
+    assert len(tele_mem) == 2
+    assert tele_mem[0].input_rms_dbfs is not None
+    assert tele_mem[1].details["patched_spans"][0]["crossfade_ms"] == 60.0
+    assert "donor_start_s" in tele_mem[1].details["patched_spans"][0]
+
+    src_wav = save_wav(tmp_path / "adapt_in.wav", noisy, sr, subtype="PCM_24")
+    tele_str = []
+    apply_recipe_streaming(
+        src_wav,
+        tmp_path / "adapt_out.wav",
+        [
+            {"filter_name": "highpass_rumble", "params": {"cutoff_hz": 50.0}},
+            {
+                "filter_name": "ambience_patch",
+                "params": {
+                    "spans": [{"start_s": 1.4, "end_s": 2.3, "crossfade_ms": 55.0}]
+                },
+            },
+        ],
+        subtype="PCM_24",
+        block_seconds=2.5,
+        telemetry_out=tele_str,
+    )
+    assert len(tele_str) == 2
+    assert tele_str[1].details["patched_spans"][0]["crossfade_ms"] == 55.0

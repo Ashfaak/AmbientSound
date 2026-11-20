@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import math
 import re
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -11,9 +13,19 @@ from uuid import uuid4
 
 import numpy as np
 
-from ambient_sound.analysis import SensitivityLevel, analyze_audio, analyze_file
+from ambient_sound.analysis import (
+    SensitivityLevel,
+    analyze_audio,
+    analyze_file,
+    event_kind_counts,
+    summarize_events,
+)
 from ambient_sound.config import Settings, ensure_path_allowed
-from ambient_sound.dsp import apply_recipe, apply_recipe_streaming, compute_residual
+from ambient_sound.dsp import (
+    apply_recipe_streaming,
+    apply_recipe_with_telemetry,
+    compute_residual,
+)
 from ambient_sound.io_audio import (
     export_audio,
     ingest_audio_to_wav,
@@ -31,6 +43,7 @@ from ambient_sound.models import (
     FilterStep,
     ProcessingRecipe,
     SessionSummary,
+    StepTelemetry,
     TakeRecord,
 )
 from ambient_sound.visuals import (
@@ -44,6 +57,9 @@ from ambient_sound.visuals import (
 STREAMING_THRESHOLD_S = 120.0
 
 
+_MAX_INLINE_EVENTS = 200
+
+
 def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
@@ -51,6 +67,27 @@ def _utc_now_iso() -> str:
 def _slugify(text: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "-", text.strip()).strip("-_").lower()
     return cleaned[:32] or "session"
+
+
+def _patched_spans_from_telemetry(step_metrics: list[StepTelemetry]) -> list[tuple[float, float]]:
+    spans: list[tuple[float, float]] = []
+    for st in step_metrics:
+        for item in st.details.get("patched_spans") or []:
+            try:
+                spans.append((float(item["target_start_s"]), float(item["target_end_s"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+    return spans
+
+
+def _next_prefixed_id(existing_ids: list[str], prefix: str) -> str:
+    max_num = 0 if prefix == "ab_" else -1
+    pattern = re.compile(rf"^{re.escape(prefix)}(\d+)$")
+    for eid in existing_ids:
+        m = pattern.match(eid)
+        if m:
+            max_num = max(max_num, int(m.group(1)))
+    return f"{prefix}{max_num + 1:03d}"
 
 
 class SessionManager:
@@ -106,6 +143,28 @@ class SessionManager:
                 return take
         raise FileNotFoundError(f"Take '{take_id}' not found in session '{session_id}'.")
 
+    def _write_take_events(
+        self, take_dir: Path, events: list[DistractionEvent]
+    ) -> tuple[Path, dict[str, int], list[DistractionEvent]]:
+        events_file = take_dir / "events.json"
+        events_file.write_text(
+            json.dumps([e.model_dump() for e in events], indent=2),
+            encoding="utf-8",
+        )
+        counts = event_kind_counts(events)
+        bounded, _, _, _ = summarize_events(events, max_events=_MAX_INLINE_EVENTS)
+        return events_file, counts, bounded
+
+    def load_take_events(self, session_id: str, take_id: str) -> list[DistractionEvent]:
+        """Load the full event list for a take from events.json (or inline fallback)."""
+        take = self.get_take(session_id, take_id)
+        if take.events_path:
+            ep = Path(take.events_path)
+            if ep.exists():
+                raw = json.loads(ep.read_text(encoding="utf-8"))
+                return [DistractionEvent.model_validate(item) for item in raw]
+        return list(take.events)
+
     def create_session(self, source_path: str | Path, name: str = "") -> SessionSummary:
         """Ingest an audio recording into immutable take_000 in bounded RAM."""
         src = ensure_path_allowed(source_path, self.settings)
@@ -126,6 +185,7 @@ class SessionManager:
             title=f"{session_name} — take_000 (Original)",
             events=events,
         )
+        events_file, counts, bounded_events = self._write_take_events(take_dir, events)
 
         take_000 = TakeRecord(
             take_id="take_000",
@@ -137,10 +197,15 @@ class SessionManager:
             residual_path=None,
             spectrogram_path=str(spec_png),
             diff_spectrogram_path=None,
+            events_path=str(events_file),
             sha256=sha256_file(audio_wav),
+            source_offset_s=0.0,
+            timeline_modified=False,
             recipe=None,
             metrics=metrics,
-            events=events,
+            event_counts=counts,
+            events=bounded_events,
+            step_metrics=[],
         )
         summary = SessionSummary(
             session_id=session_id,
@@ -161,6 +226,7 @@ class SessionManager:
         min_event_s: float = 0.12,
         max_event_s: float = 45.0,
         freq_range_hz: tuple[float, float] | None = None,
+        event_kinds: list[str] | None = None,
     ) -> tuple[AudioMetrics, list[DistractionEvent]]:
         """Compute fresh metrics and distraction events for an entire take."""
         take = self.get_take(session_id, take_id)
@@ -170,6 +236,7 @@ class SessionManager:
             min_event_s=min_event_s,
             max_event_s=max_event_s,
             freq_range_hz=freq_range_hz,
+            event_kinds=event_kinds,
         )
 
     def analyze_region(
@@ -182,6 +249,7 @@ class SessionManager:
         min_event_s: float = 0.12,
         max_event_s: float = 45.0,
         freq_range_hz: tuple[float, float] | None = None,
+        event_kinds: list[str] | None = None,
     ) -> tuple[AudioMetrics, list[DistractionEvent]]:
         """Analyze a specific [start_s, end_s] time window of a take with custom sensitivity."""
         take = self.get_take(session_id, take_id)
@@ -193,6 +261,7 @@ class SessionManager:
             min_event_s=min_event_s,
             max_event_s=max_event_s,
             freq_range_hz=freq_range_hz,
+            event_kinds=event_kinds,
         )
 
     def render_take_visuals(
@@ -205,6 +274,7 @@ class SessionManager:
     ) -> dict[str, str]:
         """Render full-file overview or zoomed [start_s, end_s] spectrogram & diff PNGs."""
         take = self.get_take(session_id, take_id)
+        take_events = self.load_take_events(session_id, take_id)
         take_dir = Path(take.audio_path).parent
         windowed = start_s is not None or end_s is not None
         tag = ""
@@ -223,7 +293,7 @@ class SessionManager:
             take.audio_path,
             spec_file,
             title=f"{take.take_id} ({take.label}){title_sfx}",
-            events=take.events,
+            events=take_events,
             start_s=start_s,
             end_s=end_s,
         )
@@ -239,6 +309,8 @@ class SessionManager:
                 title=f"{ref_take.take_id} -> {take.take_id} ({take.label}){title_sfx}",
                 start_s=start_s,
                 end_s=end_s,
+                loudness_match_residual=True,
+                patched_spans=_patched_spans_from_telemetry(take.step_metrics) or None,
             )
             result["diff_spectrogram_path"] = str(diff_path)
         elif (
@@ -266,10 +338,22 @@ class SessionManager:
         changes_length = any(
             st.filter_name in {"trim_range", "cut_regions"} for st in parsed_steps
         )
+        cur_offset = parent.source_offset_s
+        timeline_mod = parent.timeline_modified
+        for st in parsed_steps:
+            if st.filter_name == "trim_range":
+                cur_offset += max(0.0, float(st.params.get("start_s", 0.0)))
+            elif st.filter_name == "cut_regions":
+                timeline_mod = True
 
-        new_take_id = f"take_{len(summary.takes):03d}"
+        existing_take_ids = [t.take_id for t in summary.takes]
+        takes_dir = self._session_dir(session_id) / "takes"
+        if takes_dir.exists():
+            existing_take_ids.extend(p.name for p in takes_dir.iterdir() if p.is_dir())
+        new_take_id = _next_prefixed_id(existing_take_ids, "take_")
+
         take_label = label.strip() or f"Processed ({len(parsed_steps)} steps)"
-        take_dir = self._session_dir(session_id) / "takes" / new_take_id
+        take_dir = takes_dir / new_take_id
         take_dir.mkdir(parents=True, exist_ok=True)
         audio_path = take_dir / "audio.wav"
 
@@ -279,10 +363,13 @@ class SessionManager:
         parent_info = probe_audio(parent.audio_path)
         residual_wav: Path | None = None
         diff_png: Path | None = None
+        step_metrics: list[StepTelemetry] = []
 
         if parent_info.duration_s <= STREAMING_THRESHOLD_S:
             parent_audio, sr = load_audio(parent.audio_path)
-            processed = apply_recipe(parent_audio, sr, parsed_steps)
+            processed, step_metrics = apply_recipe_with_telemetry(
+                parent_audio, sr, parsed_steps
+            )
             save_wav(audio_path, processed, sr, subtype="FLOAT")
 
             metrics, events = analyze_audio(processed, sr)
@@ -302,6 +389,8 @@ class SessionManager:
                     sr,
                     take_dir / "diff_spectrogram.png",
                     title=f"{parent_take_id} -> {new_take_id} ({take_label})",
+                    loudness_match_residual=True,
+                    patched_spans=_patched_spans_from_telemetry(step_metrics) or None,
                 )
         else:
             out_info = apply_recipe_streaming(
@@ -309,6 +398,7 @@ class SessionManager:
                 audio_path,
                 parsed_steps,
                 subtype="PCM_24",
+                telemetry_out=step_metrics,
             )
             metrics, events = analyze_file(audio_path)
             spec_png = render_file_spectrogram_png(
@@ -323,7 +413,11 @@ class SessionManager:
                     audio_path,
                     take_dir / "diff_spectrogram.png",
                     title=f"{parent_take_id} -> {new_take_id} ({take_label})",
+                    loudness_match_residual=True,
+                    patched_spans=_patched_spans_from_telemetry(step_metrics) or None,
                 )
+
+        events_file, counts, bounded_events = self._write_take_events(take_dir, events)
 
         record = TakeRecord(
             take_id=new_take_id,
@@ -335,10 +429,15 @@ class SessionManager:
             residual_path=str(residual_wav) if residual_wav else None,
             spectrogram_path=str(spec_png),
             diff_spectrogram_path=str(diff_png) if diff_png else None,
+            events_path=str(events_file),
             sha256=sha256_file(audio_path),
+            source_offset_s=round(cur_offset, 4),
+            timeline_modified=timeline_mod,
             recipe=recipe,
             metrics=metrics,
-            events=events,
+            event_counts=counts,
+            events=bounded_events,
+            step_metrics=step_metrics,
         )
         summary.takes.append(record)
         self._save_session(summary)
@@ -372,8 +471,32 @@ class SessionManager:
         start_s: float = 0.0,
         end_s: float | None = None,
     ) -> tuple[np.ndarray, int]:
-        """Return sliced residual (from disk if present, else computed on the fly)."""
+        """Return loudness-normalized residual slice when gain shifts exceed 1.5 dB."""
         take = self.get_take(session_id, take_id)
+        if take.parent_take_id:
+            parent = self.get_take(session_id, take.parent_take_id)
+            p_info = probe_audio(parent.audio_path)
+            t_info = probe_audio(take.audio_path)
+            if p_info.frames == t_info.frames:
+                p_rms = parent.metrics.rms_dbfs
+                t_rms = take.metrics.rms_dbfs
+                if (
+                    p_rms is not None
+                    and t_rms is not None
+                    and math.isfinite(p_rms)
+                    and math.isfinite(t_rms)
+                    and abs(t_rms - p_rms) > 1.5
+                ):
+                    parent_slice, sr = load_audio_slice(
+                        parent.audio_path, start_s=start_s, end_s=end_s, dtype="float64"
+                    )
+                    take_slice, _ = load_audio_slice(
+                        take.audio_path, start_s=start_s, end_s=end_s, dtype="float64"
+                    )
+                    n = min(parent_slice.shape[0], take_slice.shape[0])
+                    scale = 10.0 ** ((p_rms - t_rms) / 20.0)
+                    return parent_slice[:n] - take_slice[:n] * scale, sr
+
         if take.residual_path and Path(take.residual_path).exists():
             return load_audio_slice(
                 take.residual_path, start_s=start_s, end_s=end_s, dtype="float64"
@@ -396,6 +519,57 @@ class SessionManager:
         n = min(parent_slice.shape[0], take_slice.shape[0])
         return parent_slice[:n] - take_slice[:n], sr
 
+    def _resolve_original_take_id(
+        self,
+        summary: SessionSummary,
+        take_a: TakeRecord,
+        take_b: TakeRecord,
+        explicit_original_id: str | None,
+    ) -> str:
+        if explicit_original_id and explicit_original_id.strip():
+            ref = self.get_take(summary.session_id, explicit_original_id.strip())
+            return ref.take_id
+
+        take_map = {t.take_id: t for t in summary.takes}
+
+        def _lineage(start_tid: str) -> list[TakeRecord]:
+            chain: list[TakeRecord] = []
+            seen: set[str] = set()
+            cur: str | None = start_tid
+            while cur and cur in take_map and cur not in seen:
+                seen.add(cur)
+                rec = take_map[cur]
+                chain.append(rec)
+                cur = rec.parent_take_id
+            chain.reverse()
+            return chain
+
+        def _matches_both(cand: TakeRecord) -> bool:
+            return (
+                abs(cand.source_offset_s - take_a.source_offset_s) <= 0.05
+                and abs(cand.source_offset_s - take_b.source_offset_s) <= 0.05
+                and cand.timeline_modified == take_a.timeline_modified
+                and cand.timeline_modified == take_b.timeline_modified
+                and abs(cand.metrics.duration_s - take_a.metrics.duration_s) <= 0.1
+                and abs(cand.metrics.duration_s - take_b.metrics.duration_s) <= 0.1
+            )
+
+        chain_a = _lineage(take_a.take_id)
+        chain_b = _lineage(take_b.take_id)
+        set_b = {t.take_id for t in chain_b}
+
+        # Earliest shared ancestor matching both candidate timelines
+        for anc in chain_a:
+            if anc.take_id in set_b and _matches_both(anc):
+                return anc.take_id
+
+        # Earliest ancestor of A (e.g., trimmed preview root) matching timeline & duration
+        for anc in chain_a:
+            if anc.take_id not in {take_a.take_id, take_b.take_id} and _matches_both(anc):
+                return anc.take_id
+
+        return "take_000" if "take_000" in take_map else chain_a[0].take_id
+
     def create_ab_test(
         self,
         session_id: str,
@@ -405,25 +579,28 @@ class SessionManager:
         focus_end_s: float | None = None,
         blind: bool = False,
         notes: str = "",
-        original_take_id: str = "take_000",
+        original_take_id: str | None = None,
+        match_original: bool = False,
     ) -> ABTestRecord:
-        """Create a loudness-matched A/B test comparing two candidate takes and the original."""
+        """Create an A/B test matching candidate loudness by default (optional original match)."""
         summary = self.get_session(session_id)
         take_a = self.get_take(session_id, take_a_id)
         take_b = self.get_take(session_id, take_b_id)
-        take_o = self.get_take(session_id, original_take_id)
+        resolved_orig_id = self._resolve_original_take_id(
+            summary, take_a, take_b, original_take_id
+        )
+        take_o = self.get_take(session_id, resolved_orig_id)
 
-        lufs_values = [
+        candidate_lufs = [
             v
-            for v in (
-                take_a.metrics.integrated_lufs,
-                take_b.metrics.integrated_lufs,
-                take_o.metrics.integrated_lufs,
-            )
+            for v in (take_a.metrics.integrated_lufs, take_b.metrics.integrated_lufs)
             if v is not None
         ]
-        if lufs_values:
-            target_lufs = min(lufs_values)
+        if match_original and take_o.metrics.integrated_lufs is not None:
+            candidate_lufs.append(take_o.metrics.integrated_lufs)
+
+        if candidate_lufs:
+            target_lufs = min(candidate_lufs)
 
             def _attenuation_gain(lufs: float | None) -> float:
                 if lufs is None:
@@ -436,17 +613,18 @@ class SessionManager:
         else:
             gain_a = gain_b = gain_o = 0.0
 
-        ab_id = f"ab_{len(summary.ab_tests) + 1:03d}"
+        ab_id = _next_prefixed_id([a.ab_id for a in summary.ab_tests], "ab_")
         record = ABTestRecord(
             ab_id=ab_id,
             session_id=session_id,
             created_at=_utc_now_iso(),
             take_a_id=take_a_id,
             take_b_id=take_b_id,
-            original_take_id=original_take_id,
+            original_take_id=resolved_orig_id,
             focus_start_s=focus_start_s,
             focus_end_s=focus_end_s,
             blind=blind,
+            match_original=match_original,
             notes=notes,
             gain_db_a=gain_a,
             gain_db_b=gain_b,
@@ -542,6 +720,77 @@ class SessionManager:
     def ab_ui_url(self, session_id: str, ab_id: str) -> str:
         """Build the local A/B studio URL for a test."""
         return f"{self.settings.ui_base_url}/?session={session_id}&ab={ab_id}"
+
+    def delete_take(
+        self, session_id: str, take_id: str, cascade: bool = False
+    ) -> dict[str, Any]:
+        """Delete a non-root take (and optional descendant subtree) plus orphaned A/B tests."""
+        if take_id == "take_000":
+            raise ValueError(
+                "Cannot delete immutable root 'take_000'. Use delete_session to remove the session."
+            )
+        summary = self.get_session(session_id)
+        take_ids = {t.take_id for t in summary.takes}
+        if take_id not in take_ids:
+            raise FileNotFoundError(f"Take '{take_id}' not found in session '{session_id}'.")
+
+        children_by_parent: dict[str, list[str]] = {}
+        for t in summary.takes:
+            if t.parent_take_id:
+                children_by_parent.setdefault(t.parent_take_id, []).append(t.take_id)
+
+        descendants: list[str] = []
+        queue = list(children_by_parent.get(take_id, []))
+        while queue:
+            cid = queue.pop(0)
+            if cid not in descendants:
+                descendants.append(cid)
+                queue.extend(children_by_parent.get(cid, []))
+
+        if descendants and not cascade:
+            raise ValueError(
+                f"Take '{take_id}' has child take(s) {descendants}. "
+                "Pass cascade=True to delete the take and its descendants."
+            )
+
+        to_delete = {take_id, *descendants}
+        sdir = self._session_dir(session_id)
+        for tid in sorted(to_delete):
+            tdir = sdir / "takes" / tid
+            if tdir.exists():
+                shutil.rmtree(tdir, ignore_errors=True)
+
+        summary.takes = [t for t in summary.takes if t.take_id not in to_delete]
+        deleted_ab_ids: list[str] = []
+        kept_abs: list[ABTestRecord] = []
+        for ab in summary.ab_tests:
+            if (
+                ab.take_a_id in to_delete
+                or ab.take_b_id in to_delete
+                or ab.original_take_id in to_delete
+            ):
+                deleted_ab_ids.append(ab.ab_id)
+                ab_file = sdir / "ab_tests" / f"{ab.ab_id}.json"
+                if ab_file.exists():
+                    ab_file.unlink()
+            else:
+                kept_abs.append(ab)
+        summary.ab_tests = kept_abs
+        self._save_session(summary)
+
+        return {
+            "session_id": session_id,
+            "deleted_take_ids": sorted(to_delete),
+            "deleted_ab_ids": deleted_ab_ids,
+            "remaining_takes": len(summary.takes),
+        }
+
+    def delete_session(self, session_id: str) -> dict[str, Any]:
+        """Permanently delete a session directory and all its takes and A/B tests."""
+        self.get_session(session_id)
+        sdir = self._session_dir(session_id)
+        shutil.rmtree(sdir)
+        return {"session_id": session_id, "deleted": True}
 
 
 def read_take_recipe(take: TakeRecord) -> dict[str, Any] | None:

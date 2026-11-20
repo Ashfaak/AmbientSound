@@ -53,12 +53,15 @@ def test_web_ui_endpoints_and_blind_redaction(tmp_path: Path) -> None:
     assert r_sessions.status_code == 200
     assert len(r_sessions.json()) == 1
 
-    # Before verdict in blind mode, labels/recipes are redacted
+    # Before verdict in blind mode, labels/recipes/step_metrics/event_counts are redacted
     r_ab = client.get(f"/api/sessions/{session.session_id}/ab-tests/{ab.ab_id}")
     assert r_ab.status_code == 200
     data = r_ab.json()
     assert data["redacted"] is True
     assert data["takes"]["a"]["recipe"] is None
+    assert data["takes"]["a"]["step_metrics"] == []
+    assert data["takes"]["a"]["event_counts"] == {}
+    assert data["takes"]["a"]["events_total"] == 0
     assert data["takes"]["a"]["label"] == "Candidate A (Blind)"
 
     # Audio, residual, and spectrogram assets stream cleanly
@@ -121,4 +124,7 @@ def test_web_ui_endpoints_and_blind_redaction(tmp_path: Path) -> None:
     assert revealed["redacted"] is False
     assert revealed["takes"]["a"]["label"] == "Gentle HPF"
     assert revealed["takes"]["a"]["recipe"] is not None
+    assert len(revealed["takes"]["a"]["step_metrics"]) == 1
+    assert "event_counts" in revealed["takes"]["a"]
+    assert "events_total" in revealed["takes"]["a"]
     assert revealed["ab_test"]["verdict"]["winner"] == "a"

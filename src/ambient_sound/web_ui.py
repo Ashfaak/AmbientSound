@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel, Field
 
 from ambient_sound import __version__
+from ambient_sound.analysis import summarize_events
 from ambient_sound.config import Settings
 from ambient_sound.io_audio import render_wav_bytes
 from ambient_sound.models import ABTestRecord, TakeRecord
@@ -47,16 +48,25 @@ def _serialize_take_for_ui(
                 "integrated_lufs": take.metrics.integrated_lufs,
             },
             "events": [],
+            "event_counts": {},
+            "events_total": 0,
             "recipe": None,
+            "step_metrics": [],
             "has_residual": has_res,
             "has_diff_spectrogram": take.diff_spectrogram_path is not None,
         }
+    bounded_events, counts, filtered_total, _ = summarize_events(take.events, max_events=50)
+    merged_counts = take.event_counts or counts
+    events_total = sum(merged_counts.values()) if merged_counts else filtered_total
     return {
         "take_id": take.take_id,
         "label": take.label,
         "metrics": take.metrics.model_dump(),
-        "events": [e.model_dump() for e in take.events],
+        "events": [e.model_dump() for e in bounded_events],
+        "event_counts": merged_counts,
+        "events_total": events_total,
         "recipe": take.recipe.model_dump() if take.recipe else None,
+        "step_metrics": [s.model_dump() for s in take.step_metrics],
         "has_residual": has_res,
         "has_diff_spectrogram": take.diff_spectrogram_path is not None,
     }

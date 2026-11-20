@@ -47,12 +47,14 @@ def test_mcp_tool_workflow_and_sandboxing(tmp_path: Path) -> None:
         "create_ab_test",
         "list_ab_tests",
         "get_ab_feedback",
+        "delete_take",
+        "delete_session",
         "export_take",
     }.issubset(tool_names)
 
     health = _call_tool_json(mcp, "health_check", {})
     assert health["status"] == "ok"
-    assert health["filter_count"] == 14
+    assert health["filter_count"] == 15
 
     filters_res = _call_tool_json(mcp, "list_filters", {})
     filters = filters_res["filters"]
@@ -152,8 +154,34 @@ def test_mcp_tool_workflow_and_sandboxing(tmp_path: Path) -> None:
     )
     assert feedback["verdict"] is None
 
-    summary = _call_tool_json(mcp, "get_session_summary", {"session_id": sid})
+    summary = _call_tool_json(
+        mcp,
+        "get_session_summary",
+        {"session_id": sid, "include_events": False},
+    )
     assert len(summary["takes"]) == 3
+    assert summary["takes"][0]["events"] == []
+    assert "event_counts" in summary["takes"][0]
+    assert "events_total" in summary["takes"][0]
+    assert "step_metrics" in take1 and len(take1["step_metrics"]) == 1
+
+    analyzed_filtered = _call_tool_json(
+        mcp,
+        "analyze_take",
+        {
+            "session_id": sid,
+            "take_id": "take_000",
+            "event_kinds": ["slow_pass"],
+            "max_events": 10,
+        },
+    )
+    assert analyzed_filtered["events_truncated"] is False
+    assert all(e["kind"] == "slow_pass" for e in analyzed_filtered["events"])
+
+    del_t2 = _call_tool_json(
+        mcp, "delete_take", {"session_id": sid, "take_id": take2["take_id"]}
+    )
+    assert take2["take_id"] in del_t2["deleted_take_ids"]
 
     out_wav = tmp_path / "exported_clean.wav"
     exported = _call_tool_json(
@@ -162,6 +190,9 @@ def test_mcp_tool_workflow_and_sandboxing(tmp_path: Path) -> None:
         {"session_id": sid, "take_id": take1["take_id"], "output_path": str(out_wav)},
     )
     assert Path(exported["output_path"]).exists()
+
+    del_sess = _call_tool_json(mcp, "delete_session", {"session_id": sid})
+    assert del_sess["deleted"] is True
 
     # Path traversal outside allowed_roots must fail via ToolError
     with pytest.raises(ToolError):

@@ -61,6 +61,25 @@ class AudioMetrics(BaseModel):
     rumble_ratio_db: float | None = None
     hum_peaks_hz: list[float] = Field(default_factory=list)
     tonal_peaks_hz: list[float] = Field(default_factory=list)
+    loudness_range_lu: float | None = None
+    noise_floor_dbfs: float | None = None
+    short_term_lufs_stats: dict[str, float] | None = None
+    short_term_lufs_timeline: list[dict[str, float]] = Field(default_factory=list)
+
+
+class StepTelemetry(BaseModel):
+    """Per-step level and provenance telemetry recorded during process_take."""
+
+    step_index: int
+    filter_name: str
+    params: dict[str, Any] = Field(default_factory=dict)
+    input_rms_dbfs: float | None = None
+    output_rms_dbfs: float | None = None
+    input_peak_dbfs: float | None = None
+    output_peak_dbfs: float | None = None
+    input_lufs: float | None = None
+    output_lufs: float | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
 
 
 class FilterStep(BaseModel):
@@ -90,10 +109,15 @@ class TakeRecord(BaseModel):
     residual_path: str | None = None
     spectrogram_path: str | None = None
     diff_spectrogram_path: str | None = None
+    events_path: str | None = None
     sha256: str
+    source_offset_s: float = 0.0
+    timeline_modified: bool = False
     recipe: ProcessingRecipe | None = None
     metrics: AudioMetrics
+    event_counts: dict[str, int] = Field(default_factory=dict)
     events: list[DistractionEvent] = Field(default_factory=list)
+    step_metrics: list[StepTelemetry] = Field(default_factory=list)
 
 
 class ABVerdict(BaseModel):
@@ -117,6 +141,7 @@ class ABTestRecord(BaseModel):
     focus_start_s: float | None = None
     focus_end_s: float | None = None
     blind: bool = False
+    match_original: bool = False
     notes: str = ""
     gain_db_a: float = 0.0
     gain_db_b: float = 0.0

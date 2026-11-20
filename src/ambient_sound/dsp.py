@@ -24,7 +24,7 @@ from ambient_sound.io_audio import (
     load_audio_slice,
     probe_audio,
 )
-from ambient_sound.models import AudioInfo, FilterStep
+from ambient_sound.models import AudioInfo, FilterStep, StepTelemetry
 
 FILTER_SPECS: list[dict[str, Any]] = [
     {
@@ -107,8 +107,10 @@ FILTER_SPECS: list[dict[str, Any]] = [
             "(single or batched spans)."
         ),
         "ambient_guidance": (
-            "Use envelope_mode='swell' and long fade_ms (800-3000 ms) for 5-20 s passing "
-            "vehicles, or pass spans=[...] to attenuate multiple passes in one step."
+            "Use envelope_mode='adaptive' for asymmetric 5-20 s vehicle passes so peak cut tracks "
+            "the loudest excess without hollowing quiet edges, or 'swell' for symmetric fades. "
+            "Pass spans=[{start_s, end_s, low_hz?, high_hz?, attenuation_db?, fade_ms?, "
+            "envelope_mode?}] to batch multiple passes in one step."
         ),
         "params": {
             "start_s": {"type": "float | null", "default": None},
@@ -117,7 +119,11 @@ FILTER_SPECS: list[dict[str, Any]] = [
             "high_hz": {"type": "float", "default": 250.0},
             "attenuation_db": {"type": "float", "default": -18.0, "min": -60.0, "max": 12.0},
             "fade_ms": {"type": "float", "default": 30.0, "min": 2.0, "max": 5000.0},
-            "envelope_mode": {"type": "str", "default": "flat", "choices": ["flat", "swell"]},
+            "envelope_mode": {
+                "type": "str",
+                "default": "flat",
+                "choices": ["flat", "swell", "adaptive"],
+            },
             "n_fft": {"type": "int", "default": 2048, "min": 256, "max": 8192},
             "spans": {"type": "list[dict] | null", "default": None},
         },
@@ -128,8 +134,9 @@ FILTER_SPECS: list[dict[str, Any]] = [
             "Replaces distracted time span(s) with matched clean ambient texture via crossfades."
         ),
         "ambient_guidance": (
-            "Supports crossfade_ms up to 5000 ms and batch spans=[...] for multiple events. "
-            "Auto-selects clean donor outside all target spans."
+            "Supports crossfade_ms up to 5000 ms and batch spans=[{start_s, end_s, "
+            "crossfade_ms?, source_start_s?}] for per-span crossfades and explicit donors. "
+            "Auto-selects clean donor outside all target spans and records donor provenance."
         ),
         "params": {
             "start_s": {"type": "float | null", "default": None},
@@ -176,6 +183,17 @@ FILTER_SPECS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "gain",
+        "summary": "Pure sample-accurate linear gain stage in decibels (dB).",
+        "ambient_guidance": (
+            "Use before soft_compress on quiet recordings (e.g. -50 LUFS) so dynamics "
+            "processing reaches threshold cleanly."
+        ),
+        "params": {
+            "gain_db": {"type": "float", "default": 0.0, "min": -48.0, "max": 48.0},
+        },
+    },
+    {
         "name": "parametric_eq",
         "summary": "RBJ Audio EQ Cookbook biquad filter (peaking, lowshelf, or highshelf).",
         "ambient_guidance": (
@@ -219,14 +237,16 @@ FILTER_SPECS: list[dict[str, Any]] = [
     },
     {
         "name": "loudness_normalize",
-        "summary": "Integrated ITU-R BS.1770 LUFS normalization with true-peak ceiling guard.",
+        "summary": "Integrated ITU-R BS.1770 LUFS normalization with optional peak limiting.",
         "ambient_guidance": (
-            "Target -14 LUFS for YouTube/ASMR playback (pair with soft_compress + "
-            "true_peak_limiter), or -18 to -24 LUFS for quiet natural beds."
+            "Target -14 LUFS with limit_peaks=True (or pre-stage gain + soft_compress) for "
+            "YouTube/ASMR playback, or -18 to -24 LUFS with limit_peaks=False for quiet beds."
         ),
         "params": {
             "target_lufs": {"type": "float", "default": -18.0, "min": -40.0, "max": -6.0},
             "true_peak_ceiling_dbtp": {"type": "float", "default": -1.0, "min": -6.0, "max": -0.1},
+            "limit_peaks": {"type": "bool", "default": False},
+            "limiter_release_ms": {"type": "float", "default": 80.0, "min": 10.0, "max": 1000.0},
         },
     },
 ]
@@ -619,14 +639,45 @@ def _band_attenuate(
             continue
         fade_s = sp["fade_ms"] * 0.001
         freq_fade = max(25.0, 0.1 * (f_hi - f_lo))
+        w_f = _cosine_edge_mask(freqs, f_lo, f_hi, freq_fade)
         if sp["envelope_mode"] == "swell":
             w_t = _swell_time_mask(times, sp["start_s"], sp["end_s"], fade_s)
+            mask_2d = np.outer(w_f, w_t)
+            target_lin = 10.0 ** (sp["attenuation_db"] / 20.0)
+            gain_sp = 1.0 - mask_2d * (1.0 - target_lin)
+        elif sp["envelope_mode"] == "adaptive" and sp["attenuation_db"] < 0.0:
+            w_t = _cosine_edge_mask(times, sp["start_s"], sp["end_s"], fade_s)
+            band_power_t = np.zeros(times.size, dtype=np.float64)
+            wf_sq = (w_f * w_f)[:, np.newaxis]
+            for z in z_list:
+                band_power_t += np.sum((np.abs(z) ** 2) * wf_sq, axis=0)
+            band_db_t = 10.0 * np.log10(np.maximum(band_power_t, 1e-24))
+            dt_frame = float(times[1] - times[0]) if times.size > 1 else 0.02
+            k_smooth = max(1, int(round(0.25 / max(dt_frame, 1e-4))))
+            band_db_smooth = (
+                ndimage.uniform_filter1d(band_db_t, size=k_smooth, mode="nearest")
+                if k_smooth > 1 and band_db_t.size >= k_smooth
+                else band_db_t
+            )
+            ref_mask = (
+                (times >= sp["start_s"] - fade_s - 2.0) & (times < sp["start_s"] - fade_s * 0.25)
+            ) | ((times > sp["end_s"] + fade_s * 0.25) & (times <= sp["end_s"] + fade_s + 2.0))
+            in_mask = w_t > 0.05
+            if np.sum(ref_mask) >= 3:
+                ref_db = float(np.median(band_db_smooth[ref_mask]))
+            elif np.any(in_mask):
+                ref_db = float(np.percentile(band_db_smooth[in_mask], 15))
+            else:
+                ref_db = float(np.percentile(band_db_smooth, 15))
+            excess_db = np.maximum(0.0, band_db_smooth - ref_db)
+            cut_db_t = np.minimum(excess_db, -sp["attenuation_db"]) * w_t
+            gain_t = 10.0 ** (-cut_db_t / 20.0)
+            gain_sp = 1.0 - np.outer(w_f, 1.0 - gain_t)
         else:
             w_t = _cosine_edge_mask(times, sp["start_s"], sp["end_s"], fade_s)
-        w_f = _cosine_edge_mask(freqs, f_lo, f_hi, freq_fade)
-        mask_2d = np.outer(w_f, w_t)
-        target_lin = 10.0 ** (sp["attenuation_db"] / 20.0)
-        gain_sp = 1.0 - mask_2d * (1.0 - target_lin)
+            mask_2d = np.outer(w_f, w_t)
+            target_lin = 10.0 ** (sp["attenuation_db"] / 20.0)
+            gain_sp = 1.0 - mask_2d * (1.0 - target_lin)
         gain_total *= gain_sp
 
         pad_s = fade_s + (nperseg / float(sample_rate))
@@ -678,14 +729,14 @@ def _build_tiled_donor(donor: np.ndarray, target_len: int, xfade: int) -> np.nda
     return out[:target_len]
 
 
-def _pick_clean_donor(
+def _pick_clean_donor_with_span(
     audio: np.ndarray,
     sample_rate: int,
     exclude_spans: list[tuple[int, int]],
     target_len: int,
     xfade: int,
-) -> np.ndarray:
-    """Select the lowest-crest, smoothest clean segment outside all excluded sample intervals."""
+) -> tuple[np.ndarray, float, float]:
+    """Select the lowest-crest clean segment outside excluded intervals and return span (s)."""
     n_samples, _ = audio.shape
     margin = int(0.05 * sample_rate)
     merged_ex: list[tuple[int, int]] = []
@@ -697,21 +748,26 @@ def _pick_clean_donor(
         else:
             merged_ex.append((s_m, e_m))
 
-    candidates: list[np.ndarray] = []
+    candidates: list[tuple[int, int]] = []
     cur = 0
     for s_m, e_m in merged_ex:
         if s_m - cur > int(0.15 * sample_rate):
-            candidates.append(audio[cur:s_m])
+            candidates.append((cur, s_m))
         cur = max(cur, e_m)
     if n_samples - cur > int(0.15 * sample_rate):
-        candidates.append(audio[cur:n_samples])
+        candidates.append((cur, n_samples))
 
     if not candidates:
         ex0, ex1 = merged_ex[0] if merged_ex else (0, n_samples)
-        fallback = audio[:ex0] if ex0 >= (n_samples - ex1) else audio[ex1:]
+        fb0, fb1 = (0, ex0) if ex0 >= (n_samples - ex1) else (ex1, n_samples)
+        fallback = audio[fb0:fb1]
         if fallback.shape[0] == 0:
-            return np.zeros((target_len, audio.shape[1]), dtype=np.float64)
-        return _build_tiled_donor(fallback, target_len, xfade)
+            return np.zeros((target_len, audio.shape[1]), dtype=np.float64), 0.0, 0.0
+        return (
+            _build_tiled_donor(fallback, target_len, xfade),
+            round(fb0 / float(sample_rate), 3),
+            round(fb1 / float(sample_rate), 3),
+        )
 
     win_rms = max(32, int(0.1 * sample_rate))
     mono = np.mean(audio, axis=1)
@@ -727,24 +783,27 @@ def _pick_clean_donor(
     )
 
     best_score = float("inf")
-    best_chunk = candidates[0]
-    probe_len = min(target_len, max(int(0.25 * sample_rate), min(c.shape[0] for c in candidates)))
+    best_bounds = candidates[0]
+    probe_len = min(target_len, max(int(0.25 * sample_rate), min(e - s for s, e in candidates)))
 
-    for region in candidates:
-        if region.shape[0] <= probe_len:
-            chunk = region
+    for r_s, r_e in candidates:
+        region_len = r_e - r_s
+        if region_len <= probe_len:
+            chunk = audio[r_s:r_e]
             mono_c = np.mean(chunk, axis=1)
             rms = float(np.sqrt(np.mean(mono_c * mono_c))) + 1e-12
             crest = float(np.max(np.abs(mono_c))) / rms
             score = crest + 3.0 * abs(rms - global_med_rms) / max(global_med_rms, 1e-6)
             if score < best_score:
                 best_score = score
-                best_chunk = chunk
+                best_bounds = (r_s, r_e)
             continue
 
         step = max(32, probe_len // 4)
-        for p in range(0, region.shape[0] - probe_len + 1, step):
-            chunk = region[p : p + probe_len]
+        for p in range(0, region_len - probe_len + 1, step):
+            abs_s = r_s + p
+            abs_e = abs_s + probe_len
+            chunk = audio[abs_s:abs_e]
             mono_c = np.mean(chunk, axis=1)
             rms = float(np.sqrt(np.mean(mono_c * mono_c))) + 1e-12
             crest = float(np.max(np.abs(mono_c))) / rms
@@ -756,9 +815,26 @@ def _pick_clean_donor(
             )
             if score < best_score:
                 best_score = score
-                best_chunk = chunk
+                best_bounds = (abs_s, abs_e)
 
-    return _build_tiled_donor(best_chunk, target_len, xfade)
+    b0, b1 = best_bounds
+    return (
+        _build_tiled_donor(audio[b0:b1], target_len, xfade),
+        round(b0 / float(sample_rate), 3),
+        round(b1 / float(sample_rate), 3),
+    )
+
+
+def _pick_clean_donor(
+    audio: np.ndarray,
+    sample_rate: int,
+    exclude_spans: list[tuple[int, int]],
+    target_len: int,
+    xfade: int,
+) -> np.ndarray:
+    """Select the lowest-crest, smoothest clean segment outside all excluded sample intervals."""
+    donor, _, _ = _pick_clean_donor_with_span(audio, sample_rate, exclude_spans, target_len, xfade)
+    return donor
 
 
 def _apply_patch_slice(
@@ -835,11 +911,68 @@ def _resolve_patch_spans(
                 "xf_l": xf_l,
                 "xf_r": xf_r,
                 "desired_xf": desired_xf,
+                "crossfade_ms": xf_ms,
                 "source_start_s": item.get("source_start_s", source_start_s),
             }
         )
     resolved.sort(key=lambda r: r["p0"])
     return resolved
+
+
+def _ambience_patch_with_info(
+    audio: np.ndarray,
+    sample_rate: int,
+    start_s: float | None = None,
+    end_s: float | None = None,
+    source_start_s: float | None = None,
+    crossfade_ms: float = 40.0,
+    spans: list[dict[str, Any]] | None = None,
+) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    n_samples, _ = audio.shape
+    if n_samples < 32:
+        return audio.copy(), []
+    resolved = _resolve_patch_spans(
+        n_samples, sample_rate, start_s, end_s, source_start_s, crossfade_ms, spans
+    )
+    if not resolved:
+        return audio.copy(), []
+
+    exclude_spans = [(r["p0"], r["p1"]) for r in resolved]
+    out = audio.copy()
+    patch_log: list[dict[str, Any]] = []
+
+    for r in resolved:
+        p0, p1 = r["p0"], r["p1"]
+        patch_len = p1 - p0
+        if r["source_start_s"] is not None:
+            s_val = float(r["source_start_s"])
+            src_i0 = max(0, min(n_samples - 1, int(round(s_val * sample_rate))))
+            src_i1 = min(n_samples, src_i0 + patch_len)
+            raw_donor = audio[src_i0:src_i1]
+            if raw_donor.shape[0] == 0:
+                raw_donor = audio
+            donor = _build_tiled_donor(raw_donor, patch_len, r["desired_xf"])
+            donor_s0 = round(src_i0 / float(sample_rate), 3)
+            donor_s1 = round(src_i1 / float(sample_rate), 3)
+            src_mode = "manual"
+        else:
+            donor, donor_s0, donor_s1 = _pick_clean_donor_with_span(
+                audio, sample_rate, exclude_spans, patch_len, r["desired_xf"]
+            )
+            src_mode = "auto"
+
+        _apply_patch_slice(out, audio, sample_rate, p0, p1, r["xf_l"], r["xf_r"], donor)
+        patch_log.append(
+            {
+                "target_start_s": round(p0 / float(sample_rate), 3),
+                "target_end_s": round(p1 / float(sample_rate), 3),
+                "donor_start_s": donor_s0,
+                "donor_end_s": donor_s1,
+                "source_mode": src_mode,
+                "crossfade_ms": round(float(r.get("crossfade_ms", crossfade_ms)), 1),
+            }
+        )
+    return out, patch_log
 
 
 def _ambience_patch(
@@ -851,32 +984,9 @@ def _ambience_patch(
     crossfade_ms: float = 40.0,
     spans: list[dict[str, Any]] | None = None,
 ) -> np.ndarray:
-    n_samples, _ = audio.shape
-    if n_samples < 32:
-        return audio.copy()
-    resolved = _resolve_patch_spans(
-        n_samples, sample_rate, start_s, end_s, source_start_s, crossfade_ms, spans
+    out, _ = _ambience_patch_with_info(
+        audio, sample_rate, start_s, end_s, source_start_s, crossfade_ms, spans
     )
-    if not resolved:
-        return audio.copy()
-
-    exclude_spans = [(r["p0"], r["p1"]) for r in resolved]
-    out = audio.copy()
-
-    for r in resolved:
-        p0, p1 = r["p0"], r["p1"]
-        patch_len = p1 - p0
-        if r["source_start_s"] is not None:
-            s_val = float(r["source_start_s"])
-            src_i0 = max(0, min(n_samples - 1, int(round(s_val * sample_rate))))
-            raw_donor = audio[src_i0 : min(n_samples, src_i0 + patch_len)]
-            if raw_donor.shape[0] == 0:
-                raw_donor = audio
-            donor = _build_tiled_donor(raw_donor, patch_len, r["desired_xf"])
-        else:
-            donor = _pick_clean_donor(audio, sample_rate, exclude_spans, patch_len, r["desired_xf"])
-
-        _apply_patch_slice(out, audio, sample_rate, p0, p1, r["xf_l"], r["xf_r"], donor)
     return out
 
 
@@ -1075,6 +1185,23 @@ def _true_peak_limiter(
     frames = padded.reshape(n_frames, step, audio.shape[1])
     frame_peaks = np.max(np.abs(frames), axis=(1, 2))
 
+    # Include 4x oversampled per-frame peaks so transient inter-sample overshoots
+    # are absorbed locally rather than triggering a global gain reduction later.
+    if padded.shape[0] >= 4:
+        chunk_frames = 512
+        pad_f = 8
+        up_peaks = np.empty(n_frames, dtype=np.float64)
+        for f0 in range(0, n_frames, chunk_frames):
+            f1 = min(n_frames, f0 + chunk_frames)
+            s_a = max(0, (f0 - pad_f) * step)
+            s_b = min(padded.shape[0], (f1 + pad_f) * step)
+            up = signal.resample_poly(padded[s_a:s_b], 4, 1, axis=0)
+            off = (f0 * step - s_a) * 4
+            cnt = (f1 - f0) * step * 4
+            seg_up = up[off : off + cnt].reshape(f1 - f0, step * 4, audio.shape[1])
+            up_peaks[f0:f1] = np.max(np.abs(seg_up), axis=(1, 2))
+        frame_peaks = np.maximum(frame_peaks, up_peaks)
+
     lookahead_frames = max(2, int(round(0.006 / 0.002)))
     peak_win = ndimage.maximum_filter1d(frame_peaks, size=lookahead_frames, mode="nearest")
 
@@ -1099,30 +1226,105 @@ def _true_peak_limiter(
     return np.clip(limited, -ceiling_lin, ceiling_lin)
 
 
+def _gain(audio: np.ndarray, sample_rate: int, gain_db: float = 0.0) -> np.ndarray:
+    del sample_rate
+    g_db = max(-48.0, min(48.0, float(gain_db)))
+    if abs(g_db) < 1e-6:
+        return audio.copy()
+    return audio * (10.0 ** (g_db / 20.0))
+
+
+def _measure_lufs_and_tp(audio: np.ndarray, sample_rate: int) -> tuple[float | None, float]:
+    acc = StreamingLUFS(sample_rate, audio.shape[1])
+    acc.update(audio)
+    return acc.finalize(), max(chunked_true_peak_linear(audio), 1e-12)
+
+
+def _loudness_normalize_with_info(
+    audio: np.ndarray,
+    sample_rate: int,
+    target_lufs: float = -18.0,
+    true_peak_ceiling_dbtp: float = -1.0,
+    limit_peaks: bool = False,
+    limiter_release_ms: float = 80.0,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    duration_s = audio.shape[0] / float(max(sample_rate, 1))
+    rms = float(np.sqrt(np.mean(audio * audio)))
+    if duration_s < 0.45 or rms <= 1e-10:
+        return audio.copy(), {"applied_gain_db": 0.0, "peak_limited": bool(limit_peaks)}
+
+    cur_lufs, tp_lin = _measure_lufs_and_tp(audio, sample_rate)
+    if cur_lufs is None or not math.isfinite(cur_lufs):
+        return audio.copy(), {"applied_gain_db": 0.0, "peak_limited": bool(limit_peaks)}
+
+    ceiling = float(true_peak_ceiling_dbtp)
+    desired_gain_db = max(-48.0, min(48.0, float(target_lufs) - cur_lufs))
+
+    if not limit_peaks:
+        tp_db = 20.0 * math.log10(tp_lin)
+        applied_gain_db = min(desired_gain_db, ceiling - tp_db)
+        return audio * (10.0 ** (applied_gain_db / 20.0)), {
+            "target_lufs": round(float(target_lufs), 2),
+            "applied_gain_db": round(applied_gain_db, 3),
+            "peak_limited": False,
+        }
+
+    rel_ms = float(limiter_release_ms)
+    out = _true_peak_limiter(
+        audio * (10.0 ** (desired_gain_db / 20.0)),
+        sample_rate,
+        ceiling_dbtp=ceiling,
+        release_ms=rel_ms,
+    )
+    total_gain_db = desired_gain_db
+    lufs_1, tp_1 = _measure_lufs_and_tp(out, sample_rate)
+    for _ in range(3):
+        if lufs_1 is None or not math.isfinite(lufs_1):
+            break
+        deficit = float(target_lufs) - lufs_1
+        if deficit <= 0.25:
+            break
+        topup_db = min(18.0, deficit)
+        out = _true_peak_limiter(
+            out * (10.0 ** (topup_db / 20.0)),
+            sample_rate,
+            ceiling_dbtp=ceiling,
+            release_ms=rel_ms,
+        )
+        total_gain_db += topup_db
+        lufs_1, tp_1 = _measure_lufs_and_tp(out, sample_rate)
+
+    tp_1_db = 20.0 * math.log10(max(tp_1, 1e-12))
+    if tp_1_db > ceiling:
+        trim_db = ceiling - tp_1_db
+        out = out * (10.0 ** (trim_db / 20.0))
+        total_gain_db += trim_db
+
+    return out, {
+        "target_lufs": round(float(target_lufs), 2),
+        "applied_gain_db": round(total_gain_db, 3),
+        "peak_limited": True,
+        "ceiling_dbtp": round(ceiling, 2),
+    }
+
+
 def _loudness_normalize(
     audio: np.ndarray,
     sample_rate: int,
     target_lufs: float = -18.0,
     true_peak_ceiling_dbtp: float = -1.0,
+    limit_peaks: bool = False,
+    limiter_release_ms: float = 80.0,
 ) -> np.ndarray:
-    duration_s = audio.shape[0] / float(max(sample_rate, 1))
-    rms = float(np.sqrt(np.mean(audio * audio)))
-    if duration_s < 0.45 or rms <= 1e-10:
-        return audio.copy()
-
-    acc = StreamingLUFS(sample_rate, audio.shape[1])
-    acc.update(audio)
-    current_lufs = acc.finalize()
-    if current_lufs is None or not math.isfinite(current_lufs):
-        return audio.copy()
-
-    desired_gain_db = float(target_lufs) - current_lufs
-    tp_lin = max(chunked_true_peak_linear(audio), 1e-12)
-    tp_db = 20.0 * math.log10(tp_lin)
-    max_safe_gain_db = float(true_peak_ceiling_dbtp) - tp_db
-    applied_gain_db = min(desired_gain_db, max_safe_gain_db)
-
-    return audio * (10.0 ** (applied_gain_db / 20.0))
+    out, _ = _loudness_normalize_with_info(
+        audio,
+        sample_rate,
+        target_lufs=target_lufs,
+        true_peak_ceiling_dbtp=true_peak_ceiling_dbtp,
+        limit_peaks=limit_peaks,
+        limiter_release_ms=limiter_release_ms,
+    )
+    return out
 
 
 _FILTER_HANDLERS = {
@@ -1136,6 +1338,7 @@ _FILTER_HANDLERS = {
     "trim_range": _trim_range,
     "cut_regions": _cut_regions,
     "fade_edges": _fade_edges,
+    "gain": _gain,
     "parametric_eq": _parametric_eq,
     "soft_compress": _soft_compress,
     "true_peak_limiter": _true_peak_limiter,
@@ -1149,10 +1352,21 @@ _LOCAL_STREAMABLE_FILTERS = {
     "declick_impulse",
     "spectral_denoise",
     "band_attenuate",
+    "gain",
     "parametric_eq",
     "soft_compress",
     "true_peak_limiter",
 }
+
+
+def _array_rms_peak_db(audio: np.ndarray) -> tuple[float | None, float | None]:
+    if audio.size == 0:
+        return None, None
+    rms_lin = float(np.sqrt(np.mean(audio * audio)))
+    pk_lin = float(np.max(np.abs(audio)))
+    rms_db = round(20.0 * math.log10(rms_lin), 4) if rms_lin > 0.0 else None
+    pk_db = round(20.0 * math.log10(pk_lin), 4) if pk_lin > 0.0 else None
+    return rms_db, pk_db
 
 
 def apply_recipe(
@@ -1170,6 +1384,60 @@ def apply_recipe(
             raise ValueError(f"Unknown filter '{step.filter_name}'. Available: {known}")
         out = ensure_2d_audio(handler(out, int(sample_rate), **step.params))
     return out
+
+
+def apply_recipe_with_telemetry(
+    audio: np.ndarray,
+    sample_rate: int,
+    steps: list[FilterStep] | list[dict[str, Any]],
+) -> tuple[np.ndarray, list[StepTelemetry]]:
+    """Apply FilterStep chain in memory and return per-step level + provenance telemetry."""
+    sr = int(sample_rate)
+    out = ensure_2d_audio(audio).copy()
+    telemetry: list[StepTelemetry] = []
+
+    for idx, item in enumerate(steps):
+        step = item if isinstance(item, FilterStep) else FilterStep.model_validate(item)
+        handler = _FILTER_HANDLERS.get(step.filter_name)
+        if handler is None:
+            known = ", ".join(sorted(_FILTER_HANDLERS))
+            raise ValueError(f"Unknown filter '{step.filter_name}'. Available: {known}")
+
+        in_rms_db, in_pk_db = _array_rms_peak_db(out)
+        in_lufs = None
+        if out.shape[0] / float(max(sr, 1)) >= 0.45:
+            in_lufs, _ = _measure_lufs_and_tp(out, sr)
+
+        details: dict[str, Any] = {}
+        if step.filter_name == "ambience_patch":
+            out, patch_log = _ambience_patch_with_info(out, sr, **step.params)
+            details = {"patched_spans": patch_log}
+        elif step.filter_name == "loudness_normalize":
+            out, norm_info = _loudness_normalize_with_info(out, sr, **step.params)
+            details = norm_info
+        else:
+            out = ensure_2d_audio(handler(out, sr, **step.params))
+
+        out_rms_db, out_pk_db = _array_rms_peak_db(out)
+        out_lufs = None
+        if out.shape[0] / float(max(sr, 1)) >= 0.45:
+            out_lufs, _ = _measure_lufs_and_tp(out, sr)
+
+        telemetry.append(
+            StepTelemetry(
+                step_index=idx,
+                filter_name=step.filter_name,
+                params=copy.deepcopy(step.params),
+                input_rms_dbfs=in_rms_db,
+                output_rms_dbfs=out_rms_db,
+                input_peak_dbfs=in_pk_db,
+                output_peak_dbfs=out_pk_db,
+                input_lufs=in_lufs,
+                output_lufs=out_lufs,
+                details=details,
+            )
+        )
+    return out, telemetry
 
 
 def _shift_step_times(step: FilterStep, offset_s: float) -> FilterStep:
@@ -1192,11 +1460,37 @@ def _shift_step_times(step: FilterStep, offset_s: float) -> FilterStep:
     return FilterStep(filter_name=step.filter_name, params=params)
 
 
+def _stats_from_accum(
+    sum_sq: float, peak_lin: float, count: int
+) -> tuple[float | None, float | None]:
+    if count <= 0:
+        return None, None
+    rms_lin = math.sqrt(sum_sq / float(count))
+    rms_db = round(20.0 * math.log10(rms_lin), 4) if rms_lin > 0.0 else None
+    pk_db = round(20.0 * math.log10(peak_lin), 4) if peak_lin > 0.0 else None
+    return rms_db, pk_db
+
+
+def _probe_stream_rms_peak(wav_path: Path) -> tuple[float | None, float | None]:
+    sum_sq = 0.0
+    peak_lin = 0.0
+    count = 0
+    for _, block in iter_audio_blocks(wav_path, block_seconds=30.0, dtype="float64"):
+        if block.size == 0:
+            continue
+        sum_sq += float(np.sum(block * block))
+        peak_lin = max(peak_lin, float(np.max(np.abs(block))))
+        count += block.size
+    return _stats_from_accum(sum_sq, peak_lin, count)
+
+
 def _stream_local_batch(
     src_wav: Path,
     dst_wav: Path,
     steps: list[FilterStep],
     block_seconds: float,
+    step_telemetry_out: list[StepTelemetry] | None = None,
+    base_step_index: int = 0,
 ) -> None:
     info = probe_audio(src_wav)
     sr = info.sample_rate
@@ -1210,6 +1504,11 @@ def _stream_local_batch(
             for sp in st.params.get("spans") or []:
                 max_fade_s = max(max_fade_s, float(sp.get("fade_ms", 30.0)) * 0.001)
     pad_s = min(8.0, max(2.0, max_fade_s + 1.0))
+
+    n_steps = len(steps)
+    stage_sum_sq = [0.0] * (n_steps + 1)
+    stage_peak = [0.0] * (n_steps + 1)
+    stage_count = [0] * (n_steps + 1)
 
     block_frames = max(1024, int(round(block_seconds * sr)))
     with sf.SoundFile(
@@ -1230,12 +1529,47 @@ def _stream_local_batch(
 
             buf_arr, _ = load_audio_slice(src_wav, start_s=buf_s0, end_s=buf_s1, dtype="float64")
             shifted = [_shift_step_times(st, buf_s0) for st in steps]
-            processed = apply_recipe(buf_arr, sr, shifted)
-
             trim_l = int(round((core_s0 - buf_s0) * sr))
             core_len = core_end - pos
+
+            cur = ensure_2d_audio(buf_arr)
+            if step_telemetry_out is not None:
+                c0 = cur[trim_l : trim_l + core_len]
+                if c0.size:
+                    stage_sum_sq[0] += float(np.sum(c0 * c0))
+                    stage_peak[0] = max(stage_peak[0], float(np.max(np.abs(c0))))
+                    stage_count[0] += c0.size
+                for j, sh in enumerate(shifted):
+                    cur = ensure_2d_audio(_FILTER_HANDLERS[sh.filter_name](cur, sr, **sh.params))
+                    cj = cur[trim_l : trim_l + core_len]
+                    if cj.size:
+                        stage_sum_sq[j + 1] += float(np.sum(cj * cj))
+                        stage_peak[j + 1] = max(stage_peak[j + 1], float(np.max(np.abs(cj))))
+                        stage_count[j + 1] += cj.size
+                processed = cur
+            else:
+                processed = apply_recipe(cur, sr, shifted)
+
             fout.write(processed[trim_l : trim_l + core_len])
             pos = core_end
+
+    if step_telemetry_out is not None:
+        for j, st in enumerate(steps):
+            in_rms, in_pk = _stats_from_accum(stage_sum_sq[j], stage_peak[j], stage_count[j])
+            out_rms, out_pk = _stats_from_accum(
+                stage_sum_sq[j + 1], stage_peak[j + 1], stage_count[j + 1]
+            )
+            step_telemetry_out.append(
+                StepTelemetry(
+                    step_index=base_step_index + j,
+                    filter_name=st.filter_name,
+                    params=copy.deepcopy(st.params),
+                    input_rms_dbfs=in_rms,
+                    output_rms_dbfs=out_rms,
+                    input_peak_dbfs=in_pk,
+                    output_peak_dbfs=out_pk,
+                )
+            )
 
 
 def _stream_fade_edges(src_wav: Path, dst_wav: Path, params: dict[str, Any]) -> None:
@@ -1349,13 +1683,13 @@ def _stream_cut_regions(src_wav: Path, dst_wav: Path, params: dict[str, Any]) ->
             fout.write(tail)
 
 
-def _pick_streaming_donor(
+def _pick_streaming_donor_with_span(
     src_wav: Path,
     exclude_spans: list[tuple[int, int]],
     target_len: int,
     xfade: int,
-) -> np.ndarray:
-    """Locate a clean donor slice on disk with bounded RAM using a streaming RMS scan."""
+) -> tuple[np.ndarray, float, float]:
+    """Locate a clean donor slice on disk with bounded RAM and return (donor, start_s, end_s)."""
     info = probe_audio(src_wav)
     sr = info.sample_rate
     ch = info.channels
@@ -1380,7 +1714,7 @@ def _pick_streaming_donor(
         free_spans.append((cur, total))
 
     if not free_spans:
-        return np.zeros((target_len, ch), dtype=np.float64)
+        return np.zeros((target_len, ch), dtype=np.float64), 0.0, 0.0
 
     probe_len = min(target_len, max(int(0.5 * sr), min(e - s for s, e in free_spans)))
     # Stream 0.25 s window RMS & crest across free spans
@@ -1416,20 +1750,43 @@ def _pick_streaming_donor(
             best_score = score
             best_sample_start = start_f
 
+    donor_s0 = best_sample_start / float(sr)
+    donor_s1 = min(info.duration_s, (best_sample_start + probe_len) / float(sr))
     raw_donor, _ = load_audio_slice(
         src_wav,
-        start_s=best_sample_start / float(sr),
-        end_s=(best_sample_start + probe_len) / float(sr),
+        start_s=donor_s0,
+        end_s=donor_s1,
         dtype="float64",
     )
-    return _build_tiled_donor(raw_donor, target_len, xfade)
+    return (
+        _build_tiled_donor(raw_donor, target_len, xfade),
+        round(donor_s0, 3),
+        round(donor_s1, 3),
+    )
 
 
-def _stream_ambience_patch(src_wav: Path, dst_wav: Path, params: dict[str, Any]) -> None:
+def _pick_streaming_donor(
+    src_wav: Path,
+    exclude_spans: list[tuple[int, int]],
+    target_len: int,
+    xfade: int,
+) -> np.ndarray:
+    """Locate a clean donor slice on disk with bounded RAM using a streaming RMS scan."""
+    donor, _, _ = _pick_streaming_donor_with_span(src_wav, exclude_spans, target_len, xfade)
+    return donor
+
+
+def _stream_ambience_patch(
+    src_wav: Path,
+    dst_wav: Path,
+    params: dict[str, Any],
+    patch_log_out: list[dict[str, Any]] | None = None,
+) -> None:
     info = probe_audio(src_wav)
     sr = info.sample_rate
     ch = info.channels
     total = info.frames
+    default_xf_ms = float(params.get("crossfade_ms", 40.0))
 
     resolved = _resolve_patch_spans(
         total,
@@ -1437,7 +1794,7 @@ def _stream_ambience_patch(src_wav: Path, dst_wav: Path, params: dict[str, Any])
         params.get("start_s"),
         params.get("end_s"),
         params.get("source_start_s"),
-        float(params.get("crossfade_ms", 40.0)),
+        default_xf_ms,
         params.get("spans"),
     )
     exclude_spans = [(r["p0"], r["p1"]) for r in resolved]
@@ -1448,10 +1805,11 @@ def _stream_ambience_patch(src_wav: Path, dst_wav: Path, params: dict[str, Any])
         patch_len = p1 - p0
         if r["source_start_s"] is not None:
             s_t = max(0.0, float(r["source_start_s"]))
+            e_t = min(info.duration_s, s_t + patch_len / float(sr))
             raw_d, _ = load_audio_slice(
                 src_wav,
                 start_s=s_t,
-                end_s=min(info.duration_s, s_t + patch_len / float(sr)),
+                end_s=e_t,
                 dtype="float64",
             )
             donor = (
@@ -1459,8 +1817,12 @@ def _stream_ambience_patch(src_wav: Path, dst_wav: Path, params: dict[str, Any])
                 if raw_d.size
                 else np.zeros((patch_len, ch))
             )
+            donor_s0, donor_s1, src_mode = round(s_t, 3), round(e_t, 3), "manual"
         else:
-            donor = _pick_streaming_donor(src_wav, exclude_spans, patch_len, r["desired_xf"])
+            donor, donor_s0, donor_s1 = _pick_streaming_donor_with_span(
+                src_wav, exclude_spans, patch_len, r["desired_xf"]
+            )
+            src_mode = "auto"
 
         # Boundary context slice around [p0, p1]
         orig_slice, _ = load_audio_slice(
@@ -1491,6 +1853,17 @@ def _stream_ambience_patch(src_wav: Path, dst_wav: Path, params: dict[str, Any])
             t_r = np.linspace(0.0, math.pi * 0.5, xf_r, endpoint=True)[:, np.newaxis]
             blended[-xf_r:] = donor[-xf_r:] * np.cos(t_r) + orig_slice[-xf_r:] * np.sin(t_r)
         patches.append((p0, p1, blended))
+        if patch_log_out is not None:
+            patch_log_out.append(
+                {
+                    "target_start_s": round(p0 / float(sr), 3),
+                    "target_end_s": round(p1 / float(sr), 3),
+                    "donor_start_s": donor_s0,
+                    "donor_end_s": donor_s1,
+                    "source_mode": src_mode,
+                    "crossfade_ms": round(float(r.get("crossfade_ms", default_xf_ms)), 1),
+                }
+            )
 
     with (
         sf.SoundFile(str(src_wav), mode="r") as fin,
@@ -1529,32 +1902,134 @@ def _stream_ambience_patch(src_wav: Path, dst_wav: Path, params: dict[str, Any])
                 fout.write(c)
 
 
-def _stream_loudness_normalize(src_wav: Path, dst_wav: Path, params: dict[str, Any]) -> None:
+def _probe_stream_lufs_tp(wav_path: Path) -> tuple[float | None, float]:
+    info = probe_audio(wav_path)
+    lufs_acc = StreamingLUFS(info.sample_rate, info.channels)
+    tp_acc = StreamingTruePeak(info.channels)
+    for _, block in iter_audio_blocks(wav_path, block_seconds=30.0, dtype="float64"):
+        lufs_acc.update(block)
+        tp_acc.update(block)
+    return lufs_acc.finalize(), max(tp_acc.peak_lin, 1e-12)
+
+
+def _stream_loudness_normalize(
+    src_wav: Path,
+    dst_wav: Path,
+    params: dict[str, Any],
+    info_out: dict[str, Any] | None = None,
+) -> None:
     info = probe_audio(src_wav)
     sr = info.sample_rate
     ch = info.channels
     target_lufs = float(params.get("target_lufs", -18.0))
     ceiling_dbtp = float(params.get("true_peak_ceiling_dbtp", -1.0))
+    limit_peaks = bool(params.get("limit_peaks", False))
+    rel_ms = float(params.get("limiter_release_ms", 80.0))
 
-    lufs_acc = StreamingLUFS(sr, ch)
-    tp_acc = StreamingTruePeak(ch)
-    for _, block in iter_audio_blocks(src_wav, block_seconds=30.0, dtype="float64"):
-        lufs_acc.update(block)
-        tp_acc.update(block)
+    cur_lufs, tp_lin = _probe_stream_lufs_tp(src_wav)
+    if cur_lufs is None or not math.isfinite(cur_lufs):
+        shutil.copy2(src_wav, dst_wav)
+        if info_out is not None:
+            info_out.update(
+                {
+                    "target_lufs": round(target_lufs, 2),
+                    "applied_gain_db": 0.0,
+                    "peak_limited": False,
+                }
+            )
+        return
 
-    cur_lufs = lufs_acc.finalize()
-    gain_lin = 1.0
-    if cur_lufs is not None and math.isfinite(cur_lufs):
-        desired_db = target_lufs - cur_lufs
-        tp_db = 20.0 * math.log10(max(tp_acc.peak_lin, 1e-12))
+    desired_db = max(-48.0, min(48.0, target_lufs - cur_lufs))
+    if not limit_peaks:
+        tp_db = 20.0 * math.log10(tp_lin)
         applied_db = min(desired_db, ceiling_dbtp - tp_db)
         gain_lin = 10.0 ** (applied_db / 20.0)
+        with sf.SoundFile(
+            str(dst_wav), mode="w", samplerate=sr, channels=ch, subtype="FLOAT", format="WAV"
+        ) as fout:
+            for _, block in iter_audio_blocks(src_wav, block_seconds=30.0, dtype="float64"):
+                fout.write(block * gain_lin if gain_lin != 1.0 else block)
+        out_lufs = cur_lufs + applied_db
+        if info_out is not None:
+            info_out.update(
+                {
+                    "input_lufs": round(cur_lufs, 3),
+                    "output_lufs": round(out_lufs, 3),
+                    "target_lufs": round(target_lufs, 2),
+                    "applied_gain_db": round(applied_db, 3),
+                    "peak_limited": False,
+                }
+            )
+        return
 
-    with sf.SoundFile(
-        str(dst_wav), mode="w", samplerate=sr, channels=ch, subtype="FLOAT", format="WAV"
-    ) as fout:
-        for _, block in iter_audio_blocks(src_wav, block_seconds=30.0, dtype="float64"):
-            fout.write(block * gain_lin if gain_lin != 1.0 else block)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        pass1_wav = tmp / "norm_p1.wav"
+        _stream_local_batch(
+            src_wav,
+            pass1_wav,
+            [
+                FilterStep(filter_name="gain", params={"gain_db": desired_db}),
+                FilterStep(
+                    filter_name="true_peak_limiter",
+                    params={"ceiling_dbtp": ceiling_dbtp, "release_ms": rel_ms},
+                ),
+            ],
+            block_seconds=30.0,
+        )
+        total_gain_db = desired_db
+        cur_wav = pass1_wav
+        lufs_1, tp_1 = _probe_stream_lufs_tp(cur_wav)
+        for pass_idx in range(2, 5):
+            if lufs_1 is None or not math.isfinite(lufs_1):
+                break
+            deficit = target_lufs - lufs_1
+            if deficit <= 0.25:
+                break
+            topup_db = min(18.0, deficit)
+            next_pass_wav = tmp / f"norm_p{pass_idx}.wav"
+            _stream_local_batch(
+                cur_wav,
+                next_pass_wav,
+                [
+                    FilterStep(filter_name="gain", params={"gain_db": topup_db}),
+                    FilterStep(
+                        filter_name="true_peak_limiter",
+                        params={"ceiling_dbtp": ceiling_dbtp, "release_ms": rel_ms},
+                    ),
+                ],
+                block_seconds=30.0,
+            )
+            cur_wav = next_pass_wav
+            total_gain_db += topup_db
+            lufs_1, tp_1 = _probe_stream_lufs_tp(cur_wav)
+
+        tp_1_db = 20.0 * math.log10(max(tp_1, 1e-12))
+        if tp_1_db > ceiling_dbtp:
+            trim_db = ceiling_dbtp - tp_1_db
+            trim_lin = 10.0 ** (trim_db / 20.0)
+            total_gain_db += trim_db
+            if lufs_1 is not None:
+                lufs_1 += trim_db
+            with sf.SoundFile(
+                str(dst_wav), mode="w", samplerate=sr, channels=ch, subtype="FLOAT", format="WAV"
+            ) as fout:
+                for _, block in iter_audio_blocks(cur_wav, block_seconds=30.0, dtype="float64"):
+                    fout.write(block * trim_lin)
+        else:
+            shutil.copy2(cur_wav, dst_wav)
+
+    if info_out is not None:
+        info_out.update(
+            {
+                "input_lufs": round(cur_lufs, 3),
+                "output_lufs": round(lufs_1, 3) if lufs_1 is not None else None,
+                "target_lufs": round(target_lufs, 2),
+                "applied_gain_db": round(total_gain_db, 3),
+                "peak_limited": True,
+                "ceiling_dbtp": round(ceiling_dbtp, 2),
+            }
+        )
 
 
 def apply_recipe_streaming(
@@ -1563,6 +2038,7 @@ def apply_recipe_streaming(
     steps: list[FilterStep] | list[dict[str, Any]],
     subtype: str = "PCM_24",
     block_seconds: float = 60.0,
+    telemetry_out: list[StepTelemetry] | None = None,
 ) -> AudioInfo:
     """Apply an ordered DSP chain file-to-file in bounded RAM for long recordings."""
     src = Path(src_path)
@@ -1581,22 +2057,43 @@ def apply_recipe_streaming(
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         cur_wav = src
-        step_idx = 0
+        stage_idx = 0
         i = 0
+        prev_rms_pk: tuple[float | None, float | None] | None = None
         while i < len(parsed):
             st = parsed[i]
             if st.filter_name in _LOCAL_STREAMABLE_FILTERS:
+                batch_base = i
                 batch: list[FilterStep] = []
                 while i < len(parsed) and parsed[i].filter_name in _LOCAL_STREAMABLE_FILTERS:
                     batch.append(parsed[i])
                     i += 1
-                next_wav = tmp / f"stage_{step_idx:03d}.wav"
-                _stream_local_batch(cur_wav, next_wav, batch, block_seconds=block_seconds)
+                next_wav = tmp / f"stage_{stage_idx:03d}.wav"
+                batch_tele: list[StepTelemetry] | None = [] if telemetry_out is not None else None
+                _stream_local_batch(
+                    cur_wav,
+                    next_wav,
+                    batch,
+                    block_seconds=block_seconds,
+                    step_telemetry_out=batch_tele,
+                    base_step_index=batch_base,
+                )
+                if telemetry_out is not None and batch_tele:
+                    telemetry_out.extend(batch_tele)
+                    prev_rms_pk = (
+                        batch_tele[-1].output_rms_dbfs,
+                        batch_tele[-1].output_peak_dbfs,
+                    )
                 cur_wav = next_wav
-                step_idx += 1
+                stage_idx += 1
                 continue
 
-            next_wav = tmp / f"stage_{step_idx:03d}.wav"
+            if telemetry_out is not None and prev_rms_pk is None:
+                prev_rms_pk = _probe_stream_rms_peak(cur_wav)
+
+            next_wav = tmp / f"stage_{stage_idx:03d}.wav"
+            step_details: dict[str, Any] = {}
+            in_lufs = out_lufs = None
             if st.filter_name == "fade_edges":
                 _stream_fade_edges(cur_wav, next_wav, st.params)
             elif st.filter_name == "trim_range":
@@ -1604,11 +2101,38 @@ def apply_recipe_streaming(
             elif st.filter_name == "cut_regions":
                 _stream_cut_regions(cur_wav, next_wav, st.params)
             elif st.filter_name == "ambience_patch":
-                _stream_ambience_patch(cur_wav, next_wav, st.params)
+                patch_log: list[dict[str, Any]] = []
+                _stream_ambience_patch(cur_wav, next_wav, st.params, patch_log_out=patch_log)
+                step_details = {"patched_spans": patch_log}
             elif st.filter_name == "loudness_normalize":
-                _stream_loudness_normalize(cur_wav, next_wav, st.params)
+                norm_info: dict[str, Any] = {}
+                _stream_loudness_normalize(cur_wav, next_wav, st.params, info_out=norm_info)
+                in_lufs = norm_info.pop("input_lufs", None)
+                out_lufs = norm_info.pop("output_lufs", None)
+                step_details = norm_info
+
+            if telemetry_out is not None:
+                out_rms_pk = _probe_stream_rms_peak(next_wav)
+                in_rms, in_pk = prev_rms_pk or (None, None)
+                out_rms, out_pk = out_rms_pk
+                telemetry_out.append(
+                    StepTelemetry(
+                        step_index=i,
+                        filter_name=st.filter_name,
+                        params=copy.deepcopy(st.params),
+                        input_rms_dbfs=in_rms,
+                        output_rms_dbfs=out_rms,
+                        input_peak_dbfs=in_pk,
+                        output_peak_dbfs=out_pk,
+                        input_lufs=in_lufs,
+                        output_lufs=out_lufs,
+                        details=step_details,
+                    )
+                )
+                prev_rms_pk = out_rms_pk
+
             cur_wav = next_wav
-            step_idx += 1
+            stage_idx += 1
             i += 1
 
         # Materialize final output in requested subtype

@@ -13,15 +13,15 @@ flowchart TB
     end
 
     subgraph MCP["MCP Server (stdio, MCPServer)"]
-        Tools[11 Sandboxed Tools\nlist_filters, process_take, create_ab_test...]
+        Tools[15 Sandboxed Tools\nlist_filters, process_take, delete_take...]
     end
 
     subgraph Core["ambient_sound Core Package"]
         Config[Settings & Path Sandbox]
         Session[SessionManager\nImmutable Take DAG + Verdicts]
-        Analysis[Psychoacoustic Analyzer\nLUFS, TP, Stereo, Rumble, Hum, Events]
-        DSP[Linked-Stereo DSP Engine\n8 Clean-Room Filters + Residual]
-        Visuals[Headless Renderer\nSpectrogram & 3-Panel Diff PNG]
+        Analysis[Psychoacoustic Analyzer\nLUFS, LRA, TP, Bilateral Hum/Drone, Events]
+        DSP[Linked-Stereo DSP Engine\n15 Clean-Room Filters + Telemetry]
+        Visuals[Headless Renderer\nn_fft=8192 Spectrogram & Diff PNG]
         IO[Audio I/O\nsoundfile + ffmpeg subprocess]
     end
 
@@ -71,13 +71,15 @@ Every workspace lives under `AMBIENTSOUND_WORKSPACE` (default `~/.ambientsound/`
       takes/
         take_000/                # Immutable source recording
           audio.wav
+          events.json            # Full event log (inline capped <=200 in session.json)
           spectrogram.png
         take_001/                # Processed child take
           audio.wav
-          residual.wav           # parent_audio - audio
+          residual.wav           # parent_audio - audio (<=120 s non-structural takes)
+          events.json
           recipe.json            # parent_take_id + ordered FilterStep list
           spectrogram.png
-          diff_spectrogram.png   # 3-panel Before / After / Residual
+          diff_spectrogram.png   # 3-panel Before / After / Gain-Matched Residual
       ab_tests/
         ab_001.json              # ABTestRecord + attenuation-only LUFS offsets + verdict
 ```
@@ -86,13 +88,15 @@ Every workspace lives under `AMBIENTSOUND_WORKSPACE` (default `~/.ambientsound/`
 
 ## 4. Loudness-Matched Time-Locked A/B Engine
 
-Human listening perception strongly favors whichever clip sounds louder, even by `0.5 dB`. To prevent loudness bias:
+Human listening perception strongly favors whichever clip sounds louder, even by `0.5 dB`. To prevent loudness bias while keeping mastered comparisons audible:
 
-1. **Server-Side Attenuation-Only Gains:**
-   Given takes $\{T_A, T_B, T_{\text{orig}}\}$ with integrated LUFS $\{L_A, L_B, L_{\text{orig}}\}$:
-   $$L_{\text{target}} = \min(L_A, L_B, L_{\text{orig}})$$
-   $$g_i = \min(0.0,\; L_{\text{target}} - L_i)\ \text{dB}$$
-   Because every gain offset is $\le 0.0\ \text{dB}$, loudness matching **never boosts** a track into digital clipping.
+1. **Candidate-First Attenuation-Only Gains (`match_original=False` default):**
+   - `original_take_id` auto-resolves to the earliest common ancestor matching both `take_a` and `take_b`'s timeline (`source_offset_s`, `timeline_modified`, duration)—so trimmed `trim_range` previews compare cleanly against the uncleaned preview snippet rather than `take_000` at wrong timestamps.
+   - By default (`match_original=False`), target loudness matches across candidates:
+     $$L_{\text{target}} = \min(L_A, L_B)$$
+     $$g_i = \min(0.0,\; L_{\text{target}} - L_i)\ \text{dB}$$
+     so `-14 LUFS` mastered takes stay loud instead of being pulled `-35 dB` down to a quiet `-49 LUFS` original (`match_original=True` includes $L_{\text{orig}}$ when needed). Because $g_i \le 0.0\ \text{dB}$, loudness matching **never boosts** into clipping.
+   - When computing A/B Removed Residuals (`load_take_residual_slice`) or 3-panel diff spectrograms, takes differing by `> 1.5 dB` RMS are gain-scaled before subtraction so mastering gain never hides true spectral removals.
 2. **Browser Synchronized Playback:**
    - The browser decodes `Original`, `Take A`, `Take B`, `Residual A`, and `Residual B` into `AudioBuffer`s upfront.
    - Pressing Play schedules all `AudioBufferSourceNode`s at the exact same `AudioContext.currentTime` offset, feeding dedicated `GainNode`s.

@@ -8,8 +8,15 @@ from pathlib import Path
 import numpy as np
 import pyloudnorm as pyln
 
-from ambient_sound.analysis import StreamingLUFS, analyze_audio, analyze_file
+from ambient_sound.analysis import (
+    StreamingLUFS,
+    analyze_audio,
+    analyze_file,
+    summarize_events,
+)
+from ambient_sound.dsp import apply_recipe
 from ambient_sound.io_audio import save_wav
+from ambient_sound.models import DistractionEvent
 
 
 def _make_pink_bed(n_samples: int, channels: int, seed: int = 7) -> np.ndarray:
@@ -129,3 +136,91 @@ def test_configurable_detection_slow_pass_and_machine_drone() -> None:
     assert "slow_pass" in kinds
     slow_passes = [ev for ev in events if ev.kind == "slow_pass"]
     assert any(ev.start_s <= 3.5 and ev.end_s >= 5.5 for ev in slow_passes)
+
+
+def test_quiet_recording_narrow_band_min_event_and_lra() -> None:
+    sr = 44100
+    dur = 6.0
+    n = int(sr * dur)
+    t = np.arange(n, dtype=np.float64) / sr
+    # Very quiet ~ -52 LUFS background bed
+    bed = _make_pink_bed(n, 2, seed=41) * 0.14
+
+    # Sharp clicks that must be skipped when min_event_s > 0.15
+    bed[int(0.7 * sr) : int(0.7 * sr) + 5, :] += 0.09
+    bed[int(1.2 * sr) : int(1.2 * sr) + 5, :] += 0.09
+
+    # Quiet 2.4 s narrowband 90 Hz swell (below old -60 dBFS band floor)
+    s0, s1 = int(2.0 * sr), int(4.4 * sr)
+    swell = np.hanning(s1 - s0)
+    bed[s0:s1, :] += (0.008 * swell * np.sin(2.0 * np.pi * 90.0 * t[s0:s1]))[:, np.newaxis]
+
+    metrics, filtered_events = analyze_audio(
+        bed,
+        sr,
+        sensitivity="high",
+        min_event_s=1.5,
+        max_event_s=20.0,
+        freq_range_hz=(40.0, 140.0),
+    )
+    assert "impulsive_click" not in {ev.kind for ev in filtered_events}
+    assert any(
+        ev.kind in {"slow_pass", "transient_distraction", "low_freq_rumble"}
+        and ev.end_s > 2.2
+        and ev.start_s < 4.2
+        for ev in filtered_events
+    )
+
+    assert metrics.noise_floor_dbfs is not None
+    assert metrics.noise_floor_dbfs < -40.0
+    assert metrics.loudness_range_lu is not None
+    assert metrics.loudness_range_lu >= 0.0
+    assert metrics.short_term_lufs_stats is not None
+    assert "median_lufs" in metrics.short_term_lufs_stats
+    assert len(metrics.short_term_lufs_timeline) > 0
+
+    synth_clicks = [
+        DistractionEvent(
+            id=f"c_{i}",
+            start_s=0.1 * i,
+            end_s=0.1 * i + 0.01,
+            kind="impulsive_click",
+            severity="medium",
+        )
+        for i in range(10)
+    ]
+    macro = DistractionEvent(
+        id="m_1", start_s=2.0, end_s=6.0, kind="slow_pass", severity="high"
+    )
+    kept, counts, total, truncated = summarize_events(synth_clicks + [macro], max_events=3)
+    assert total == 11
+    assert truncated is True
+    assert counts == {"impulsive_click": 10, "slow_pass": 1}
+    assert any(ev.kind == "slow_pass" for ev in kept)
+
+
+def test_bilateral_hum_and_persistent_tonal_detection() -> None:
+    sr = 16000
+    dur = 20.0
+    n = int(sr * dur)
+    t = np.arange(n, dtype=np.float64) / sr
+    bed = _make_pink_bed(n, 2, seed=55)
+
+    # Steep 45 Hz highpass should NOT create a false 50 Hz mains_hum peak
+    hpf_only = apply_recipe(
+        bed[: sr * 4],
+        sr,
+        [{"filter_name": "highpass_rumble", "params": {"cutoff_hz": 45.0, "order": 4}}],
+    )
+    m_hpf, _ = analyze_audio(hpf_only, sr)
+    assert 50.0 not in m_hpf.hum_peaks_hz
+
+    # Continuous moderate steady tonal drone at 220 Hz + brief 1.5 s burst at 410 Hz in [6..7.5s]
+    steady_220 = (0.014 * np.sin(2.0 * np.pi * 220.0 * t))[:, np.newaxis]
+    brief_410 = np.zeros_like(bed)
+    b0, b1 = int(6.0 * sr), int(7.5 * sr)
+    brief_410[b0:b1, :] = (0.045 * np.sin(2.0 * np.pi * 410.0 * t[b0:b1]))[:, np.newaxis]
+
+    m_drone, _ = analyze_audio(bed + steady_220 + brief_410, sr)
+    assert any(abs(f - 220.0) <= 5.0 for f in m_drone.tonal_peaks_hz)
+    assert not any(abs(f - 410.0) <= 8.0 for f in m_drone.tonal_peaks_hz)

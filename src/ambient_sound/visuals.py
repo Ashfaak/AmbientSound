@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import matplotlib
@@ -19,7 +20,7 @@ from ambient_sound.models import DistractionEvent
 def _compute_spectrogram_db(
     mono: np.ndarray,
     sample_rate: int,
-    n_fft: int = 2048,
+    n_fft: int = 8192,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     if mono.size < 32:
         freqs = np.array([20.0, max(100.0, sample_rate * 0.5)])
@@ -27,7 +28,8 @@ def _compute_spectrogram_db(
         spec_db = np.full((2, 2), -90.0, dtype=np.float64)
         return freqs, times, spec_db
 
-    nperseg = min(n_fft, mono.size)
+    nperseg = min(n_fft, max(256, (mono.size // 4) * 2)) if mono.size < n_fft else n_fft
+    nperseg = min(nperseg, mono.size)
     noverlap = int(nperseg * 0.75)
     freqs, times, zxx = signal.stft(
         mono,
@@ -92,9 +94,19 @@ def _plot_spectrogram_figure(
             )
             ax_wav.set_ylim(-peak, peak)
         ax_wav.set_ylabel("Amp", color="#d8e2ec", fontsize=9)
-        ax_wav.set_title(title or "Ambient Recording Overview", color="#eef3f8", fontsize=11)
+        display_title = title or "Ambient Recording Overview"
 
         if events:
+            in_view_clicks = sum(
+                1
+                for ev in events
+                if ev.kind == "impulsive_click"
+                and ev.end_s >= x_start_s
+                and ev.start_s <= x_end_s
+            )
+            skip_clicks = in_view_clicks > 40
+            if skip_clicks:
+                display_title = f"{display_title} ({in_view_clicks} click markers omitted)"
             palette = {
                 "low_freq_rumble": "#f59e0b",
                 "impulsive_click": "#ef4444",
@@ -105,6 +117,8 @@ def _plot_spectrogram_figure(
             for ev in events:
                 if ev.kind in {"mains_hum", "machine_drone"}:
                     continue
+                if skip_clicks and ev.kind == "impulsive_click":
+                    continue
                 if ev.end_s < x_start_s or ev.start_s > x_end_s:
                     continue
                 color = palette.get(ev.kind, "#f43f5e")
@@ -114,6 +128,8 @@ def _plot_spectrogram_figure(
                     color=color,
                     alpha=0.22,
                 )
+
+        ax_wav.set_title(display_title, color="#eef3f8", fontsize=11)
 
         pos_mask = freqs >= 20.0
         f_plot = freqs[pos_mask] if np.any(pos_mask) else freqs[1:]
@@ -155,6 +171,8 @@ def _plot_diff_figure(
     x_end_s: float,
     out_path: str | Path,
     title: str,
+    residual_label: str = "Removed Residual (Parent - Processed)",
+    patched_spans: list[tuple[float, float]] | None = None,
 ) -> Path:
     vmax = float(max(np.max(s_b), np.max(s_a), -40.0))
     vmin = vmax - 85.0
@@ -173,7 +191,7 @@ def _plot_diff_figure(
     panels = [
         (axes[0], s_b, "Before (Parent Take)"),
         (axes[1], s_a, "After (Processed Take)"),
-        (axes[2], s_r, "Removed Residual (Parent - Processed)"),
+        (axes[2], s_r, residual_label),
     ]
     try:
         fig.patch.set_facecolor("#0f141c")
@@ -201,6 +219,28 @@ def _plot_diff_figure(
                 ax.set_ylim(max(20.0, float(f_plot[0])), max(100.0, sample_rate * 0.5))
             ax.set_title(subtitle, color="#eef3f8", fontsize=9.5, loc="left")
             ax.set_ylabel("Hz", color="#d8e2ec", fontsize=8)
+
+        if patched_spans:
+            y_hi = max(100.0, sample_rate * 0.5) * 0.72
+            for ps, pe in patched_spans:
+                if pe < x_start_s or ps > x_end_s:
+                    continue
+                s_c = max(x_start_s, float(ps))
+                e_c = min(x_end_s, float(pe))
+                for ax in (axes[1], axes[2]):
+                    ax.axvline(s_c, color="#38bdf8", linestyle="--", linewidth=0.9, alpha=0.8)
+                    ax.axvline(e_c, color="#38bdf8", linestyle="--", linewidth=0.9, alpha=0.8)
+                    ax.axvspan(s_c, e_c, color="#38bdf8", alpha=0.10)
+                axes[1].text(
+                    0.5 * (s_c + e_c),
+                    y_hi,
+                    "Patched",
+                    color="#7dd3fc",
+                    fontsize=7.5,
+                    ha="center",
+                    va="top",
+                    bbox={"facecolor": "#0f172a", "alpha": 0.65, "edgecolor": "none", "pad": 1.5},
+                )
 
         axes[-1].set_xlabel("Time (s)", color="#d8e2ec", fontsize=9)
         axes[-1].set_xlim(x_start_s, max(x_start_s + 0.01, x_end_s))
@@ -262,6 +302,8 @@ def render_diff_spectrogram_png(
     out_path: str | Path,
     title: str = "",
     time_offset_s: float = 0.0,
+    loudness_match_residual: bool = True,
+    patched_spans: list[tuple[float, float]] | None = None,
 ) -> Path:
     """Render a 3-panel Before / After / Removed Residual spectrogram comparison."""
     arr_b = ensure_2d_audio(before)
@@ -269,7 +311,18 @@ def render_diff_spectrogram_png(
     n = min(arr_b.shape[0], arr_a.shape[0])
     mono_b = np.mean(arr_b[:n], axis=1)
     mono_a = np.mean(arr_a[:n], axis=1)
-    mono_r = mono_b - mono_a
+
+    residual_label = "Removed Residual (Parent - Processed)"
+    mono_a_cmp = mono_a
+    if loudness_match_residual and mono_b.size > 0:
+        rms_b = float(np.sqrt(np.mean(mono_b * mono_b)))
+        rms_a = float(np.sqrt(np.mean(mono_a * mono_a)))
+        if rms_b > 1e-12 and rms_a > 1e-12:
+            diff_db = abs(20.0 * math.log10(rms_a / rms_b))
+            if diff_db > 1.5:
+                mono_a_cmp = mono_a * (rms_b / rms_a)
+                residual_label = "Gain-Matched Spectral Diff (After scaled to Before RMS)"
+    mono_r = mono_b - mono_a_cmp
 
     f_b, t_b, s_b = _compute_spectrogram_db(mono_b, sample_rate)
     _, _, s_a = _compute_spectrogram_db(mono_a, sample_rate)
@@ -287,6 +340,8 @@ def render_diff_spectrogram_png(
         x_end_s=time_offset_s + duration_s,
         out_path=out_path,
         title=title,
+        residual_label=residual_label,
+        patched_spans=patched_spans,
     )
 
 
@@ -313,7 +368,7 @@ def render_file_spectrogram_png(
 
     # Low-RAM sampled overview for long recordings (> 60 s)
     n_cols = 800
-    n_fft = 2048
+    n_fft = 8192
     sr = info.sample_rate
     win = np.hanning(n_fft)
     win_norm = max(float(np.sum(win)), 1.0)
@@ -362,6 +417,8 @@ def render_file_diff_spectrogram_png(
     title: str = "",
     start_s: float | None = None,
     end_s: float | None = None,
+    loudness_match_residual: bool = True,
+    patched_spans: list[tuple[float, float]] | None = None,
 ) -> Path:
     """Render a 3-panel diff PNG in bounded RAM (full <= 60s, overview > 60s)."""
     info_b = probe_audio(before_path)
@@ -375,11 +432,18 @@ def render_file_diff_spectrogram_png(
         arr_b, sr = load_audio_slice(before_path, start_s=s0, end_s=s1, dtype="float64")
         arr_a, _ = load_audio_slice(after_path, start_s=s0, end_s=s1, dtype="float64")
         return render_diff_spectrogram_png(
-            arr_b, arr_a, sr, out_path, title=title, time_offset_s=s0
+            arr_b,
+            arr_a,
+            sr,
+            out_path,
+            title=title,
+            time_offset_s=s0,
+            loudness_match_residual=loudness_match_residual,
+            patched_spans=patched_spans,
         )
 
     n_cols = 700
-    n_fft = 2048
+    n_fft = 8192
     sr = info_b.sample_rate
     win = np.hanning(n_fft)
     win_norm = max(float(np.sum(win)), 1.0)
@@ -389,21 +453,44 @@ def render_file_diff_spectrogram_png(
     s_a = np.empty((freqs.size, n_cols), dtype=np.float64)
     s_r = np.empty((freqs.size, n_cols), dtype=np.float64)
 
-    probe_dur = max(n_fft / float(sr), min(0.2, span / n_cols))
-    for i, t_c in enumerate(col_times):
+    probe_dur = max(n_fft / float(sr), min(0.25, span / n_cols))
+    seg_pairs: list[tuple[np.ndarray, np.ndarray]] = []
+    sum_sq_b = 0.0
+    sum_sq_a = 0.0
+    n_tot = 0
+    for _i, t_c in enumerate(col_times):
         t_end = min(s1, float(t_c) + probe_dur)
         cb, _ = load_audio_slice(before_path, start_s=float(t_c), end_s=t_end, dtype="float32")
         ca, _ = load_audio_slice(after_path, start_s=float(t_c), end_s=t_end, dtype="float32")
         n = min(cb.shape[0], ca.shape[0])
         if n == 0:
-            s_b[:, i] = s_a[:, i] = s_r[:, i] = -120.0
+            seg_pairs.append((np.zeros(0), np.zeros(0)))
             continue
         mb = np.mean(cb[:n], axis=1)
         ma = np.mean(ca[:n], axis=1)
-        mr = mb - ma
-        for mat, vec in ((s_b, mb), (s_a, ma), (s_r, mr)):
-            seg = vec[:n_fft] if vec.size >= n_fft else np.pad(vec, (0, n_fft - vec.size))
-            mag = np.abs(np.fft.rfft(seg * win)) / win_norm
+        seg_b = mb[:n_fft] if mb.size >= n_fft else np.pad(mb, (0, n_fft - mb.size))
+        seg_a = ma[:n_fft] if ma.size >= n_fft else np.pad(ma, (0, n_fft - ma.size))
+        seg_pairs.append((seg_b, seg_a))
+        sum_sq_b += float(np.sum(seg_b * seg_b))
+        sum_sq_a += float(np.sum(seg_a * seg_a))
+        n_tot += n_fft
+
+    scale = 1.0
+    residual_label = "Removed Residual (Parent - Processed)"
+    if loudness_match_residual and n_tot > 0:
+        rms_b = math.sqrt(sum_sq_b / n_tot)
+        rms_a = math.sqrt(sum_sq_a / n_tot)
+        if rms_b > 1e-12 and rms_a > 1e-12 and abs(20.0 * math.log10(rms_a / rms_b)) > 1.5:
+            scale = rms_b / rms_a
+            residual_label = "Gain-Matched Spectral Diff (After scaled to Before RMS)"
+
+    for i, (seg_b, seg_a) in enumerate(seg_pairs):
+        if seg_b.size == 0:
+            s_b[:, i] = s_a[:, i] = s_r[:, i] = -120.0
+            continue
+        seg_r = seg_b - seg_a * scale
+        for mat, vec in ((s_b, seg_b), (s_a, seg_a), (s_r, seg_r)):
+            mag = np.abs(np.fft.rfft(vec * win)) / win_norm
             mat[:, i] = 20.0 * np.log10(np.maximum(mag, 1e-6))
 
     return _plot_diff_figure(
@@ -417,4 +504,6 @@ def render_file_diff_spectrogram_png(
         x_end_s=s1,
         out_path=out_path,
         title=title,
+        residual_label=residual_label,
+        patched_spans=patched_spans,
     )

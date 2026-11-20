@@ -11,9 +11,14 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 
 from ambient_sound import __version__
-from ambient_sound.analysis import SensitivityLevel
+from ambient_sound.analysis import (
+    SensitivityLevel,
+    event_kind_counts,
+    summarize_events,
+)
 from ambient_sound.config import Settings
 from ambient_sound.dsp import list_filter_specs
+from ambient_sound.models import DistractionEvent, TakeRecord
 from ambient_sound.session import STREAMING_THRESHOLD_S, SessionManager
 
 # Strictly keep stdout clean for MCP JSON-RPC frames.
@@ -31,6 +36,66 @@ def _parse_freq_range(freq_range_hz: list[float] | None) -> tuple[float, float] 
     if len(freq_range_hz) != 2:
         raise ValueError("freq_range_hz must contain exactly two floats: [low_hz, high_hz].")
     return float(freq_range_hz[0]), float(freq_range_hz[1])
+
+
+def _compact_events_payload(
+    events: list[DistractionEvent],
+    event_kinds: list[str] | None,
+    max_events: int,
+    include_events: bool,
+    stored_counts: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    counts = stored_counts or event_kind_counts(events)
+    if not include_events:
+        if stored_counts is not None:
+            if event_kinds is not None:
+                allowed = {str(k).strip() for k in event_kinds if str(k).strip()}
+                total_filtered = sum(stored_counts.get(k, 0) for k in allowed)
+            else:
+                total_filtered = sum(stored_counts.values())
+            truncated = total_filtered > 0
+        else:
+            _, _, total_filtered, truncated = summarize_events(
+                events, event_kinds=event_kinds, max_events=0
+            )
+        return {
+            "event_counts": counts,
+            "events_total": total_filtered,
+            "events_truncated": truncated,
+            "events": [],
+        }
+    bounded, computed_counts, total_filtered, truncated = summarize_events(
+        events, event_kinds=event_kinds, max_events=max_events
+    )
+    return {
+        "event_counts": stored_counts or computed_counts,
+        "events_total": total_filtered,
+        "events_truncated": truncated,
+        "events": [e.model_dump() for e in bounded],
+    }
+
+
+def _format_take_payload(
+    manager: SessionManager,
+    take: TakeRecord,
+    event_kinds: list[str] | None = None,
+    max_events: int = 50,
+    include_events: bool = True,
+) -> dict[str, Any]:
+    data = take.model_dump()
+    if include_events and (event_kinds is not None or take.events_path):
+        full_events = manager.load_take_events(take.session_id, take.take_id)
+    else:
+        full_events = list(take.events)
+    compact = _compact_events_payload(
+        full_events,
+        event_kinds=event_kinds,
+        max_events=max_events,
+        include_events=include_events,
+        stored_counts=take.event_counts or None,
+    )
+    data.update(compact)
+    return data
 
 
 def create_mcp_server(settings: Settings | None = None) -> MCPServer:
@@ -66,10 +131,27 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
         return {"filters": list_filter_specs()}
 
     @mcp.tool()
-    def create_session(audio_path: str, name: str = "") -> dict[str, Any]:
+    def create_session(
+        audio_path: str,
+        name: str = "",
+        event_kinds: list[str] | None = None,
+        max_events: int = 50,
+        include_events: bool = True,
+    ) -> dict[str, Any]:
         """Ingest audio into a non-destructive session (take_000) in bounded RAM."""
         summary = manager.create_session(audio_path, name=name)
-        return summary.model_dump()
+        payload = summary.model_dump()
+        payload["takes"] = [
+            _format_take_payload(
+                manager,
+                t,
+                event_kinds=event_kinds,
+                max_events=max_events,
+                include_events=include_events,
+            )
+            for t in summary.takes
+        ]
+        return payload
 
     @mcp.tool()
     def list_sessions() -> dict[str, Any]:
@@ -89,9 +171,26 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
         }
 
     @mcp.tool()
-    def get_session_summary(session_id: str) -> dict[str, Any]:
-        """Return complete metadata, takes, metrics, events, and A/B tests for a session."""
-        return manager.get_session(session_id).model_dump()
+    def get_session_summary(
+        session_id: str,
+        event_kinds: list[str] | None = None,
+        max_events: int = 50,
+        include_events: bool = True,
+    ) -> dict[str, Any]:
+        """Return session metadata, takes, metrics, bounded events, and A/B tests."""
+        summary = manager.get_session(session_id)
+        payload = summary.model_dump()
+        payload["takes"] = [
+            _format_take_payload(
+                manager,
+                t,
+                event_kinds=event_kinds,
+                max_events=max_events,
+                include_events=include_events,
+            )
+            for t in summary.takes
+        ]
+        return payload
 
     @mcp.tool()
     def analyze_take(
@@ -101,6 +200,9 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
         min_event_s: float = 0.12,
         max_event_s: float = 45.0,
         freq_range_hz: list[float] | None = None,
+        event_kinds: list[str] | None = None,
+        max_events: int = 50,
+        include_events: bool = True,
     ) -> dict[str, Any]:
         """Compute psychoacoustic metrics and configurable distraction events for a full take."""
         metrics, events = manager.analyze_take(
@@ -110,12 +212,13 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
             min_event_s=min_event_s,
             max_event_s=max_event_s,
             freq_range_hz=_parse_freq_range(freq_range_hz),
+            event_kinds=event_kinds,
         )
         return {
             "session_id": session_id,
             "take_id": take_id,
             "metrics": metrics.model_dump(),
-            "events": [e.model_dump() for e in events],
+            **_compact_events_payload(events, event_kinds, max_events, include_events),
         }
 
     @mcp.tool()
@@ -128,6 +231,9 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
         min_event_s: float = 0.12,
         max_event_s: float = 45.0,
         freq_range_hz: list[float] | None = None,
+        event_kinds: list[str] | None = None,
+        max_events: int = 50,
+        include_events: bool = True,
     ) -> dict[str, Any]:
         """Analyze a specific [start_s, end_s] time window with custom sensitivity & freq filter."""
         metrics, events = manager.analyze_region(
@@ -139,13 +245,14 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
             min_event_s=min_event_s,
             max_event_s=max_event_s,
             freq_range_hz=_parse_freq_range(freq_range_hz),
+            event_kinds=event_kinds,
         )
         return {
             "session_id": session_id,
             "take_id": take_id,
             "window": {"start_s": start_s, "end_s": end_s},
             "metrics": metrics.model_dump(),
-            "events": [e.model_dump() for e in events],
+            **_compact_events_payload(events, event_kinds, max_events, include_events),
         }
 
     @mcp.tool()
@@ -172,6 +279,9 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
         steps: list[dict[str, Any]],
         label: str = "",
         notes: str = "",
+        event_kinds: list[str] | None = None,
+        max_events: int = 50,
+        include_events: bool = True,
     ) -> dict[str, Any]:
         """Apply an ordered DSP filter recipe to parent_take_id as a new immutable take."""
         record = manager.process_take(
@@ -181,7 +291,13 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
             label=label,
             notes=notes,
         )
-        return record.model_dump()
+        return _format_take_payload(
+            manager,
+            record,
+            event_kinds=event_kinds,
+            max_events=max_events,
+            include_events=include_events,
+        )
 
     @mcp.tool()
     def create_ab_test(
@@ -192,6 +308,8 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
         focus_end_s: float | None = None,
         blind: bool = False,
         notes: str = "",
+        original_take_id: str | None = None,
+        match_original: bool = False,
     ) -> dict[str, Any]:
         """Register a loudness-matched A/B listening test and return the local studio URL."""
         record = manager.create_ab_test(
@@ -202,11 +320,27 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
             focus_end_s=focus_end_s,
             blind=blind,
             notes=notes,
+            original_take_id=original_take_id,
+            match_original=match_original,
         )
         payload = record.model_dump()
         payload["ui_url"] = manager.ab_ui_url(session_id, record.ab_id)
         payload["workspace_dir"] = str(cfg.workspace_dir)
         return payload
+
+    @mcp.tool()
+    def delete_take(
+        session_id: str,
+        take_id: str,
+        cascade: bool = False,
+    ) -> dict[str, Any]:
+        """Delete an abandoned non-root take (with optional cascade) to reclaim workspace disk."""
+        return manager.delete_take(session_id, take_id, cascade=cascade)
+
+    @mcp.tool()
+    def delete_session(session_id: str) -> dict[str, Any]:
+        """Permanently delete a session directory and all its takes and A/B tests."""
+        return manager.delete_session(session_id)
 
     @mcp.tool()
     def list_ab_tests(session_id: str) -> dict[str, Any]:

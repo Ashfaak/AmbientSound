@@ -21,10 +21,53 @@ from ambient_sound.models import AudioMetrics, DistractionEvent
 SensitivityLevel = Literal["low", "medium", "high"]
 
 _SENSITIVITY_PARAMS: dict[str, tuple[float, float]] = {
-    "low": (11.0, 5.5),
-    "medium": (8.0, 4.2),
-    "high": (5.5, 3.2),
+    "low": (10.0, 5.0),
+    "medium": (7.0, 3.8),
+    "high": (4.5, 2.6),
 }
+
+_RUMBLE_SENSITIVITY_PARAMS: dict[str, tuple[float, float]] = {
+    "low": (10.5, 4.8),
+    "medium": (7.5, 3.8),
+    "high": (5.0, 2.8),
+}
+
+
+def event_kind_counts(events: list[DistractionEvent]) -> dict[str, int]:
+    """Count distraction events grouped by event kind."""
+    counts: dict[str, int] = {}
+    for ev in events:
+        counts[ev.kind] = counts.get(ev.kind, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def summarize_events(
+    events: list[DistractionEvent],
+    event_kinds: list[str] | None = None,
+    max_events: int = 50,
+) -> tuple[list[DistractionEvent], dict[str, int], int, bool]:
+    """Filter and bound events for compact MCP payloads, prioritizing non-click distractions."""
+    counts = event_kind_counts(events)
+    if event_kinds is not None:
+        allowed = {str(k).strip() for k in event_kinds if str(k).strip()}
+        filtered = [ev for ev in events if ev.kind in allowed]
+    else:
+        filtered = list(events)
+
+    total_filtered = len(filtered)
+    if max_events <= 0:
+        return [], counts, total_filtered, total_filtered > 0
+    if total_filtered <= max_events:
+        return filtered, counts, total_filtered, False
+
+    non_clicks = [ev for ev in filtered if ev.kind != "impulsive_click"]
+    clicks = [ev for ev in filtered if ev.kind == "impulsive_click"]
+    selected = non_clicks[:max_events]
+    remaining = max_events - len(selected)
+    if remaining > 0 and clicks:
+        selected.extend(clicks[:remaining])
+    selected.sort(key=lambda ev: (ev.start_s, ev.end_s))
+    return selected, counts, total_filtered, True
 
 
 def _finite_or_none(value: float | np.floating | None, digits: int = 4) -> float | None:
@@ -203,13 +246,99 @@ class StreamingLUFS:
             return None
         return _finite_or_none(-0.691 + 10.0 * math.log10(final_sum))
 
+    def short_term_metrics(
+        self,
+        time_offset_s: float = 0.0,
+        max_timeline_points: int = 120,
+    ) -> tuple[float | None, dict[str, float] | None, list[dict[str, float]]]:
+        """Compute LRA (LU), short-term LUFS summary stats, and downsampled timeline."""
+        if len(self._sub_energies) < 30:
+            return None, None, []
+
+        subs = np.asarray(self._sub_energies, dtype=np.float64)
+        weights = np.array([1.0, 1.0, 1.0, 1.41, 1.41], dtype=np.float64)
+        if self.channels <= 5:
+            g = weights[: self.channels]
+        else:
+            g = np.concatenate([weights, np.ones(self.channels - 5, dtype=np.float64)])
+
+        weighted = subs @ g
+        csum = np.concatenate([[0.0], np.cumsum(weighted)])
+        st_weighted = np.maximum((csum[30:] - csum[:-30]) / 30.0, 1e-24)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            st_lufs = -0.691 + 10.0 * np.log10(st_weighted)
+
+        valid_mask = np.isfinite(st_lufs) & (st_lufs > -120.0)
+        if not np.any(valid_mask):
+            return None, None, []
+
+        valid_vals = st_lufs[valid_mask]
+        stats = {
+            "min_lufs": round(float(np.min(valid_vals)), 4),
+            "p10_lufs": round(float(np.percentile(valid_vals, 10)), 4),
+            "median_lufs": round(float(np.median(valid_vals)), 4),
+            "p95_lufs": round(float(np.percentile(valid_vals, 95)), 4),
+            "max_lufs": round(float(np.max(valid_vals)), 4),
+        }
+
+        lra: float | None = None
+        abs_mask = st_lufs >= -70.0
+        if np.any(abs_mask):
+            avg_power = float(np.mean(st_weighted[abs_mask]))
+            if avg_power > 0.0:
+                rel_thresh = -0.691 + 10.0 * math.log10(avg_power) - 20.0
+                gated = st_lufs[(st_lufs >= rel_thresh) & abs_mask]
+                if gated.size >= 2:
+                    lra = _finite_or_none(
+                        max(0.0, float(np.percentile(gated, 95) - np.percentile(gated, 10))),
+                        digits=2,
+                    )
+
+        n_pts = st_lufs.size
+        step = max(1, math.ceil(n_pts / max(1, max_timeline_points)))
+        timeline: list[dict[str, float]] = []
+        for idx in range(0, n_pts, step):
+            val = float(st_lufs[idx])
+            if math.isfinite(val) and val > -120.0:
+                timeline.append(
+                    {
+                        "time_s": round(time_offset_s + idx * 0.1, 2),
+                        "lufs": round(val, 2),
+                    }
+                )
+        return lra, stats, timeline
+
+
+def _bilateral_prominence_db(
+    freqs: np.ndarray,
+    psd_db: np.ndarray,
+    f_center: float,
+    peak_val: float,
+    min_left_hz: float,
+    max_right_hz: float,
+    inner_gap_hz: float = 6.0,
+    outer_span_hz: float = 22.0,
+) -> float | None:
+    """Measure how much a spectral peak exceeds BOTH lower and upper sidebands."""
+    left_mask = (freqs >= max(min_left_hz, f_center - outer_span_hz)) & (
+        freqs <= f_center - inner_gap_hz
+    )
+    right_mask = (freqs >= f_center + inner_gap_hz) & (
+        freqs <= min(max_right_hz, f_center + outer_span_hz)
+    )
+    if not np.any(left_mask) or not np.any(right_mask):
+        return None
+    left_med = float(np.median(psd_db[left_mask]))
+    right_med = float(np.median(psd_db[right_mask]))
+    return min(peak_val - left_med, peak_val - right_med)
+
 
 def _detect_hum_peaks(
     freqs: np.ndarray,
     psd: np.ndarray,
     sample_rate: int,
 ) -> list[float]:
-    """Return 50 Hz or 60 Hz harmonic frequencies exhibiting > 10 dB narrowband prominence."""
+    """Return 50 Hz or 60 Hz harmonic frequencies exhibiting > 10 dB bilateral prominence."""
     nyquist = sample_rate * 0.5
     if freqs.size < 16:
         return []
@@ -224,15 +353,20 @@ def _detect_hum_peaks(
             if f_target >= nyquist * 0.9:
                 break
             peak_mask = (freqs >= f_target - 3.0) & (freqs <= f_target + 3.0)
-            nbr_mask = ((freqs >= max(10.0, f_target - 20.0)) & (freqs <= f_target - 6.0)) | (
-                (freqs >= f_target + 6.0) & (freqs <= min(nyquist, f_target + 20.0))
-            )
-            if not np.any(peak_mask) or not np.any(nbr_mask):
+            if not np.any(peak_mask):
                 continue
             peak_val = float(np.max(psd_db[peak_mask]))
-            nbr_med = float(np.median(psd_db[nbr_mask]))
-            prominence = peak_val - nbr_med
-            if prominence > 10.0 and peak_val > -110.0:
+            prominence = _bilateral_prominence_db(
+                freqs,
+                psd_db,
+                f_target,
+                peak_val,
+                10.0,
+                nyquist,
+                inner_gap_hz=6.0,
+                outer_span_hz=20.0,
+            )
+            if prominence is not None and prominence > 10.0 and peak_val > -110.0:
                 series_peaks.append((f_target, prominence))
         if series_peaks and (
             any(f == base and p > 11.0 for f, p in series_peaks) or len(series_peaks) >= 2
@@ -247,8 +381,10 @@ def _detect_tonal_peaks(
     psd: np.ndarray,
     sample_rate: int,
     exclude_freqs: list[float],
+    freqs_low: np.ndarray | None = None,
+    segment_psds_low: list[np.ndarray] | None = None,
 ) -> list[float]:
-    """Detect arbitrary narrowband machine/drone tonal peaks between 30 Hz and 1000 Hz."""
+    """Detect persistent narrowband machine/drone tonal peaks between 30 Hz and 1000 Hz."""
     nyquist = sample_rate * 0.5
     max_f = min(1000.0, nyquist * 0.85)
     if freqs.size < 32 or max_f <= 40.0:
@@ -266,15 +402,32 @@ def _detect_tonal_peaks(
         f_cand = float(freqs[idx])
         if any(abs(f_cand - ex) <= 4.5 for ex in exclude_freqs):
             continue
-        nbr_mask = ((freqs >= max(12.0, f_cand - 22.0)) & (freqs <= f_cand - 6.0)) | (
-            (freqs >= f_cand + 6.0) & (freqs <= min(nyquist, f_cand + 22.0))
+        peak_val = float(psd_db[idx])
+        prom = _bilateral_prominence_db(
+            freqs, psd_db, f_cand, peak_val, 12.0, nyquist, inner_gap_hz=6.0, outer_span_hz=22.0
         )
-        if not np.any(nbr_mask):
+        if prom is None or prom <= 7.0 or peak_val <= -108.0:
             continue
-        nbr_med = float(np.median(psd_db[nbr_mask]))
-        prom = float(psd_db[idx]) - nbr_med
-        if prom > 12.0 and float(psd_db[idx]) > -105.0:
-            candidates.append((f_cand, prom))
+
+        if segment_psds_low is not None and len(segment_psds_low) >= 3 and freqs_low is not None:
+            p_mask = (freqs_low >= f_cand - 3.5) & (freqs_low <= f_cand + 3.5)
+            l_mask = (freqs_low >= max(12.0, f_cand - 22.0)) & (freqs_low <= f_cand - 6.0)
+            r_mask = (freqs_low >= f_cand + 6.0) & (freqs_low <= min(nyquist, f_cand + 22.0))
+            if np.any(p_mask) and np.any(l_mask) and np.any(r_mask):
+                persistent_segs = 0
+                for seg_psd in segment_psds_low:
+                    seg_db = 10.0 * np.log10(np.maximum(seg_psd, 1e-24))
+                    seg_pk = float(np.max(seg_db[p_mask]))
+                    seg_prom = min(
+                        seg_pk - float(np.median(seg_db[l_mask])),
+                        seg_pk - float(np.median(seg_db[r_mask])),
+                    )
+                    if seg_prom >= 4.5:
+                        persistent_segs += 1
+                if persistent_segs / float(len(segment_psds_low)) < 0.60:
+                    continue
+
+        candidates.append((f_cand, prom))
 
     candidates.sort(key=lambda pair: pair[1], reverse=True)
     selected: list[float] = []
@@ -293,20 +446,30 @@ def _rumble_events_from_curve(
     win_dur_s: float,
     duration_s: float,
     time_offset_s: float,
+    sensitivity: SensitivityLevel = "medium",
+    min_event_s: float = 0.12,
+    max_event_s: float = 45.0,
 ) -> list[DistractionEvent]:
     if rms_db.size < 4:
         return []
+    excess_req, mad_mult = _RUMBLE_SENSITIVITY_PARAMS.get(
+        sensitivity, _RUMBLE_SENSITIVITY_PARAMS["medium"]
+    )
     med = float(np.median(rms_db))
-    mask = (rms_db > med + 8.0) & (rms_db > -55.0)
-    spans = _merge_intervals(mask, times, win_dur_s, max_gap_s=0.25)
+    mad = float(np.median(np.abs(rms_db - med))) * 1.4826
+    threshold = max(med + excess_req, med + mad_mult * max(mad, 1.0))
+    mask = (rms_db > threshold) & (rms_db > -92.0)
+    spans = _merge_intervals(mask, times, win_dur_s, max_gap_s=0.40)
 
+    min_dur = max(0.2, float(min_event_s))
     events: list[DistractionEvent] = []
     for s, e in spans:
         e_clamped = min(e, duration_s)
-        if e_clamped - s < 0.2:
+        dur = e_clamped - s
+        if dur < min_dur or dur > max_event_s:
             continue
         seg_mask = (times >= s) & (times <= e_clamped)
-        peak_db = float(np.max(rms_db[seg_mask])) if np.any(seg_mask) else med + 8.0
+        peak_db = float(np.max(rms_db[seg_mask])) if np.any(seg_mask) else threshold
         excess = peak_db - med
         sev = "high" if excess > 16.0 else ("medium" if excess > 11.0 else "low")
         events.append(
@@ -330,6 +493,7 @@ def _click_events_from_hits(
     duration_s: float,
     cutoff: float,
     time_offset_s: float,
+    min_event_s: float = 0.12,
 ) -> list[DistractionEvent]:
     if not hits:
         return []
@@ -356,6 +520,8 @@ def _click_events_from_hits(
         pad = int(0.005 * sample_rate)
         s_s = max(0.0, (c_s - pad) / sample_rate)
         e_s = min(duration_s, (c_e + pad + 1) / sample_rate)
+        if min_event_s > 0.15 and (e_s - s_s) < min_event_s:
+            continue
         sev = "high" if p_z > 30.0 or p_lin > 0.5 else ("medium" if p_z > 16.0 else "low")
         events.append(
             DistractionEvent(
@@ -416,8 +582,8 @@ def _foreground_events_from_curve(
     med = float(np.median(rms_db))
     mad = float(np.median(np.abs(rms_db - med))) * 1.4826
     threshold = max(med + excess_req, med + mad_mult * max(mad, 1.0))
-    mask = (rms_db > threshold) & (rms_db > -60.0)
-    spans = _merge_intervals(mask, times, win_dur_s, max_gap_s=0.20)
+    mask = (rms_db > threshold) & (rms_db > -92.0)
+    spans = _merge_intervals(mask, times, win_dur_s, max_gap_s=0.50)
 
     events: list[DistractionEvent] = []
     for s, e in spans:
@@ -518,6 +684,8 @@ def _finalize_spectral_summary(
     freqs: np.ndarray,
     psd: np.ndarray,
     sample_rate: int,
+    freqs_low: np.ndarray | None = None,
+    segment_psds_low: list[np.ndarray] | None = None,
 ) -> tuple[float | None, float | None, float | None, float | None, list[float], list[float]]:
     psd_sum = float(np.sum(psd))
     if psd_sum <= 0.0:
@@ -543,8 +711,25 @@ def _finalize_spectral_summary(
         rumble_ratio_db = _finite_or_none(10.0 * math.log10(low_energy / body_energy))
 
     hum_peaks = _detect_hum_peaks(freqs, psd, sample_rate)
-    tonal_peaks = _detect_tonal_peaks(freqs, psd, sample_rate, hum_peaks)
+    tonal_peaks = _detect_tonal_peaks(
+        freqs,
+        psd,
+        sample_rate,
+        hum_peaks,
+        freqs_low=freqs_low,
+        segment_psds_low=segment_psds_low,
+    )
     return centroid_hz, rolloff_hz, flatness, rumble_ratio_db, hum_peaks, tonal_peaks
+
+
+def _noise_floor_from_chunk_rms(chunk_rms_db: list[float] | np.ndarray) -> float | None:
+    arr = np.asarray(chunk_rms_db, dtype=np.float64)
+    if arr.size == 0:
+        return None
+    valid = arr[np.isfinite(arr)]
+    if valid.size == 0:
+        return None
+    return _finite_or_none(float(np.percentile(valid, 10)), digits=2)
 
 
 def analyze_audio(
@@ -555,6 +740,7 @@ def analyze_audio(
     max_event_s: float = 45.0,
     freq_range_hz: tuple[float, float] | None = None,
     time_offset_s: float = 0.0,
+    event_kinds: list[str] | None = None,
 ) -> tuple[AudioMetrics, list[DistractionEvent]]:
     """Compute finite psychoacoustic metrics and detect distractions from an in-memory array."""
     arr = ensure_2d_audio(audio)
@@ -566,6 +752,10 @@ def analyze_audio(
             AudioMetrics(duration_s=0.0, sample_rate=int(sample_rate), channels=int(num_channels)),
             [],
         )
+
+    allowed_kinds = (
+        {str(k).strip() for k in event_kinds if str(k).strip()} if event_kinds is not None else None
+    )
 
     mono = np.mean(arr, axis=1)
     rms_lin = float(np.sqrt(np.mean(arr * arr)))
@@ -582,11 +772,29 @@ def analyze_audio(
     )
     dc_offset = _finite_or_none(float(np.mean(arr)), digits=6)
 
+    floor_win = max(1, int(0.1 * sample_rate))
+    n_floor_bins = num_samples // floor_win
+    if n_floor_bins >= 1:
+        sq_bins = np.mean(
+            (arr[: n_floor_bins * floor_win] ** 2).reshape(n_floor_bins, floor_win, num_channels),
+            axis=(1, 2),
+        )
+        floor_db_arr = 10.0 * np.log10(np.maximum(sq_bins, 1e-24))
+        noise_floor_dbfs = _noise_floor_from_chunk_rms(floor_db_arr)
+    else:
+        noise_floor_dbfs = rms_dbfs
+
     integrated_lufs: float | None = None
+    loudness_range_lu: float | None = None
+    short_term_lufs_stats: dict[str, float] | None = None
+    short_term_lufs_timeline: list[dict[str, float]] = []
     if duration_s >= 0.45 and rms_lin > 1e-10:
         lufs_acc = StreamingLUFS(sample_rate, num_channels)
         lufs_acc.update(arr)
         integrated_lufs = lufs_acc.finalize()
+        loudness_range_lu, short_term_lufs_stats, short_term_lufs_timeline = (
+            lufs_acc.short_term_metrics(time_offset_s=time_offset_s)
+        )
 
     stereo_correlation: float | None = None
     mid_side_ratio_db: float | None = None
@@ -613,6 +821,17 @@ def analyze_audio(
     if num_samples >= 64 and float(np.max(np.abs(mono))) > 1e-12:
         nperseg = min(num_samples, 16384)
         freqs_ref, psd_ref = signal.welch(mono, fs=sample_rate, nperseg=nperseg)
+        low_mask = freqs_ref <= 1100.0
+        freqs_low = freqs_ref[low_mask]
+        segment_psds_low: list[np.ndarray] = []
+        if duration_s >= 15.0:
+            n_segs = min(12, max(3, int(duration_s // 5.0)))
+            seg_len = num_samples // n_segs
+            if seg_len >= nperseg:
+                for seg_idx in range(n_segs):
+                    chunk = mono[seg_idx * seg_len : (seg_idx + 1) * seg_len]
+                    _, p_seg = signal.welch(chunk, fs=sample_rate, nperseg=nperseg)
+                    segment_psds_low.append(p_seg[low_mask])
         (
             centroid_hz,
             rolloff_hz,
@@ -620,14 +839,24 @@ def analyze_audio(
             rumble_ratio_db,
             hum_peaks_hz,
             tonal_peaks_hz,
-        ) = _finalize_spectral_summary(freqs_ref, psd_ref, sample_rate)
+        ) = _finalize_spectral_summary(
+            freqs_ref,
+            psd_ref,
+            sample_rate,
+            freqs_low=freqs_low,
+            segment_psds_low=segment_psds_low,
+        )
 
     events: list[DistractionEvent] = _build_global_events(
         duration_s, time_offset_s, hum_peaks_hz, tonal_peaks_hz
     )
 
     # Rumble detector
-    if sample_rate > 220 and mono.size >= int(sample_rate * 0.5):
+    if (
+        (allowed_kinds is None or "low_freq_rumble" in allowed_kinds)
+        and sample_rate > 220
+        and mono.size >= int(sample_rate * 0.5)
+    ):
         sos_lp = signal.butter(
             4, min(80.0, sample_rate * 0.35), btype="lowpass", fs=sample_rate, output="sos"
         )
@@ -647,11 +876,20 @@ def analyze_audio(
                 ]
             )
             events.extend(
-                _rumble_events_from_curve(t_r, db_r, win_r / sample_rate, duration_s, time_offset_s)
+                _rumble_events_from_curve(
+                    t_r,
+                    db_r,
+                    win_r / sample_rate,
+                    duration_s,
+                    time_offset_s,
+                    sensitivity=sensitivity,
+                    min_event_s=min_event_s,
+                    max_event_s=max_event_s,
+                )
             )
 
     # Click detector
-    if num_samples >= 64:
+    if (allowed_kinds is None or "impulsive_click" in allowed_kinds) and num_samples >= 64:
         cutoff = min(1500.0, sample_rate * 0.35)
         sos_hp = signal.butter(4, cutoff, btype="highpass", fs=sample_rate, output="sos")
         hp = signal.sosfiltfilt(sos_hp, arr, axis=0)
@@ -664,57 +902,67 @@ def analyze_audio(
             (int(i), float(np.max(np.abs(arr[i]))), float(z[i]))
             for i in hit_idx
         ]
-        events.extend(_click_events_from_hits(hits, sample_rate, duration_s, cutoff, time_offset_s))
-
-    # Foreground transient & slow_pass detector
-    fg_signal = mono
-    if freq_range_hz is not None and mono.size >= 64:
-        f_lo = max(5.0, min(float(freq_range_hz[0]), sample_rate * 0.44))
-        f_hi = max(f_lo + 5.0, min(float(freq_range_hz[1]), sample_rate * 0.48))
-        sos_bp = signal.butter(4, [f_lo, f_hi], btype="bandpass", fs=sample_rate, output="sos")
-        fg_signal = signal.sosfiltfilt(sos_bp, mono)
-
-    win_fg = max(128, int(0.10 * sample_rate))
-    hop_fg = max(64, int(0.05 * sample_rate))
-    if fg_signal.size >= win_fg * 4:
-        n_fg = 1 + (fg_signal.size - win_fg) // hop_fg
-        t_fg = np.arange(n_fg) * (hop_fg / sample_rate)
-        db_fg = np.array(
-            [
-                20.0
-                * math.log10(
-                    max(
-                        float(
-                            np.sqrt(np.mean(fg_signal[i * hop_fg : i * hop_fg + win_fg] ** 2))
-                        ),
-                        1e-12,
-                    )
-                )
-                for i in range(n_fg)
-            ]
-        )
         events.extend(
-            _foreground_events_from_curve(
-                t_fg,
-                db_fg,
-                win_fg / sample_rate,
-                duration_s,
+            _click_events_from_hits(
+                hits,
                 sample_rate,
-                freqs_ref,
-                psd_ref,
-                sensitivity,
-                min_event_s,
-                max_event_s,
-                freq_range_hz,
+                duration_s,
+                cutoff,
                 time_offset_s,
-                mono,
+                min_event_s=min_event_s,
             )
         )
+
+    # Foreground transient & slow_pass detector
+    if allowed_kinds is None or bool({"slow_pass", "transient_distraction"} & allowed_kinds):
+        fg_signal = mono
+        if freq_range_hz is not None and mono.size >= 64:
+            f_lo = max(5.0, min(float(freq_range_hz[0]), sample_rate * 0.44))
+            f_hi = max(f_lo + 5.0, min(float(freq_range_hz[1]), sample_rate * 0.48))
+            sos_bp = signal.butter(4, [f_lo, f_hi], btype="bandpass", fs=sample_rate, output="sos")
+            fg_signal = signal.sosfiltfilt(sos_bp, mono)
+
+        win_fg = max(128, int(0.10 * sample_rate))
+        hop_fg = max(64, int(0.05 * sample_rate))
+        if fg_signal.size >= win_fg * 4:
+            n_fg = 1 + (fg_signal.size - win_fg) // hop_fg
+            t_fg = np.arange(n_fg) * (hop_fg / sample_rate)
+            db_fg = np.array(
+                [
+                    20.0
+                    * math.log10(
+                        max(
+                            float(
+                                np.sqrt(np.mean(fg_signal[i * hop_fg : i * hop_fg + win_fg] ** 2))
+                            ),
+                            1e-12,
+                        )
+                    )
+                    for i in range(n_fg)
+                ]
+            )
+            events.extend(
+                _foreground_events_from_curve(
+                    t_fg,
+                    db_fg,
+                    win_fg / sample_rate,
+                    duration_s,
+                    sample_rate,
+                    freqs_ref,
+                    psd_ref,
+                    sensitivity,
+                    min_event_s,
+                    max_event_s,
+                    freq_range_hz,
+                    time_offset_s,
+                    mono,
+                )
+            )
 
     # Clipping detector
     clipped_mask = np.any(np.abs(arr) >= 0.9999, axis=1)
     clipped_samples = int(np.sum(np.abs(arr) >= 0.9999))
-    if clipped_samples > 0:
+    if clipped_samples > 0 and (allowed_kinds is None or "clipping" in allowed_kinds):
         idx_c = np.flatnonzero(clipped_mask)
         gap = int(0.1 * sample_rate)
         s_i = e_i = int(idx_c[0])
@@ -747,6 +995,9 @@ def analyze_audio(
             )
         )
 
+    if allowed_kinds is not None:
+        events = [ev for ev in events if ev.kind in allowed_kinds]
+
     events.sort(key=lambda ev: (ev.start_s, ev.end_s))
     for idx, ev in enumerate(events, start=1):
         ev.id = f"evt_{idx:03d}"
@@ -770,6 +1021,10 @@ def analyze_audio(
         rumble_ratio_db=rumble_ratio_db,
         hum_peaks_hz=hum_peaks_hz,
         tonal_peaks_hz=tonal_peaks_hz,
+        loudness_range_lu=loudness_range_lu,
+        noise_floor_dbfs=noise_floor_dbfs,
+        short_term_lufs_stats=short_term_lufs_stats,
+        short_term_lufs_timeline=short_term_lufs_timeline,
     )
     return metrics, events
 
@@ -782,6 +1037,7 @@ def analyze_file(
     min_event_s: float = 0.12,
     max_event_s: float = 45.0,
     freq_range_hz: tuple[float, float] | None = None,
+    event_kinds: list[str] | None = None,
 ) -> tuple[AudioMetrics, list[DistractionEvent]]:
     """Stream-analyze an audio file (or sub-region) in bounded RAM (< 100 MB)."""
     src = Path(path)
@@ -795,6 +1051,9 @@ def analyze_file(
             [],
         )
 
+    allowed_kinds = (
+        {str(k).strip() for k in event_kinds if str(k).strip()} if event_kinds is not None else None
+    )
     sr = info.sample_rate
     ch = info.channels
 
@@ -810,6 +1069,7 @@ def analyze_file(
                 max_event_s=max_event_s,
                 freq_range_hz=freq_range_hz,
                 time_offset_s=s0,
+                event_kinds=event_kinds,
             )
         except Exception:
             pass
@@ -830,6 +1090,13 @@ def analyze_file(
     freqs_ref = np.fft.rfftfreq(nperseg, d=1.0 / sr)
     psd_accum = np.zeros_like(freqs_ref, dtype=np.float64)
     psd_weight = 0
+    low_mask = freqs_ref <= 1100.0
+    freqs_low = freqs_ref[low_mask]
+    segment_psds_low: list[np.ndarray] = []
+
+    floor_hop = max(1, int(0.1 * sr))
+    floor_tail = np.zeros(0, dtype=np.float64)
+    floor_db_list: list[float] = []
 
     # Stateful filters for rumble, click, and foreground curves
     sos_lp = signal.butter(4, min(80.0, sr * 0.35), btype="lowpass", fs=sr, output="sos")
@@ -869,6 +1136,17 @@ def analyze_file(
         sum_sq_all += float(np.sum(block * block))
         peak_lin = max(peak_lin, float(np.max(np.abs(block))))
 
+        sq_ch_mean = np.mean(block * block, axis=1)
+        f_cat = np.concatenate([floor_tail, sq_ch_mean]) if floor_tail.size else sq_ch_mean
+        n_floor = f_cat.size // floor_hop
+        if n_floor > 0:
+            f_mat = f_cat[: n_floor * floor_hop].reshape(n_floor, floor_hop)
+            f_db = 10.0 * np.log10(np.maximum(np.mean(f_mat, axis=1), 1e-24))
+            floor_db_list.extend(f_db)
+            floor_tail = f_cat[n_floor * floor_hop :]
+        else:
+            floor_tail = f_cat
+
         clip_mask_b = np.abs(block) >= 0.9999
         c_cnt = int(np.sum(clip_mask_b))
         if c_cnt > 0:
@@ -896,51 +1174,55 @@ def analyze_file(
             _, p_b = signal.welch(mono, fs=sr, nperseg=nperseg)
             psd_accum += p_b * n_b
             psd_weight += n_b
+            segment_psds_low.append(p_b[low_mask].copy())
 
         # Rumble curve (125 ms frames)
-        low_b, zi_lp = signal.sosfilt(sos_lp, mono, zi=zi_lp)
-        low_cat = np.concatenate([rumble_tail, low_b]) if rumble_tail.size else low_b
-        n_r_frames = low_cat.size // hop_r
-        if n_r_frames > 0:
-            r_mat = low_cat[: n_r_frames * hop_r].reshape(n_r_frames, hop_r)
-            r_rms = np.sqrt(np.mean(r_mat * r_mat, axis=1))
-            rumble_db_list.extend(20.0 * np.log10(np.maximum(r_rms, 1e-12)))
-            rumble_tail = low_cat[n_r_frames * hop_r :]
-        else:
-            rumble_tail = low_cat
+        if allowed_kinds is None or "low_freq_rumble" in allowed_kinds:
+            low_b, zi_lp = signal.sosfilt(sos_lp, mono, zi=zi_lp)
+            low_cat = np.concatenate([rumble_tail, low_b]) if rumble_tail.size else low_b
+            n_r_frames = low_cat.size // hop_r
+            if n_r_frames > 0:
+                r_mat = low_cat[: n_r_frames * hop_r].reshape(n_r_frames, hop_r)
+                r_rms = np.sqrt(np.mean(r_mat * r_mat, axis=1))
+                rumble_db_list.extend(20.0 * np.log10(np.maximum(r_rms, 1e-12)))
+                rumble_tail = low_cat[n_r_frames * hop_r :]
+            else:
+                rumble_tail = low_cat
 
         # Click spikes per block
-        hp_b, zi_hp = signal.sosfilt(sos_hp, block, axis=0, zi=zi_hp)
-        env_b = np.max(np.abs(hp_b), axis=1)
-        med_b = float(np.median(env_b))
-        sig_b = max(float(np.median(np.abs(env_b - med_b))) * 1.4826, 1e-7)
-        z_b = (env_b - med_b) / sig_b
-        hits_b = np.flatnonzero((z_b > 10.0) & (env_b > 5e-3))
-        if hits_b.size > 0:
-            for idx_h in hits_b[:2000]:
-                i_h = int(idx_h)
-                click_hits.append(
-                    (
-                        rel_start_frame + i_h,
-                        float(np.max(np.abs(block[i_h]))),
-                        float(z_b[i_h]),
+        if (allowed_kinds is None or "impulsive_click" in allowed_kinds) and min_event_s <= 0.15:
+            hp_b, zi_hp = signal.sosfilt(sos_hp, block, axis=0, zi=zi_hp)
+            env_b = np.max(np.abs(hp_b), axis=1)
+            med_b = float(np.median(env_b))
+            sig_b = max(float(np.median(np.abs(env_b - med_b))) * 1.4826, 1e-7)
+            z_b = (env_b - med_b) / sig_b
+            hits_b = np.flatnonzero((z_b > 10.0) & (env_b > 5e-3))
+            if hits_b.size > 0:
+                for idx_h in hits_b[:2000]:
+                    i_h = int(idx_h)
+                    click_hits.append(
+                        (
+                            rel_start_frame + i_h,
+                            float(np.max(np.abs(block[i_h]))),
+                            float(z_b[i_h]),
+                        )
                     )
-                )
 
         # Foreground curve (50 ms frames)
-        if sos_bp is not None and zi_bp is not None:
-            fg_b, zi_bp = signal.sosfilt(sos_bp, mono, zi=zi_bp)
-        else:
-            fg_b = mono
-        fg_cat = np.concatenate([fg_tail, fg_b]) if fg_tail.size else fg_b
-        n_fg_frames = fg_cat.size // hop_fg
-        if n_fg_frames > 0:
-            fg_mat = fg_cat[: n_fg_frames * hop_fg].reshape(n_fg_frames, hop_fg)
-            fg_rms = np.sqrt(np.mean(fg_mat * fg_mat, axis=1))
-            fg_db_list.extend(20.0 * np.log10(np.maximum(fg_rms, 1e-12)))
-            fg_tail = fg_cat[n_fg_frames * hop_fg :]
-        else:
-            fg_tail = fg_cat
+        if allowed_kinds is None or bool({"slow_pass", "transient_distraction"} & allowed_kinds):
+            if sos_bp is not None and zi_bp is not None:
+                fg_b, zi_bp = signal.sosfilt(sos_bp, mono, zi=zi_bp)
+            else:
+                fg_b = mono
+            fg_cat = np.concatenate([fg_tail, fg_b]) if fg_tail.size else fg_b
+            n_fg_frames = fg_cat.size // hop_fg
+            if n_fg_frames > 0:
+                fg_mat = fg_cat[: n_fg_frames * hop_fg].reshape(n_fg_frames, hop_fg)
+                fg_rms = np.sqrt(np.mean(fg_mat * fg_mat, axis=1))
+                fg_db_list.extend(20.0 * np.log10(np.maximum(fg_rms, 1e-12)))
+                fg_tail = fg_cat[n_fg_frames * hop_fg :]
+            else:
+                fg_tail = fg_cat
 
         del abs_frame  # unused
 
@@ -961,7 +1243,17 @@ def analyze_file(
         else None
     )
     dc_offset = _finite_or_none(sum_all / (total_frames * ch), digits=6)
-    integrated_lufs = lufs_acc.finalize() if rms_lin > 1e-10 else None
+    noise_floor_dbfs = _noise_floor_from_chunk_rms(floor_db_list) if floor_db_list else rms_dbfs
+
+    integrated_lufs: float | None = None
+    loudness_range_lu: float | None = None
+    short_term_lufs_stats: dict[str, float] | None = None
+    short_term_lufs_timeline: list[dict[str, float]] = []
+    if rms_lin > 1e-10:
+        integrated_lufs = lufs_acc.finalize()
+        loudness_range_lu, short_term_lufs_stats, short_term_lufs_timeline = (
+            lufs_acc.short_term_metrics(time_offset_s=s0)
+        )
 
     stereo_correlation: float | None = None
     mid_side_ratio_db: float | None = None
@@ -991,20 +1283,44 @@ def analyze_file(
             rumble_ratio_db,
             hum_peaks_hz,
             tonal_peaks_hz,
-        ) = _finalize_spectral_summary(freqs_ref, psd_mean, sr)
+        ) = _finalize_spectral_summary(
+            freqs_ref,
+            psd_mean,
+            sr,
+            freqs_low=freqs_low,
+            segment_psds_low=segment_psds_low,
+        )
 
     events: list[DistractionEvent] = _build_global_events(
         duration_s, s0, hum_peaks_hz, tonal_peaks_hz
     )
 
-    if rumble_db_list:
+    if rumble_db_list and (allowed_kinds is None or "low_freq_rumble" in allowed_kinds):
         r_arr = np.asarray(rumble_db_list, dtype=np.float64)
         t_r = np.arange(r_arr.size) * (hop_r / sr)
-        events.extend(_rumble_events_from_curve(t_r, r_arr, hop_r / sr, duration_s, s0))
+        events.extend(
+            _rumble_events_from_curve(
+                t_r,
+                r_arr,
+                hop_r / sr,
+                duration_s,
+                s0,
+                sensitivity=sensitivity,
+                min_event_s=min_event_s,
+                max_event_s=max_event_s,
+            )
+        )
 
-    events.extend(_click_events_from_hits(click_hits, sr, duration_s, cutoff_hp, s0))
+    if click_hits and (allowed_kinds is None or "impulsive_click" in allowed_kinds):
+        events.extend(
+            _click_events_from_hits(
+                click_hits, sr, duration_s, cutoff_hp, s0, min_event_s=min_event_s
+            )
+        )
 
-    if fg_db_list:
+    if fg_db_list and (
+        allowed_kinds is None or bool({"slow_pass", "transient_distraction"} & allowed_kinds)
+    ):
         fg_arr = np.asarray(fg_db_list, dtype=np.float64)
         t_fg = np.arange(fg_arr.size) * (hop_fg / sr)
         events.extend(
@@ -1025,7 +1341,7 @@ def analyze_file(
             )
         )
 
-    if clip_indices:
+    if clip_indices and (allowed_kinds is None or "clipping" in allowed_kinds):
         gap = int(0.1 * sr)
         s_i = e_i = clip_indices[0]
         for i in clip_indices[1:]:
@@ -1056,6 +1372,9 @@ def analyze_file(
             )
         )
 
+    if allowed_kinds is not None:
+        events = [ev for ev in events if ev.kind in allowed_kinds]
+
     events.sort(key=lambda ev: (ev.start_s, ev.end_s))
     for idx, ev in enumerate(events, start=1):
         ev.id = f"evt_{idx:03d}"
@@ -1079,5 +1398,9 @@ def analyze_file(
         rumble_ratio_db=rumble_ratio_db,
         hum_peaks_hz=hum_peaks_hz,
         tonal_peaks_hz=tonal_peaks_hz,
+        loudness_range_lu=loudness_range_lu,
+        noise_floor_dbfs=noise_floor_dbfs,
+        short_term_lufs_stats=short_term_lufs_stats,
+        short_term_lufs_timeline=short_term_lufs_timeline,
     )
     return metrics, events

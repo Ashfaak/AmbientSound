@@ -43,5 +43,11 @@ Working notes on DSP design choices, tuning heuristics for ambient soundscapes, 
 - Listen to `Residual` (`hotkey 4`) in the A/B Studio to verify rain texture outside the distraction stays intact.
 - **Bee-Hive & Passing-Vehicle Notes (`ZOOM0001.WAV` class):**
   - Honeybee hive buzzing concentrates fundamental energy around `200–300 Hz` plus upper harmonics, overlapping engine/tyre passes (`80–1000 Hz`).
-  - Use `analyze_region(..., freq_range_hz=[35, 160], sensitivity="high")` to locate vehicle swells below the hive fundamental without false triggers, then preview `trim_range` on a `30 s` slice before executing full-file batched `band_attenuate(envelope_mode="swell", fade_ms=1500+)` or `cut_regions(crossfade_ms=1000+)`.
-  - For YouTube ASMR delivery (`-14 LUFS`), chain gentle `parametric_eq` (`lowshelf` warmth + `>10 kHz` `highshelf` air), `soft_compress` (`ratio 1.8`), `loudness_normalize(target_lufs=-14.0)`, `true_peak_limiter(ceiling_dbtp=-1.0)`, and `fade_edges`.
+  - Use `analyze_region(..., freq_range_hz=[35, 160], sensitivity="high", min_event_s=1.5)` to locate vehicle swells cleanly without thousands of `impulsive_click` entries crowding responses. Note that natural hive crackles/ticks are often desirable ASMR detail—avoid running `declick_impulse` indiscriminately on clean hive textures.
+  - For asymmetric 5–20 s vehicle passes, prefer `band_attenuate(envelope_mode="adaptive", fade_ms=1500+)` or `ambience_patch` from clean bee donors.
+  - For YouTube ASMR delivery (`-14 LUFS`) from quiet (`-45` to `-55 LUFS`) sources, stage `gain` before `soft_compress` (so transients reach compressor threshold) and/or enable `loudness_normalize(target_lufs=-14.0, true_peak_ceiling_dbtp=-1.0, limit_peaks=True)` + `fade_edges`.
+
+### 2026-11-20 — `v0.3.0` Calibration & Detector Notes
+- **Bilateral Spectral Prominence:** Steep high-pass filters (`45 Hz`, `order=4`) roll off the lower sideband around `50 Hz`, causing one-sided median prominence (`peak - combined_neighbor_median`) to mistake the filter shoulder for `50 Hz` mains hum. Computing `min(peak - left_median, peak - right_median)` eliminates false hum triggers while detecting real 50/60 Hz tones.
+- **Persistent Tonal Drone Separation:** Lowering tonal prominence to `> 7.0 dB` catches steady `7–11 dB` machine drones, while requiring bilateral prominence `>= 4.5 dB` in `>= 60%` of time segments separates continuous drones across long files from brief 15 s passing vehicles.
+- **Detector Floor `-92.0 dBFS`:** Quiet `-50 LUFS` field recordings filtered into narrow sub-bands routinely fall below `-55` to `-60 dBFS`. Moving the noise gate floor to `-92.0 dBFS` restores sensitivity and band-limited event discovery on quiet sources.
