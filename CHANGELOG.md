@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added standalone [instructions.md](instructions.md) handover guide documenting the AmbientSound MCP connection setup, all 11 tool contracts, 8 DSP filters, iterative A/B tuning workflow, and feedback-to-parameter playbook for AI agents.
+
 ### Planned
 - Phase 2: CPU ONNX audio tagging / sound event detection (`YAMNet`, `PANNs`, `Silero VAD`) for semantic distraction classification.
 - Phase 3: Text-queried target distraction separation (`AudioSep` / `CLAPSep`) behind license-aware model opt-in controls.

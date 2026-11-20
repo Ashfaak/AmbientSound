@@ -114,6 +114,7 @@ Configure your MCP host (Claude Desktop, Cursor, Antigravity, etc.) to launch `a
 
 ## Documentation Index
 
+- [Agent MCP Usage Instructions](instructions.md) — standalone handover guide for AI models operating this MCP server
 - [Architecture & Data Model](docs/ARCHITECTURE.md)
 - [Ambient Audio Gaps & Design Decisions](docs/GAPS_AND_DESIGN.md)
 - [Open-Source License Compatibility Analysis](docs/LICENSES.md)
