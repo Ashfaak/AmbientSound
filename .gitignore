@@ -1,0 +1,51 @@
+# Local-only private notes, research checklists, and scratch workspaces
+.local/
+.ambientsound/
+models/
+
+# Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.installed.cfg
+*.egg
+build/
+dist/
+develop-eggs/
+eggs/
+.eggs/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+
+# Testing & linting
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Audio artifacts (never commit user recordings or rendered takes)
+*.wav
+*.flac
+*.mp3
+*.ogg
+*.opus
+*.m4a
+*.aiff
+*.aif
+!tests/fixtures/**
+
+# Environment & IDE
+.env
+.env.*
+*.log
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,68 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ambient-sound"
+version = "0.1.0"
+description = "MCP-driven ambient audio distraction removal and loudness-matched A/B listening studio"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.11,<3.14"
+authors = [
+  { name = "Ashfaak" },
+]
+keywords = ["audio", "dsp", "mcp", "ambience", "restoration", "ab-testing"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: End Users/Desktop",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Multimedia :: Sound/Audio :: Analysis",
+  "Topic :: Multimedia :: Sound/Audio :: Editors",
+]
+dependencies = [
+  "mcp>=2.0.0",
+  "numpy>=2.0.0",
+  "scipy>=1.14.0",
+  "soundfile>=0.12.1",
+  "pyloudnorm>=0.1.1",
+  "matplotlib>=3.9.0",
+  "fastapi>=0.115.0",
+  "uvicorn>=0.32.0",
+  "pydantic>=2.9.0",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3.0",
+  "httpx>=0.27.0",
+  "ruff>=0.7.0",
+]
+
+[project.scripts]
+ambient-sound = "ambient_sound.cli:main"
+ambient-sound-mcp = "ambient_sound.mcp_server:main"
+ambient-sound-ui = "ambient_sound.web_ui:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ambient_sound"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/ambient_sound/static" = "ambient_sound/static"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

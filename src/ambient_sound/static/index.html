@@ -1,0 +1,820 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AmbientSound — A/B Listening Studio</title>
+  <style>
+    :root {
+      --bg: #0c1118;
+      --panel: #141c27;
+      --panel-alt: #1a2433;
+      --border: #273549;
+      --text: #e6edf5;
+      --muted: #93a4b8;
+      --accent: #38bdf8;
+      --teal: #2dd4bf;
+      --amber: #f59e0b;
+      --rose: #fb7185;
+      --green: #34d399;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.45;
+    }
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      padding: 1rem 1.5rem;
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+    .brand-dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, var(--teal), var(--accent));
+      box-shadow: 0 0 12px rgba(45, 212, 191, 0.55);
+    }
+    .brand h1 { margin: 0; font-size: 1.1rem; font-weight: 600; letter-spacing: 0.01em; }
+    .selectors {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      align-items: center;
+    }
+    select, input[type="number"], textarea {
+      background: var(--panel-alt);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.45rem 0.7rem;
+      font-size: 0.88rem;
+    }
+    main {
+      max-width: 1320px;
+      margin: 0 auto;
+      padding: 1.25rem;
+      display: grid;
+      grid-template-columns: 1.45fr 1fr;
+      gap: 1.25rem;
+    }
+    @media (max-width: 980px) {
+      main { grid-template-columns: 1fr; }
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.15rem;
+    }
+    .card h2 {
+      margin: 0 0 0.85rem 0;
+      font-size: 0.96rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+    }
+    .banner {
+      padding: 0.65rem 0.9rem;
+      border-radius: 8px;
+      font-size: 0.86rem;
+      margin-bottom: 1rem;
+      border: 1px solid rgba(245, 158, 11, 0.4);
+      background: rgba(245, 158, 11, 0.12);
+      color: #fde68a;
+      display: none;
+    }
+    .switch-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 0.65rem;
+      margin-bottom: 1rem;
+    }
+    .btn {
+      cursor: pointer;
+      border: 1px solid var(--border);
+      background: var(--panel-alt);
+      color: var(--text);
+      border-radius: 10px;
+      padding: 0.7rem 0.75rem;
+      font-weight: 600;
+      font-size: 0.9rem;
+      transition: all 0.14s ease;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.25rem;
+    }
+    .btn:hover:not(:disabled) { border-color: var(--accent); }
+    .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+    .btn.active-a { background: rgba(45, 212, 191, 0.18); border-color: var(--teal); color: var(--teal); }
+    .btn.active-b { background: rgba(56, 189, 248, 0.18); border-color: var(--accent); color: var(--accent); }
+    .btn.active-orig { background: rgba(245, 158, 11, 0.18); border-color: var(--amber); color: var(--amber); }
+    .btn.active-res { background: rgba(251, 113, 133, 0.18); border-color: var(--rose); color: var(--rose); }
+    .kbd {
+      font-size: 0.72rem;
+      padding: 0.1rem 0.4rem;
+      border-radius: 4px;
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--muted);
+      font-weight: 500;
+    }
+    .transport {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.85rem;
+      margin-bottom: 0.9rem;
+    }
+    .play-btn {
+      background: linear-gradient(135deg, var(--teal), var(--accent));
+      color: #091017;
+      border: none;
+      border-radius: 8px;
+      padding: 0.6rem 1.2rem;
+      font-weight: 700;
+      cursor: pointer;
+      font-size: 0.92rem;
+    }
+    .play-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+    .scrub-wrap {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      margin-bottom: 0.9rem;
+    }
+    .scrub-wrap input[type="range"] { flex: 1; accent-color: var(--teal); }
+    .time-readout { font-variant-numeric: tabular-nums; font-size: 0.86rem; color: var(--muted); }
+    .controls-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1rem;
+      align-items: center;
+      font-size: 0.86rem;
+      color: var(--muted);
+      padding-top: 0.75rem;
+      border-top: 1px solid var(--border);
+    }
+    .controls-row label { display: inline-flex; align-items: center; gap: 0.4rem; cursor: pointer; }
+    .controls-row input[type="number"] { width: 76px; padding: 0.25rem 0.45rem; }
+    .tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.45rem;
+      margin-bottom: 0.75rem;
+    }
+    .tab-btn {
+      background: var(--panel-alt);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      border-radius: 6px;
+      padding: 0.35rem 0.65rem;
+      font-size: 0.8rem;
+      cursor: pointer;
+    }
+    .tab-btn.active {
+      color: var(--text);
+      border-color: var(--accent);
+      background: rgba(56, 189, 248, 0.14);
+    }
+    .spec-img {
+      width: 100%;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: #0b0f16;
+      display: block;
+    }
+    .meta-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.75rem;
+      margin-top: 0.9rem;
+    }
+    .meta-box {
+      background: var(--panel-alt);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.75rem;
+      font-size: 0.82rem;
+    }
+    .meta-box h3 { margin: 0 0 0.4rem 0; font-size: 0.86rem; color: var(--text); }
+    .meta-box pre {
+      margin: 0.45rem 0 0 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: var(--muted);
+      font-size: 0.76rem;
+    }
+    .winner-row {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 0.55rem;
+      margin-bottom: 0.9rem;
+    }
+    .winner-opt {
+      border: 1px solid var(--border);
+      background: var(--panel-alt);
+      color: var(--text);
+      border-radius: 8px;
+      padding: 0.55rem;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 0.86rem;
+      text-align: center;
+    }
+    .winner-opt.selected {
+      border-color: var(--green);
+      background: rgba(52, 211, 153, 0.16);
+      color: var(--green);
+    }
+    .chip-wrap {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.45rem;
+      margin-bottom: 0.9rem;
+    }
+    .chip {
+      border: 1px solid var(--border);
+      background: var(--panel-alt);
+      color: var(--muted);
+      border-radius: 999px;
+      padding: 0.3rem 0.7rem;
+      font-size: 0.79rem;
+      cursor: pointer;
+    }
+    .chip.selected {
+      border-color: var(--accent);
+      background: rgba(56, 189, 248, 0.16);
+      color: var(--text);
+    }
+    textarea { width: 100%; min-height: 92px; resize: vertical; margin-bottom: 0.85rem; }
+    .submit-btn {
+      width: 100%;
+      background: var(--green);
+      color: #062116;
+      border: none;
+      border-radius: 8px;
+      padding: 0.7rem;
+      font-weight: 700;
+      font-size: 0.92rem;
+      cursor: pointer;
+    }
+    .submit-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .status-line { margin-top: 0.65rem; font-size: 0.84rem; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <div class="brand-dot"></div>
+      <h1>AmbientSound A/B Listening Studio</h1>
+    </div>
+    <div class="selectors">
+      <label for="sessionSelect" style="font-size:0.84rem;color:var(--muted)">Session</label>
+      <select id="sessionSelect"></select>
+      <label for="abSelect" style="font-size:0.84rem;color:var(--muted)">A/B Test</label>
+      <select id="abSelect"></select>
+    </div>
+  </header>
+
+  <main>
+    <section style="display:flex;flex-direction:column;gap:1.25rem;">
+      <div class="card">
+        <h2>Time-Locked Switcher &amp; Transport</h2>
+        <div id="blindBanner" class="banner">
+          Blind Mode active — take labels and DSP recipes stay hidden until you submit a verdict.
+        </div>
+        <div id="testNotes" style="font-size:0.86rem;color:var(--muted);margin-bottom:0.85rem;"></div>
+
+        <div class="switch-grid">
+          <button id="btnA" class="btn active-a" type="button">
+            <span>Candidate A</span>
+            <span class="kbd">Key 1</span>
+          </button>
+          <button id="btnB" class="btn" type="button">
+            <span>Candidate B</span>
+            <span class="kbd">Key 2</span>
+          </button>
+          <button id="btnOrig" class="btn" type="button">
+            <span>Original</span>
+            <span class="kbd">Key 3</span>
+          </button>
+          <button id="btnRes" class="btn" type="button">
+            <span>Removed Residual</span>
+            <span class="kbd">Key 4</span>
+          </button>
+        </div>
+
+        <div class="transport">
+          <button id="playBtn" class="play-btn" type="button" disabled>Play (Space)</button>
+          <span id="audioLoadStatus" class="time-readout">Select a session and A/B test...</span>
+        </div>
+
+        <div class="scrub-wrap">
+          <span id="curTime" class="time-readout">0.00s</span>
+          <input id="scrubSlider" type="range" min="0" max="1" step="0.01" value="0" disabled />
+          <span id="durTime" class="time-readout">0.00s</span>
+        </div>
+
+        <div class="controls-row">
+          <label>
+            <input id="loudnessMatch" type="checkbox" checked />
+            Loudness-Match (attenuation-only LUFS)
+          </label>
+          <label>
+            <input id="loopToggle" type="checkbox" />
+            Loop Focus
+          </label>
+          <span>Start <input id="loopStart" type="number" step="0.1" min="0" value="0" /> s</span>
+          <span>End <input id="loopEnd" type="number" step="0.1" min="0" value="0" /> s</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Visual Inspection (Waveform, Spectrogram &amp; Diff)</h2>
+        <div class="tabs" id="specTabs">
+          <button class="tab-btn active" data-spec="a_diff" type="button">A Diff (Before/After/Removed)</button>
+          <button class="tab-btn" data-spec="b_diff" type="button">B Diff (Before/After/Removed)</button>
+          <button class="tab-btn" data-spec="a_spec" type="button">Take A Spectrogram</button>
+          <button class="tab-btn" data-spec="b_spec" type="button">Take B Spectrogram</button>
+          <button class="tab-btn" data-spec="orig_spec" type="button">Original Spectrogram</button>
+        </div>
+        <img id="specImg" class="spec-img" alt="Spectrogram inspection" />
+        <div class="meta-grid" id="metaGrid"></div>
+      </div>
+    </section>
+
+    <aside class="card" style="align-self:start;">
+      <h2>Human Listening Verdict &amp; Notes</h2>
+      <p style="font-size:0.84rem;color:var(--muted);margin-top:0;">
+        Switch rapidly between <strong>A</strong>, <strong>B</strong>, <strong>Original</strong>, and
+        <strong>Removed Residual</strong> (watch that rain/room tone isn't scooped out).
+      </p>
+
+      <div class="winner-row" id="winnerRow">
+        <button class="winner-opt" data-winner="a" type="button">Candidate A Wins</button>
+        <button class="winner-opt" data-winner="b" type="button">Candidate B Wins</button>
+        <button class="winner-opt" data-winner="tie" type="button">Tie / Indistinguishable</button>
+        <button class="winner-opt" data-winner="original" type="button">Keep Original</button>
+      </div>
+
+      <div style="font-size:0.82rem;color:var(--muted);margin-bottom:0.4rem;">Artifact / Quality Tags</div>
+      <div class="chip-wrap" id="tagChips">
+        <button class="chip" type="button">Natural ambience</button>
+        <button class="chip" type="button">Metallic / swishy</button>
+        <button class="chip" type="button">Hollow gap</button>
+        <button class="chip" type="button">Distraction still audible</button>
+        <button class="chip" type="button">Stereo image shifted</button>
+        <button class="chip" type="button">Too dull / muffled</button>
+        <button class="chip" type="button">Pumping / breathing</button>
+      </div>
+
+      <label for="commentBox" style="display:block;font-size:0.82rem;color:var(--muted);margin-bottom:0.35rem;">
+        Timestamped Observations / Next Tuning Notes
+      </label>
+      <textarea id="commentBox" placeholder="e.g. Candidate B patched the horn cleanly at 2.5s without leaving a hole; slight 60 Hz hum still faintly audible at start."></textarea>
+
+      <button id="submitBtn" class="submit-btn" type="button" disabled>Submit Verdict to Session</button>
+      <div id="verdictStatus" class="status-line"></div>
+    </aside>
+  </main>
+
+  <script>
+    const state = {
+      sessions: [],
+      sessionId: null,
+      abId: null,
+      payload: null,
+      activeSource: "a",
+      lastCandidate: "a",
+      selectedWinner: null,
+      selectedTags: new Set(),
+      audioCtx: null,
+      buffers: {},
+      nodes: null,
+      isPlaying: false,
+      playStartCtxTime: 0,
+      playStartOffset: 0,
+      duration: 0,
+      rafId: null,
+      specTab: "a_diff",
+    };
+
+    const el = (id) => document.getElementById(id);
+
+    function dbToLinear(db) {
+      return Math.pow(10, (db || 0) / 20);
+    }
+
+    async function fetchJson(url, opts) {
+      const res = await fetch(url, opts);
+      if (!res.ok) throw new Error(await res.text());
+      return res.json();
+    }
+
+    function stopPlayback(resetOffset = false) {
+      if (state.nodes) {
+        for (const key of Object.keys(state.nodes)) {
+          try { state.nodes[key].src.stop(); } catch (_) {}
+          try { state.nodes[key].src.disconnect(); } catch (_) {}
+          try { state.nodes[key].gain.disconnect(); } catch (_) {}
+        }
+        state.nodes = null;
+      }
+      if (state.rafId) {
+        cancelAnimationFrame(state.rafId);
+        state.rafId = null;
+      }
+      if (resetOffset) state.playStartOffset = 0;
+      state.isPlaying = false;
+      el("playBtn").textContent = "Play (Space)";
+    }
+
+    function getTargetGains() {
+      const ab = state.payload?.ab_test;
+      const match = el("loudnessMatch").checked;
+      const gainA = match ? dbToLinear(ab?.gain_db_a || 0) : 1.0;
+      const gainB = match ? dbToLinear(ab?.gain_db_b || 0) : 1.0;
+      const gainOrig = match ? dbToLinear(ab?.gain_db_original || 0) : 1.0;
+      return {
+        a: state.activeSource === "a" ? gainA : 0.0,
+        b: state.activeSource === "b" ? gainB : 0.0,
+        original: state.activeSource === "original" ? gainOrig : 0.0,
+        res_a: state.activeSource === "residual" && state.lastCandidate === "a" ? 1.0 : 0.0,
+        res_b: state.activeSource === "residual" && state.lastCandidate === "b" ? 1.0 : 0.0,
+      };
+    }
+
+    function applyGainCrossfade() {
+      if (!state.audioCtx || !state.nodes) return;
+      const now = state.audioCtx.currentTime;
+      const rampEnd = now + 0.012;
+      const targets = getTargetGains();
+      for (const [key, nodePair] of Object.entries(state.nodes)) {
+        const g = nodePair.gain.gain;
+        g.cancelScheduledValues(now);
+        g.setValueAtTime(g.value, now);
+        g.linearRampToValueAtTime(targets[key] ?? 0.0, rampEnd);
+      }
+    }
+
+    function updateSwitchButtons() {
+      el("btnA").className = "btn" + (state.activeSource === "a" ? " active-a" : "");
+      el("btnB").className = "btn" + (state.activeSource === "b" ? " active-b" : "");
+      el("btnOrig").className = "btn" + (state.activeSource === "original" ? " active-orig" : "");
+      el("btnRes").className = "btn" + (state.activeSource === "residual" ? " active-res" : "");
+      const resTarget = state.lastCandidate.toUpperCase();
+      el("btnRes").querySelector("span").textContent = `Removed Residual (${resTarget})`;
+    }
+
+    function selectSource(mode) {
+      if (mode === "a" || mode === "b") state.lastCandidate = mode;
+      state.activeSource = mode;
+      updateSwitchButtons();
+      applyGainCrossfade();
+    }
+
+    function currentPlayhead() {
+      if (!state.isPlaying || !state.audioCtx) return state.playStartOffset;
+      const elapsed = state.audioCtx.currentTime - state.playStartCtxTime;
+      const raw = state.playStartOffset + elapsed;
+      const loopOn = el("loopToggle").checked;
+      const ls = parseFloat(el("loopStart").value) || 0;
+      const le = parseFloat(el("loopEnd").value) || state.duration;
+      if (loopOn && le > ls + 0.05) {
+        if (raw >= ls) {
+          return ls + ((raw - ls) % (le - ls));
+        }
+      }
+      return Math.min(state.duration, raw);
+    }
+
+    function tickUi() {
+      if (!state.isPlaying) return;
+      const pos = currentPlayhead();
+      el("curTime").textContent = `${pos.toFixed(2)}s`;
+      el("scrubSlider").value = pos.toFixed(2);
+      if (!el("loopToggle").checked && pos >= state.duration - 0.01) {
+        stopPlayback(true);
+        el("curTime").textContent = "0.00s";
+        el("scrubSlider").value = "0";
+        return;
+      }
+      state.rafId = requestAnimationFrame(tickUi);
+    }
+
+    function startPlayback(offsetSec = null) {
+      if (!state.buffers.a || !state.buffers.b || !state.buffers.original) return;
+      if (!state.audioCtx) {
+        state.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      if (state.audioCtx.state === "suspended") state.audioCtx.resume();
+
+      const startAt = offsetSec !== null ? offsetSec : state.playStartOffset;
+      stopPlayback(false);
+
+      const loopOn = el("loopToggle").checked;
+      const ls = Math.max(0, parseFloat(el("loopStart").value) || 0);
+      const le = Math.min(state.duration, parseFloat(el("loopEnd").value) || state.duration);
+      const validLoop = loopOn && le > ls + 0.05;
+
+      const targets = getTargetGains();
+      const nodes = {};
+      const startTime = state.audioCtx.currentTime + 0.02;
+
+      for (const key of ["a", "b", "original", "res_a", "res_b"]) {
+        const buf = state.buffers[key];
+        if (!buf) continue;
+        const src = state.audioCtx.createBufferSource();
+        src.buffer = buf;
+        if (validLoop) {
+          src.loop = true;
+          src.loopStart = ls;
+          src.loopEnd = le;
+        }
+        const gain = state.audioCtx.createGain();
+        gain.gain.value = targets[key] ?? 0.0;
+        src.connect(gain).connect(state.audioCtx.destination);
+        src.start(startTime, Math.min(startAt, Math.max(0, state.duration - 0.01)));
+        nodes[key] = { src, gain };
+      }
+
+      state.nodes = nodes;
+      state.playStartCtxTime = startTime;
+      state.playStartOffset = startAt;
+      state.isPlaying = true;
+      el("playBtn").textContent = "Pause (Space)";
+      state.rafId = requestAnimationFrame(tickUi);
+    }
+
+    function updateSpectrogramView() {
+      if (!state.payload) return;
+      const ab = state.payload.ab_test;
+      const sid = state.sessionId;
+      const map = {
+        a_diff: `/api/sessions/${sid}/takes/${ab.take_a_id}/diff-spectrogram`,
+        b_diff: `/api/sessions/${sid}/takes/${ab.take_b_id}/diff-spectrogram`,
+        a_spec: `/api/sessions/${sid}/takes/${ab.take_a_id}/spectrogram`,
+        b_spec: `/api/sessions/${sid}/takes/${ab.take_b_id}/spectrogram`,
+        orig_spec: `/api/sessions/${sid}/takes/${ab.original_take_id}/spectrogram`,
+      };
+      el("specImg").src = `${map[state.specTab]}?t=${Date.now()}`;
+      for (const btn of el("specTabs").querySelectorAll(".tab-btn")) {
+        btn.classList.toggle("active", btn.dataset.spec === state.specTab);
+      }
+    }
+
+    function renderMetadataCards() {
+      const payload = state.payload;
+      if (!payload) return;
+      const { a, b } = payload.takes;
+      const ab = payload.ab_test;
+      const makeBox = (title, takeObj, gainDb) => {
+        const lufs = takeObj.metrics.integrated_lufs ?? "n/a";
+        const corr = takeObj.metrics.stereo_correlation ?? "n/a";
+        const recipeText = takeObj.recipe
+          ? JSON.stringify(takeObj.recipe.steps, null, 2)
+          : "(Recipe hidden in Blind Mode until verdict submission)";
+        return `
+          <div class="meta-box">
+            <h3>${title}: ${takeObj.label}</h3>
+            <div>LUFS: <strong>${lufs}</strong> | A/B Trim: <strong>${gainDb} dB</strong> | Stereo Corr: <strong>${corr}</strong></div>
+            <pre>${recipeText}</pre>
+          </div>
+        `;
+      };
+      el("metaGrid").innerHTML =
+        makeBox("Candidate A", a, ab.gain_db_a) + makeBox("Candidate B", b, ab.gain_db_b);
+    }
+
+    async function decodeWavBuffer(url) {
+      const res = await fetch(url);
+      if (!res.ok) return null;
+      const arr = await res.arrayBuffer();
+      if (!state.audioCtx) state.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      return state.audioCtx.decodeAudioData(arr);
+    }
+
+    async function loadAbTest(sessionId, abId) {
+      stopPlayback(true);
+      state.sessionId = sessionId;
+      state.abId = abId;
+      el("playBtn").disabled = true;
+      el("submitBtn").disabled = true;
+      el("audioLoadStatus").textContent = "Loading audio buffers...";
+
+      const payload = await fetchJson(`/api/sessions/${sessionId}/ab-tests/${abId}`);
+      state.payload = payload;
+      const ab = payload.ab_test;
+
+      el("blindBanner").style.display = payload.redacted ? "block" : "none";
+      el("testNotes").textContent = ab.notes || "";
+
+      const [bufA, bufB, bufOrig, bufResA, bufResB] = await Promise.all([
+        decodeWavBuffer(`/api/sessions/${sessionId}/takes/${ab.take_a_id}/audio`),
+        decodeWavBuffer(`/api/sessions/${sessionId}/takes/${ab.take_b_id}/audio`),
+        decodeWavBuffer(`/api/sessions/${sessionId}/takes/${ab.original_take_id}/audio`),
+        payload.takes.a.has_residual
+          ? decodeWavBuffer(`/api/sessions/${sessionId}/takes/${ab.take_a_id}/residual`)
+          : Promise.resolve(null),
+        payload.takes.b.has_residual
+          ? decodeWavBuffer(`/api/sessions/${sessionId}/takes/${ab.take_b_id}/residual`)
+          : Promise.resolve(null),
+      ]);
+
+      state.buffers = { a: bufA, b: bufB, original: bufOrig, res_a: bufResA, res_b: bufResB };
+      state.duration = bufOrig ? bufOrig.duration : 0;
+
+      el("durTime").textContent = `${state.duration.toFixed(2)}s`;
+      el("curTime").textContent = "0.00s";
+      el("scrubSlider").max = state.duration.toFixed(2);
+      el("scrubSlider").value = "0";
+      el("scrubSlider").disabled = false;
+      el("playBtn").disabled = false;
+      el("submitBtn").disabled = false;
+      el("audioLoadStatus").textContent = "Ready — press Space or click Play";
+
+      if (ab.focus_start_s !== null && ab.focus_end_s !== null) {
+        el("loopToggle").checked = true;
+        el("loopStart").value = ab.focus_start_s;
+        el("loopEnd").value = ab.focus_end_s;
+        state.playStartOffset = ab.focus_start_s;
+      } else {
+        el("loopToggle").checked = false;
+        el("loopStart").value = "0";
+        el("loopEnd").value = state.duration.toFixed(2);
+      }
+
+      // Populate prior verdict if already judged
+      state.selectedWinner = ab.verdict ? ab.verdict.winner : null;
+      state.selectedTags = new Set(ab.verdict ? ab.verdict.artifact_tags : []);
+      el("commentBox").value = ab.verdict ? ab.verdict.comment : "";
+      for (const b of el("winnerRow").querySelectorAll(".winner-opt")) {
+        b.classList.toggle("selected", b.dataset.winner === state.selectedWinner);
+      }
+      for (const c of el("tagChips").querySelectorAll(".chip")) {
+        c.classList.toggle("selected", state.selectedTags.has(c.textContent));
+      }
+      el("verdictStatus").textContent = ab.verdict
+        ? `Recorded verdict: ${ab.verdict.winner.toUpperCase()} (${ab.verdict.submitted_at})`
+        : "No verdict recorded yet.";
+
+      updateSwitchButtons();
+      updateSpectrogramView();
+      renderMetadataCards();
+    }
+
+    async function loadSessions() {
+      const sessions = await fetchJson("/api/sessions");
+      state.sessions = sessions;
+      const sel = el("sessionSelect");
+      sel.innerHTML = "";
+      if (!sessions.length) {
+        sel.innerHTML = "<option value=''>No sessions found</option>";
+        el("audioLoadStatus").textContent = "Run 'ambient-sound demo' or use MCP create_session.";
+        return;
+      }
+      for (const s of sessions) {
+        const opt = document.createElement("option");
+        opt.value = s.session_id;
+        opt.textContent = `${s.name} (${s.session_id})`;
+        sel.appendChild(opt);
+      }
+      const params = new URLSearchParams(window.location.search);
+      const qSession = params.get("session");
+      const targetSid = sessions.some((s) => s.session_id === qSession) ? qSession : sessions[0].session_id;
+      sel.value = targetSid;
+      await onSessionChange(params.get("ab"));
+    }
+
+    async function onSessionChange(preferredAbId = null) {
+      const sid = el("sessionSelect").value;
+      if (!sid) return;
+      const abs = await fetchJson(`/api/sessions/${sid}/ab-tests`);
+      const abSel = el("abSelect");
+      abSel.innerHTML = "";
+      if (!abs.length) {
+        abSel.innerHTML = "<option value=''>No A/B tests</option>";
+        el("audioLoadStatus").textContent = "Session has no A/B tests yet.";
+        return;
+      }
+      for (const ab of abs) {
+        const opt = document.createElement("option");
+        opt.value = ab.ab_id;
+        opt.textContent = `${ab.ab_id}: ${ab.take_a_id} vs ${ab.take_b_id}${ab.verdict ? " [" + ab.verdict.winner + "]" : ""}`;
+        abSel.appendChild(opt);
+      }
+      const targetAb = abs.some((x) => x.ab_id === preferredAbId) ? preferredAbId : abs[abs.length - 1].ab_id;
+      abSel.value = targetAb;
+      await loadAbTest(sid, targetAb);
+    }
+
+    el("sessionSelect").addEventListener("change", () => onSessionChange());
+    el("abSelect").addEventListener("change", () => loadAbTest(el("sessionSelect").value, el("abSelect").value));
+    el("btnA").addEventListener("click", () => selectSource("a"));
+    el("btnB").addEventListener("click", () => selectSource("b"));
+    el("btnOrig").addEventListener("click", () => selectSource("original"));
+    el("btnRes").addEventListener("click", () => selectSource("residual"));
+    el("loudnessMatch").addEventListener("change", applyGainCrossfade);
+
+    el("playBtn").addEventListener("click", () => {
+      if (state.isPlaying) {
+        state.playStartOffset = currentPlayhead();
+        stopPlayback(false);
+      } else {
+        startPlayback(state.playStartOffset);
+      }
+    });
+
+    el("scrubSlider").addEventListener("input", (e) => {
+      const val = parseFloat(e.target.value) || 0;
+      state.playStartOffset = val;
+      el("curTime").textContent = `${val.toFixed(2)}s`;
+      if (state.isPlaying) startPlayback(val);
+    });
+
+    el("loopToggle").addEventListener("change", () => {
+      if (state.isPlaying) startPlayback(currentPlayhead());
+    });
+
+    el("specTabs").addEventListener("click", (e) => {
+      const btn = e.target.closest(".tab-btn");
+      if (!btn) return;
+      state.specTab = btn.dataset.spec;
+      updateSpectrogramView();
+    });
+
+    el("winnerRow").addEventListener("click", (e) => {
+      const btn = e.target.closest(".winner-opt");
+      if (!btn) return;
+      state.selectedWinner = btn.dataset.winner;
+      for (const b of el("winnerRow").querySelectorAll(".winner-opt")) {
+        b.classList.toggle("selected", b === btn);
+      }
+    });
+
+    el("tagChips").addEventListener("click", (e) => {
+      const chip = e.target.closest(".chip");
+      if (!chip) return;
+      const text = chip.textContent;
+      if (state.selectedTags.has(text)) state.selectedTags.delete(text);
+      else state.selectedTags.add(text);
+      chip.classList.toggle("selected", state.selectedTags.has(text));
+    });
+
+    el("submitBtn").addEventListener("click", async () => {
+      if (!state.selectedWinner) {
+        el("verdictStatus").textContent = "Please choose a winner option first.";
+        return;
+      }
+      try {
+        const updated = await fetchJson(
+          `/api/sessions/${state.sessionId}/ab-tests/${state.abId}/verdict`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              winner: state.selectedWinner,
+              artifact_tags: Array.from(state.selectedTags),
+              comment: el("commentBox").value,
+            }),
+          }
+        );
+        state.payload = updated;
+        el("blindBanner").style.display = "none";
+        renderMetadataCards();
+        el("verdictStatus").textContent =
+          `Saved verdict: ${updated.ab_test.verdict.winner.toUpperCase()} (${updated.ab_test.verdict.submitted_at})`;
+      } catch (err) {
+        el("verdictStatus").textContent = `Error saving verdict: ${err.message}`;
+      }
+    });
+
+    window.addEventListener("keydown", (e) => {
+      if (["TEXTAREA", "INPUT", "SELECT"].includes(document.activeElement?.tagName)) return;
+      if (e.code === "Space") {
+        e.preventDefault();
+        el("playBtn").click();
+      } else if (e.key === "1") selectSource("a");
+      else if (e.key === "2") selectSource("b");
+      else if (e.key === "3") selectSource("original");
+      else if (e.key === "4") selectSource("residual");
+    });
+
+    loadSessions();
+  </script>
+</body>
+</html>
