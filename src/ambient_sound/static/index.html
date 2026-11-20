@@ -97,6 +97,29 @@
       color: #fde68a;
       display: none;
     }
+    .window-bar {
+      display: none;
+      flex-wrap: wrap;
+      gap: 0.65rem;
+      align-items: center;
+      padding: 0.65rem 0.85rem;
+      margin-bottom: 1rem;
+      border-radius: 8px;
+      background: rgba(56, 189, 248, 0.1);
+      border: 1px solid rgba(56, 189, 248, 0.35);
+      font-size: 0.84rem;
+    }
+    .window-bar input[type="number"] { width: 88px; padding: 0.28rem 0.5rem; }
+    .small-btn {
+      background: var(--accent);
+      color: #06131f;
+      border: none;
+      border-radius: 6px;
+      padding: 0.35rem 0.75rem;
+      font-weight: 600;
+      cursor: pointer;
+      font-size: 0.82rem;
+    }
     .switch-grid {
       display: grid;
       grid-template-columns: repeat(4, 1fr);
@@ -297,6 +320,13 @@
         <div id="blindBanner" class="banner">
           Blind Mode active — take labels and DSP recipes stay hidden until you submit a verdict.
         </div>
+        <div id="windowBar" class="window-bar">
+          <strong>Windowed Audition Mode:</strong>
+          <span>Start <input id="winStart" type="number" step="1" min="0" value="0" /> s</span>
+          <span>End <input id="winEnd" type="number" step="1" min="1" value="30" /> s</span>
+          <button id="loadWinBtn" class="small-btn" type="button">Load Window</button>
+          <span id="winNote" style="color:var(--muted)"></span>
+        </div>
         <div id="testNotes" style="font-size:0.86rem;color:var(--muted);margin-bottom:0.85rem;"></div>
 
         <div class="switch-grid">
@@ -361,7 +391,7 @@
       <h2>Human Listening Verdict &amp; Notes</h2>
       <p style="font-size:0.84rem;color:var(--muted);margin-top:0;">
         Switch rapidly between <strong>A</strong>, <strong>B</strong>, <strong>Original</strong>, and
-        <strong>Removed Residual</strong> (watch that rain/room tone isn't scooped out).
+        <strong>Removed Residual</strong> (watch that rain/hive/room tone isn't scooped out).
       </p>
 
       <div class="winner-row" id="winnerRow">
@@ -385,7 +415,7 @@
       <label for="commentBox" style="display:block;font-size:0.82rem;color:var(--muted);margin-bottom:0.35rem;">
         Timestamped Observations / Next Tuning Notes
       </label>
-      <textarea id="commentBox" placeholder="e.g. Candidate B patched the horn cleanly at 2.5s without leaving a hole; slight 60 Hz hum still faintly audible at start."></textarea>
+      <textarea id="commentBox" placeholder="e.g. Candidate B patched the passing vehicle cleanly at 612s; slight 140 Hz drone remains."></textarea>
 
       <button id="submitBtn" class="submit-btn" type="button" disabled>Submit Verdict to Session</button>
       <div id="verdictStatus" class="status-line"></div>
@@ -409,6 +439,9 @@
       playStartCtxTime: 0,
       playStartOffset: 0,
       duration: 0,
+      windowed: false,
+      winStart: 0,
+      winEnd: 0,
       rafId: null,
       specTab: "a_diff",
     };
@@ -478,6 +511,8 @@
       el("btnRes").className = "btn" + (state.activeSource === "residual" ? " active-res" : "");
       const resTarget = state.lastCandidate.toUpperCase();
       el("btnRes").querySelector("span").textContent = `Removed Residual (${resTarget})`;
+      const hasRes = state.lastCandidate === "a" ? Boolean(state.buffers.res_a) : Boolean(state.buffers.res_b);
+      el("btnRes").disabled = !hasRes;
     }
 
     function selectSource(mode) {
@@ -487,17 +522,22 @@
       applyGainCrossfade();
     }
 
+    function getLocalLoopBounds() {
+      const lsAbs = parseFloat(el("loopStart").value) || state.winStart;
+      const leAbs = parseFloat(el("loopEnd").value) || (state.winStart + state.duration);
+      const ls = Math.max(0, Math.min(state.duration, lsAbs - state.winStart));
+      const le = Math.max(0, Math.min(state.duration, leAbs - state.winStart));
+      return [ls, le];
+    }
+
     function currentPlayhead() {
       if (!state.isPlaying || !state.audioCtx) return state.playStartOffset;
       const elapsed = state.audioCtx.currentTime - state.playStartCtxTime;
       const raw = state.playStartOffset + elapsed;
       const loopOn = el("loopToggle").checked;
-      const ls = parseFloat(el("loopStart").value) || 0;
-      const le = parseFloat(el("loopEnd").value) || state.duration;
-      if (loopOn && le > ls + 0.05) {
-        if (raw >= ls) {
-          return ls + ((raw - ls) % (le - ls));
-        }
+      const [ls, le] = getLocalLoopBounds();
+      if (loopOn && le > ls + 0.05 && raw >= ls) {
+        return ls + ((raw - ls) % (le - ls));
       }
       return Math.min(state.duration, raw);
     }
@@ -505,11 +545,11 @@
     function tickUi() {
       if (!state.isPlaying) return;
       const pos = currentPlayhead();
-      el("curTime").textContent = `${pos.toFixed(2)}s`;
+      el("curTime").textContent = `${(state.winStart + pos).toFixed(2)}s`;
       el("scrubSlider").value = pos.toFixed(2);
       if (!el("loopToggle").checked && pos >= state.duration - 0.01) {
         stopPlayback(true);
-        el("curTime").textContent = "0.00s";
+        el("curTime").textContent = `${state.winStart.toFixed(2)}s`;
         el("scrubSlider").value = "0";
         return;
       }
@@ -527,8 +567,7 @@
       stopPlayback(false);
 
       const loopOn = el("loopToggle").checked;
-      const ls = Math.max(0, parseFloat(el("loopStart").value) || 0);
-      const le = Math.min(state.duration, parseFloat(el("loopEnd").value) || state.duration);
+      const [ls, le] = getLocalLoopBounds();
       const validLoop = loopOn && le > ls + 0.05;
 
       const targets = getTargetGains();
@@ -564,6 +603,9 @@
       if (!state.payload) return;
       const ab = state.payload.ab_test;
       const sid = state.sessionId;
+      const qs = state.windowed
+        ? `start_s=${state.winStart.toFixed(2)}&end_s=${state.winEnd.toFixed(2)}&`
+        : "";
       const map = {
         a_diff: `/api/sessions/${sid}/takes/${ab.take_a_id}/diff-spectrogram`,
         b_diff: `/api/sessions/${sid}/takes/${ab.take_b_id}/diff-spectrogram`,
@@ -571,7 +613,7 @@
         b_spec: `/api/sessions/${sid}/takes/${ab.take_b_id}/spectrogram`,
         orig_spec: `/api/sessions/${sid}/takes/${ab.original_take_id}/spectrogram`,
       };
-      el("specImg").src = `${map[state.specTab]}?t=${Date.now()}`;
+      el("specImg").src = `${map[state.specTab]}?${qs}t=${Date.now()}`;
       for (const btn of el("specTabs").querySelectorAll(".tab-btn")) {
         btn.classList.toggle("active", btn.dataset.spec === state.specTab);
       }
@@ -608,13 +650,68 @@
       return state.audioCtx.decodeAudioData(arr);
     }
 
+    async function loadAudioWindow() {
+      if (!state.payload) return;
+      stopPlayback(true);
+      const ab = state.payload.ab_test;
+      const sid = state.sessionId;
+      el("playBtn").disabled = true;
+      el("audioLoadStatus").textContent = "Loading audio buffers...";
+
+      const qs = state.windowed
+        ? `?start_s=${state.winStart.toFixed(3)}&end_s=${state.winEnd.toFixed(3)}`
+        : "";
+
+      const [bufA, bufB, bufOrig, bufResA, bufResB] = await Promise.all([
+        decodeWavBuffer(`/api/sessions/${sid}/takes/${ab.take_a_id}/audio${qs}`),
+        decodeWavBuffer(`/api/sessions/${sid}/takes/${ab.take_b_id}/audio${qs}`),
+        decodeWavBuffer(`/api/sessions/${sid}/takes/${ab.original_take_id}/audio${qs}`),
+        state.payload.takes.a.has_residual
+          ? decodeWavBuffer(`/api/sessions/${sid}/takes/${ab.take_a_id}/residual${qs}`)
+          : Promise.resolve(null),
+        state.payload.takes.b.has_residual
+          ? decodeWavBuffer(`/api/sessions/${sid}/takes/${ab.take_b_id}/residual${qs}`)
+          : Promise.resolve(null),
+      ]);
+
+      state.buffers = { a: bufA, b: bufB, original: bufOrig, res_a: bufResA, res_b: bufResB };
+      state.duration = bufOrig ? bufOrig.duration : 0;
+
+      el("curTime").textContent = `${state.winStart.toFixed(2)}s`;
+      el("durTime").textContent = `${(state.winStart + state.duration).toFixed(2)}s`;
+      el("scrubSlider").max = state.duration.toFixed(2);
+      el("scrubSlider").value = "0";
+      el("scrubSlider").disabled = false;
+      el("playBtn").disabled = false;
+      el("audioLoadStatus").textContent = state.windowed
+        ? `Window ${state.winStart.toFixed(1)}s-${(state.winStart + state.duration).toFixed(1)}s ready`
+        : "Ready — press Space or click Play";
+
+      if (ab.focus_start_s !== null && ab.focus_end_s !== null) {
+        const fs = Math.max(state.winStart, ab.focus_start_s);
+        const fe = Math.min(state.winStart + state.duration, ab.focus_end_s);
+        if (fe > fs + 0.05) {
+          el("loopToggle").checked = true;
+          el("loopStart").value = fs.toFixed(2);
+          el("loopEnd").value = fe.toFixed(2);
+          state.playStartOffset = fs - state.winStart;
+        }
+      } else {
+        el("loopToggle").checked = false;
+        el("loopStart").value = state.winStart.toFixed(2);
+        el("loopEnd").value = (state.winStart + state.duration).toFixed(2);
+      }
+
+      updateSwitchButtons();
+      updateSpectrogramView();
+    }
+
     async function loadAbTest(sessionId, abId) {
       stopPlayback(true);
       state.sessionId = sessionId;
       state.abId = abId;
       el("playBtn").disabled = true;
       el("submitBtn").disabled = true;
-      el("audioLoadStatus").textContent = "Loading audio buffers...";
 
       const payload = await fetchJson(`/api/sessions/${sessionId}/ab-tests/${abId}`);
       state.payload = payload;
@@ -623,42 +720,36 @@
       el("blindBanner").style.display = payload.redacted ? "block" : "none";
       el("testNotes").textContent = ab.notes || "";
 
-      const [bufA, bufB, bufOrig, bufResA, bufResB] = await Promise.all([
-        decodeWavBuffer(`/api/sessions/${sessionId}/takes/${ab.take_a_id}/audio`),
-        decodeWavBuffer(`/api/sessions/${sessionId}/takes/${ab.take_b_id}/audio`),
-        decodeWavBuffer(`/api/sessions/${sessionId}/takes/${ab.original_take_id}/audio`),
-        payload.takes.a.has_residual
-          ? decodeWavBuffer(`/api/sessions/${sessionId}/takes/${ab.take_a_id}/residual`)
-          : Promise.resolve(null),
-        payload.takes.b.has_residual
-          ? decodeWavBuffer(`/api/sessions/${sessionId}/takes/${ab.take_b_id}/residual`)
-          : Promise.resolve(null),
-      ]);
-
-      state.buffers = { a: bufA, b: bufB, original: bufOrig, res_a: bufResA, res_b: bufResB };
-      state.duration = bufOrig ? bufOrig.duration : 0;
-
-      el("durTime").textContent = `${state.duration.toFixed(2)}s`;
-      el("curTime").textContent = "0.00s";
-      el("scrubSlider").max = state.duration.toFixed(2);
-      el("scrubSlider").value = "0";
-      el("scrubSlider").disabled = false;
-      el("playBtn").disabled = false;
-      el("submitBtn").disabled = false;
-      el("audioLoadStatus").textContent = "Ready — press Space or click Play";
-
-      if (ab.focus_start_s !== null && ab.focus_end_s !== null) {
-        el("loopToggle").checked = true;
-        el("loopStart").value = ab.focus_start_s;
-        el("loopEnd").value = ab.focus_end_s;
-        state.playStartOffset = ab.focus_start_s;
+      const fullDur = payload.takes.original.metrics.duration_s || 0;
+      if (fullDur > 90.0) {
+        state.windowed = true;
+        let ws = 0.0;
+        let we = Math.min(fullDur, 30.0);
+        if (ab.focus_start_s !== null && ab.focus_end_s !== null) {
+          ws = Math.max(0.0, ab.focus_start_s - 5.0);
+          we = Math.min(fullDur, Math.max(ws + 15.0, ab.focus_end_s + 5.0));
+          if (we - ws > 90.0) we = ws + 90.0;
+        }
+        state.winStart = ws;
+        state.winEnd = we;
+        el("windowBar").style.display = "flex";
+        el("winStart").value = ws.toFixed(1);
+        el("winEnd").value = we.toFixed(1);
+        el("winNote").textContent = `Full recording: ${fullDur.toFixed(1)}s (max 90s per browser load)`;
       } else {
-        el("loopToggle").checked = false;
-        el("loopStart").value = "0";
-        el("loopEnd").value = state.duration.toFixed(2);
+        state.windowed = false;
+        state.winStart = 0.0;
+        state.winEnd = fullDur;
+        el("windowBar").style.display = "none";
       }
 
-      // Populate prior verdict if already judged
+      if (!payload.takes.a.has_diff_spectrogram && state.specTab === "a_diff") {
+        state.specTab = "a_spec";
+      }
+
+      await loadAudioWindow();
+
+      el("submitBtn").disabled = false;
       state.selectedWinner = ab.verdict ? ab.verdict.winner : null;
       state.selectedTags = new Set(ab.verdict ? ab.verdict.artifact_tags : []);
       el("commentBox").value = ab.verdict ? ab.verdict.comment : "";
@@ -672,8 +763,6 @@
         ? `Recorded verdict: ${ab.verdict.winner.toUpperCase()} (${ab.verdict.submitted_at})`
         : "No verdict recorded yet.";
 
-      updateSwitchButtons();
-      updateSpectrogramView();
       renderMetadataCards();
     }
 
@@ -724,6 +813,18 @@
 
     el("sessionSelect").addEventListener("change", () => onSessionChange());
     el("abSelect").addEventListener("change", () => loadAbTest(el("sessionSelect").value, el("abSelect").value));
+    el("loadWinBtn").addEventListener("click", async () => {
+      const fullDur = state.payload?.takes?.original?.metrics?.duration_s || 90.0;
+      let ws = Math.max(0.0, parseFloat(el("winStart").value) || 0.0);
+      let we = Math.min(fullDur, parseFloat(el("winEnd").value) || ws + 30.0);
+      if (we <= ws + 0.5) we = Math.min(fullDur, ws + 30.0);
+      if (we - ws > 90.0) we = ws + 90.0;
+      state.winStart = ws;
+      state.winEnd = we;
+      el("winStart").value = ws.toFixed(1);
+      el("winEnd").value = we.toFixed(1);
+      await loadAudioWindow();
+    });
     el("btnA").addEventListener("click", () => selectSource("a"));
     el("btnB").addEventListener("click", () => selectSource("b"));
     el("btnOrig").addEventListener("click", () => selectSource("original"));
@@ -742,7 +843,7 @@
     el("scrubSlider").addEventListener("input", (e) => {
       const val = parseFloat(e.target.value) || 0;
       state.playStartOffset = val;
-      el("curTime").textContent = `${val.toFixed(2)}s`;
+      el("curTime").textContent = `${(state.winStart + val).toFixed(2)}s`;
       if (state.isPlaying) startPlayback(val);
     });
 
@@ -811,7 +912,9 @@
       } else if (e.key === "1") selectSource("a");
       else if (e.key === "2") selectSource("b");
       else if (e.key === "3") selectSource("original");
-      else if (e.key === "4") selectSource("residual");
+      else if (e.key === "4") {
+        if (!el("btnRes").disabled) selectSource("residual");
+      }
     });
 
     loadSessions();

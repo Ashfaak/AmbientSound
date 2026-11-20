@@ -35,11 +35,13 @@ def test_mcp_tool_workflow_and_sandboxing(tmp_path: Path) -> None:
     tools = asyncio.run(mcp.list_tools())
     tool_names = {t.name for t in tools}
     assert {
+        "health_check",
         "list_filters",
         "create_session",
         "list_sessions",
         "get_session_summary",
         "analyze_take",
+        "analyze_region",
         "render_spectrogram",
         "process_take",
         "create_ab_test",
@@ -47,6 +49,10 @@ def test_mcp_tool_workflow_and_sandboxing(tmp_path: Path) -> None:
         "get_ab_feedback",
         "export_take",
     }.issubset(tool_names)
+
+    health = _call_tool_json(mcp, "health_check", {})
+    assert health["status"] == "ok"
+    assert health["filter_count"] == 14
 
     filters_res = _call_tool_json(mcp, "list_filters", {})
     filters = filters_res["filters"]
@@ -67,6 +73,20 @@ def test_mcp_tool_workflow_and_sandboxing(tmp_path: Path) -> None:
 
     analyzed = _call_tool_json(mcp, "analyze_take", {"session_id": sid, "take_id": "take_000"})
     assert analyzed["metrics"]["sample_rate"] == sr
+
+    reg_analyzed = _call_tool_json(
+        mcp,
+        "analyze_region",
+        {
+            "session_id": sid,
+            "take_id": "take_000",
+            "start_s": 0.2,
+            "end_s": 1.4,
+            "sensitivity": "high",
+            "freq_range_hz": [40.0, 300.0],
+        },
+    )
+    assert abs(reg_analyzed["metrics"]["duration_s"] - 1.2) < 0.05
 
     take1 = _call_tool_json(
         mcp,
@@ -97,7 +117,13 @@ def test_mcp_tool_workflow_and_sandboxing(tmp_path: Path) -> None:
     vis = _call_tool_json(
         mcp,
         "render_spectrogram",
-        {"session_id": sid, "take_id": take1["take_id"], "compare_to_take_id": "take_000"},
+        {
+            "session_id": sid,
+            "take_id": take1["take_id"],
+            "compare_to_take_id": "take_000",
+            "start_s": 0.2,
+            "end_s": 1.2,
+        },
     )
     assert Path(vis["spectrogram_path"]).exists()
     assert Path(vis["diff_spectrogram_path"]).exists()

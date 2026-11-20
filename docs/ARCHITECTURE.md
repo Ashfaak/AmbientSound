@@ -48,10 +48,13 @@ flowchart TB
 1. **Canonical Tensor Shape:** Every internal audio array loaded or passed between `io_audio`, `analysis`, `dsp`, and `visuals` is a 2D `numpy.ndarray` of `dtype=np.float64` with shape `(num_samples, num_channels)`.
    - Mono files become `(num_samples, 1)`.
    - Stereo files stay `(num_samples, 2)`.
-2. **Exact Length Preservation:** All DSP filters preserve exact sample count `num_samples` and channel count `num_channels` so any processed take `T` can be subtracted sample-for-sample from its parent `P`:
+2. **Exact Length Preservation (Restoration Filters):** Non-structural DSP filters preserve exact sample count `num_samples` and channel count `num_channels` so any processed take `T` can be subtracted sample-for-sample from its parent `P`:
    $$\text{residual} = P - T$$
-3. **32-Bit Float Session Storage:** Intermediate takes are saved as IEEE 32-bit float WAV (`subtype="FLOAT"`) to preserve headroom above `0 dBFS` until final export.
-4. **Finite JSON Guarantee:** Metrics such as integrated LUFS (on `<0.4 s` or silent clips) or stereo correlation (on silent/constant channels) are sanitized through `_finite_or_none` so `NaN` or `±inf` never enter JSON responses.
+   Length-changing editing filters (`trim_range`, `cut_regions`) intentionally create a shortened timeline without a full-track residual.
+3. **Storage & Streaming Threshold (`STREAMING_THRESHOLD_S = 120.0 s`):**
+   - Takes `<= 120 s` run in memory and store 32-bit float WAV (`FLOAT`) + materialized `residual.wav`.
+   - Takes `> 120 s` (such as 1-hour / 672 MB field recordings) stream chunk-by-chunk on disk (`apply_recipe_streaming`, `analyze_file`, `StreamingLUFS`, `chunked_true_peak_linear`), store 24-bit WAV (`PCM_24`), and compute sliced residuals dynamically for the Web UI.
+4. **Finite JSON Guarantee:** Metrics such as integrated LUFS (on `<0.45 s` or silent clips) or stereo correlation (on silent/constant channels) are sanitized through `_finite_or_none` so `NaN` or `±inf` never enter JSON responses.
 
 ---
 

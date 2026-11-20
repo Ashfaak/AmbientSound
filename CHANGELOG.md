@@ -7,13 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-- Added standalone [instructions.md](instructions.md) handover guide documenting the AmbientSound MCP connection setup, all 11 tool contracts, 8 DSP filters, iterative A/B tuning workflow, and feedback-to-parameter playbook for AI agents.
-
 ### Planned
 - Phase 2: CPU ONNX audio tagging / sound event detection (`YAMNet`, `PANNs`, `Silero VAD`) for semantic distraction classification.
 - Phase 3: Text-queried target distraction separation (`AudioSep` / `CLAPSep`) behind license-aware model opt-in controls.
-- Phase 4: Overlap-add streaming chunked processing for multi-hour field recordings.
+- Phase 4: Multi-take history DAG visualizer and optional external `ferraus` CLI backend adapter.
+
+## [0.2.0] - 2026-11-20
+
+### Added
+- Standalone [instructions.md](instructions.md) handover manual (with preflight checks, long-file streaming guidance, hive/traffic notes, and YouTube/ASMR mastering recipes).
+- Bounded-RAM streaming audio I/O (`probe_audio`, `load_audio_slice`, `iter_audio_blocks`, `ingest_audio_to_wav`, `render_wav_bytes`, streaming `export_audio`) safe for 1-hour / 672 MB+ WAV recordings.
+- Streaming ITU-R BS.1770-4 LUFS (`StreamingLUFS`) and chunked 4x True Peak (`chunked_true_peak_linear` / `StreamingTruePeak`) plus `analyze_file` and `analyze_region`.
+- Configurable distraction detection (`sensitivity`, `min_event_s`, `max_event_s`, `freq_range_hz`), `slow_pass` (`>= 3 s`) event classification, and arbitrary-frequency tonal `machine_drone` detection (`tonal_peaks_hz`).
+- Six new CPU DSP filters (`drone_notch`, `trim_range`, `cut_regions`, `fade_edges`, `soft_compress`, `true_peak_limiter`) plus file-to-file `apply_recipe_streaming`.
+- Multi-span batching (`spans`) and up to `5000 ms` fades/crossfades in `band_attenuate` (with `"swell"` envelope mode) and `ambience_patch`.
+- Windowed (`start_s`/`end_s`) and low-RAM long-file overview spectrogram renderers (`render_file_spectrogram_png`, `render_file_diff_spectrogram_png`).
+- New `health_check` and `analyze_region` MCP tools, plus windowed `/audio`, dynamic `/residual`, and `/spectrogram` endpoints with Windowed Audition Mode in the A/B Listening Studio (`static/index.html`).
 
 ## [0.1.0] - 2026-11-20
 

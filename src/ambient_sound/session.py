@@ -9,10 +9,20 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
-from ambient_sound.analysis import analyze_audio
+import numpy as np
+
+from ambient_sound.analysis import SensitivityLevel, analyze_audio, analyze_file
 from ambient_sound.config import Settings, ensure_path_allowed
-from ambient_sound.dsp import apply_recipe, compute_residual
-from ambient_sound.io_audio import export_audio, load_audio, save_wav, sha256_file
+from ambient_sound.dsp import apply_recipe, apply_recipe_streaming, compute_residual
+from ambient_sound.io_audio import (
+    export_audio,
+    ingest_audio_to_wav,
+    load_audio,
+    load_audio_slice,
+    probe_audio,
+    save_wav,
+    sha256_file,
+)
 from ambient_sound.models import (
     ABTestRecord,
     ABVerdict,
@@ -23,7 +33,15 @@ from ambient_sound.models import (
     SessionSummary,
     TakeRecord,
 )
-from ambient_sound.visuals import render_diff_spectrogram_png, render_spectrogram_png
+from ambient_sound.visuals import (
+    render_diff_spectrogram_png,
+    render_file_diff_spectrogram_png,
+    render_file_spectrogram_png,
+    render_spectrogram_png,
+)
+
+# Files longer than 120 seconds automatically stream on disk instead of loading into RAM.
+STREAMING_THRESHOLD_S = 120.0
 
 
 def _utc_now_iso() -> str:
@@ -89,9 +107,8 @@ class SessionManager:
         raise FileNotFoundError(f"Take '{take_id}' not found in session '{session_id}'.")
 
     def create_session(self, source_path: str | Path, name: str = "") -> SessionSummary:
-        """Ingest an audio recording into immutable take_000 and analyze distractions."""
+        """Ingest an audio recording into immutable take_000 in bounded RAM."""
         src = ensure_path_allowed(source_path, self.settings)
-        audio, sr = load_audio(src)
 
         session_name = name.strip() or src.stem
         session_id = f"{_slugify(session_name)}_{uuid4().hex[:6]}"
@@ -100,11 +117,11 @@ class SessionManager:
         take_dir.mkdir(parents=True, exist_ok=True)
         (sdir / "ab_tests").mkdir(parents=True, exist_ok=True)
 
-        audio_wav = save_wav(take_dir / "audio.wav", audio, sr, subtype="FLOAT")
-        metrics, events = analyze_audio(audio, sr)
-        spec_png = render_spectrogram_png(
-            audio,
-            sr,
+        audio_wav = take_dir / "audio.wav"
+        ingest_audio_to_wav(src, audio_wav)
+        metrics, events = analyze_file(audio_wav)
+        spec_png = render_file_spectrogram_png(
+            audio_wav,
             take_dir / "spectrogram.png",
             title=f"{session_name} — take_000 (Original)",
             events=events,
@@ -137,45 +154,98 @@ class SessionManager:
         return summary
 
     def analyze_take(
-        self, session_id: str, take_id: str
+        self,
+        session_id: str,
+        take_id: str,
+        sensitivity: SensitivityLevel = "medium",
+        min_event_s: float = 0.12,
+        max_event_s: float = 45.0,
+        freq_range_hz: tuple[float, float] | None = None,
     ) -> tuple[AudioMetrics, list[DistractionEvent]]:
-        """Re-compute or return fresh metrics and distraction events for a take."""
+        """Compute fresh metrics and distraction events for an entire take."""
         take = self.get_take(session_id, take_id)
-        audio, sr = load_audio(take.audio_path)
-        return analyze_audio(audio, sr)
+        return analyze_file(
+            take.audio_path,
+            sensitivity=sensitivity,
+            min_event_s=min_event_s,
+            max_event_s=max_event_s,
+            freq_range_hz=freq_range_hz,
+        )
+
+    def analyze_region(
+        self,
+        session_id: str,
+        take_id: str,
+        start_s: float = 0.0,
+        end_s: float | None = None,
+        sensitivity: SensitivityLevel = "medium",
+        min_event_s: float = 0.12,
+        max_event_s: float = 45.0,
+        freq_range_hz: tuple[float, float] | None = None,
+    ) -> tuple[AudioMetrics, list[DistractionEvent]]:
+        """Analyze a specific [start_s, end_s] time window of a take with custom sensitivity."""
+        take = self.get_take(session_id, take_id)
+        return analyze_file(
+            take.audio_path,
+            start_s=start_s,
+            end_s=end_s,
+            sensitivity=sensitivity,
+            min_event_s=min_event_s,
+            max_event_s=max_event_s,
+            freq_range_hz=freq_range_hz,
+        )
 
     def render_take_visuals(
         self,
         session_id: str,
         take_id: str,
         compare_to_take_id: str = "",
+        start_s: float | None = None,
+        end_s: float | None = None,
     ) -> dict[str, str]:
-        """Render spectrogram PNG and optional 3-panel diff PNG comparing two takes."""
+        """Render full-file overview or zoomed [start_s, end_s] spectrogram & diff PNGs."""
         take = self.get_take(session_id, take_id)
-        audio, sr = load_audio(take.audio_path)
         take_dir = Path(take.audio_path).parent
+        windowed = start_s is not None or end_s is not None
+        tag = ""
+        if windowed:
+            s0 = 0.0 if start_s is None else float(start_s)
+            s1 = take.metrics.duration_s if end_s is None else float(end_s)
+            tag = f"_{s0:.2f}_{s1:.2f}"
 
-        spec_path = render_spectrogram_png(
-            audio,
-            sr,
-            take_dir / "spectrogram.png",
-            title=f"{take.take_id} ({take.label})",
+        spec_file = take_dir / f"spectrogram{tag}.png"
+        title_sfx = (
+            f" [{start_s or 0.0:.1f}s-{end_s or take.metrics.duration_s:.1f}s]"
+            if windowed
+            else ""
+        )
+        spec_path = render_file_spectrogram_png(
+            take.audio_path,
+            spec_file,
+            title=f"{take.take_id} ({take.label}){title_sfx}",
             events=take.events,
+            start_s=start_s,
+            end_s=end_s,
         )
         result: dict[str, str] = {"spectrogram_path": str(spec_path)}
 
         if compare_to_take_id.strip():
             ref_take = self.get_take(session_id, compare_to_take_id.strip())
-            ref_audio, _ = load_audio(ref_take.audio_path)
-            diff_path = render_diff_spectrogram_png(
-                ref_audio,
-                audio,
-                sr,
-                take_dir / f"diff_vs_{ref_take.take_id}.png",
-                title=f"{ref_take.take_id} -> {take.take_id} ({take.label})",
+            diff_file = take_dir / f"diff_vs_{ref_take.take_id}{tag}.png"
+            diff_path = render_file_diff_spectrogram_png(
+                ref_take.audio_path,
+                take.audio_path,
+                diff_file,
+                title=f"{ref_take.take_id} -> {take.take_id} ({take.label}){title_sfx}",
+                start_s=start_s,
+                end_s=end_s,
             )
             result["diff_spectrogram_path"] = str(diff_path)
-        elif take.diff_spectrogram_path and Path(take.diff_spectrogram_path).exists():
+        elif (
+            not windowed
+            and take.diff_spectrogram_path
+            and Path(take.diff_spectrogram_path).exists()
+        ):
             result["diff_spectrogram_path"] = take.diff_spectrogram_path
         return result
 
@@ -193,36 +263,67 @@ class SessionManager:
         parsed_steps = [
             s if isinstance(s, FilterStep) else FilterStep.model_validate(s) for s in steps
         ]
-
-        parent_audio, sr = load_audio(parent.audio_path)
-        processed = apply_recipe(parent_audio, sr, parsed_steps)
-        residual = compute_residual(parent_audio, processed)
+        changes_length = any(
+            st.filter_name in {"trim_range", "cut_regions"} for st in parsed_steps
+        )
 
         new_take_id = f"take_{len(summary.takes):03d}"
         take_label = label.strip() or f"Processed ({len(parsed_steps)} steps)"
         take_dir = self._session_dir(session_id) / "takes" / new_take_id
         take_dir.mkdir(parents=True, exist_ok=True)
+        audio_path = take_dir / "audio.wav"
 
-        audio_wav = save_wav(take_dir / "audio.wav", processed, sr, subtype="FLOAT")
-        residual_wav = save_wav(take_dir / "residual.wav", residual, sr, subtype="FLOAT")
         recipe = ProcessingRecipe(parent_take_id=parent_take_id, steps=parsed_steps, notes=notes)
         (take_dir / "recipe.json").write_text(recipe.model_dump_json(indent=2), encoding="utf-8")
 
-        metrics, events = analyze_audio(processed, sr)
-        spec_png = render_spectrogram_png(
-            processed,
-            sr,
-            take_dir / "spectrogram.png",
-            title=f"{summary.name} — {new_take_id} ({take_label})",
-            events=events,
-        )
-        diff_png = render_diff_spectrogram_png(
-            parent_audio,
-            processed,
-            sr,
-            take_dir / "diff_spectrogram.png",
-            title=f"{parent_take_id} -> {new_take_id} ({take_label})",
-        )
+        parent_info = probe_audio(parent.audio_path)
+        residual_wav: Path | None = None
+        diff_png: Path | None = None
+
+        if parent_info.duration_s <= STREAMING_THRESHOLD_S:
+            parent_audio, sr = load_audio(parent.audio_path)
+            processed = apply_recipe(parent_audio, sr, parsed_steps)
+            save_wav(audio_path, processed, sr, subtype="FLOAT")
+
+            metrics, events = analyze_audio(processed, sr)
+            spec_png = render_spectrogram_png(
+                processed,
+                sr,
+                take_dir / "spectrogram.png",
+                title=f"{summary.name} — {new_take_id} ({take_label})",
+                events=events,
+            )
+            if not changes_length and processed.shape == parent_audio.shape:
+                residual = compute_residual(parent_audio, processed)
+                residual_wav = save_wav(take_dir / "residual.wav", residual, sr, subtype="FLOAT")
+                diff_png = render_diff_spectrogram_png(
+                    parent_audio,
+                    processed,
+                    sr,
+                    take_dir / "diff_spectrogram.png",
+                    title=f"{parent_take_id} -> {new_take_id} ({take_label})",
+                )
+        else:
+            out_info = apply_recipe_streaming(
+                parent.audio_path,
+                audio_path,
+                parsed_steps,
+                subtype="PCM_24",
+            )
+            metrics, events = analyze_file(audio_path)
+            spec_png = render_file_spectrogram_png(
+                audio_path,
+                take_dir / "spectrogram.png",
+                title=f"{summary.name} — {new_take_id} ({take_label})",
+                events=events,
+            )
+            if not changes_length and out_info.frames == parent_info.frames:
+                diff_png = render_file_diff_spectrogram_png(
+                    parent.audio_path,
+                    audio_path,
+                    take_dir / "diff_spectrogram.png",
+                    title=f"{parent_take_id} -> {new_take_id} ({take_label})",
+                )
 
         record = TakeRecord(
             take_id=new_take_id,
@@ -230,11 +331,11 @@ class SessionManager:
             label=take_label,
             parent_take_id=parent_take_id,
             created_at=_utc_now_iso(),
-            audio_path=str(audio_wav),
-            residual_path=str(residual_wav),
+            audio_path=str(audio_path),
+            residual_path=str(residual_wav) if residual_wav else None,
             spectrogram_path=str(spec_png),
-            diff_spectrogram_path=str(diff_png),
-            sha256=sha256_file(audio_wav),
+            diff_spectrogram_path=str(diff_png) if diff_png else None,
+            sha256=sha256_file(audio_path),
             recipe=recipe,
             metrics=metrics,
             events=events,
@@ -242,6 +343,58 @@ class SessionManager:
         summary.takes.append(record)
         self._save_session(summary)
         return record
+
+    def load_take_audio_slice(
+        self,
+        session_id: str,
+        take_id: str,
+        start_s: float = 0.0,
+        end_s: float | None = None,
+    ) -> tuple[np.ndarray, int]:
+        """Load a [start_s, end_s] slice of a take's audio in bounded RAM."""
+        take = self.get_take(session_id, take_id)
+        return load_audio_slice(take.audio_path, start_s=start_s, end_s=end_s, dtype="float64")
+
+    def can_stream_residual(self, session_id: str, take_id: str) -> bool:
+        """Return True if a take has a saved residual or matches parent frames for sliced diff."""
+        take = self.get_take(session_id, take_id)
+        if take.residual_path and Path(take.residual_path).exists():
+            return True
+        if not take.parent_take_id:
+            return False
+        parent = self.get_take(session_id, take.parent_take_id)
+        return probe_audio(take.audio_path).frames == probe_audio(parent.audio_path).frames
+
+    def load_take_residual_slice(
+        self,
+        session_id: str,
+        take_id: str,
+        start_s: float = 0.0,
+        end_s: float | None = None,
+    ) -> tuple[np.ndarray, int]:
+        """Return sliced residual (from disk if present, else computed on the fly)."""
+        take = self.get_take(session_id, take_id)
+        if take.residual_path and Path(take.residual_path).exists():
+            return load_audio_slice(
+                take.residual_path, start_s=start_s, end_s=end_s, dtype="float64"
+            )
+        if not take.parent_take_id:
+            raise FileNotFoundError(f"Residual not available for {take_id}.")
+        parent = self.get_take(session_id, take.parent_take_id)
+        p_info = probe_audio(parent.audio_path)
+        t_info = probe_audio(take.audio_path)
+        if p_info.frames != t_info.frames:
+            raise FileNotFoundError(
+                f"Residual unavailable for length-changing take {take_id}."
+            )
+        parent_slice, sr = load_audio_slice(
+            parent.audio_path, start_s=start_s, end_s=end_s, dtype="float64"
+        )
+        take_slice, _ = load_audio_slice(
+            take.audio_path, start_s=start_s, end_s=end_s, dtype="float64"
+        )
+        n = min(parent_slice.shape[0], take_slice.shape[0])
+        return parent_slice[:n] - take_slice[:n], sr
 
     def create_ab_test(
         self,
@@ -351,7 +504,6 @@ class SessionManager:
         ab_path.write_text(target_ab.model_dump_json(indent=2), encoding="utf-8")
         self._save_session(summary)
 
-        # Append markdown log entry for easy human/agent inspection
         log_path = self._session_dir(session_id) / "session_feedback_log.md"
         tags_str = ", ".join(verdict.artifact_tags) if verdict.artifact_tags else "none"
         entry = (

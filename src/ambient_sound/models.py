@@ -7,6 +7,18 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
+class AudioInfo(BaseModel):
+    """Lightweight container metadata probed without loading sample buffers into RAM."""
+
+    sample_rate: int
+    channels: int
+    frames: int
+    duration_s: float
+    subtype: str
+    format_name: str
+    size_bytes: int
+
+
 class DistractionEvent(BaseModel):
     """A localized distraction or artifact detected inside an ambient recording."""
 
@@ -15,9 +27,11 @@ class DistractionEvent(BaseModel):
     end_s: float
     kind: Literal[
         "mains_hum",
+        "machine_drone",
         "low_freq_rumble",
         "impulsive_click",
         "transient_distraction",
+        "slow_pass",
         "clipping",
     ]
     severity: Literal["low", "medium", "high"]
@@ -46,6 +60,7 @@ class AudioMetrics(BaseModel):
     spectral_flatness: float | None = None
     rumble_ratio_db: float | None = None
     hum_peaks_hz: list[float] = Field(default_factory=list)
+    tonal_peaks_hz: list[float] = Field(default_factory=list)
 
 
 class FilterStep(BaseModel):

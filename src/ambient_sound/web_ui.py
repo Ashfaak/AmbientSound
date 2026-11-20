@@ -8,10 +8,12 @@ from typing import Any, Literal
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel, Field
 
+from ambient_sound import __version__
 from ambient_sound.config import Settings
+from ambient_sound.io_audio import render_wav_bytes
 from ambient_sound.models import ABTestRecord, TakeRecord
 from ambient_sound.session import SessionManager
 
@@ -26,7 +28,14 @@ class VerdictRequest(BaseModel):
     comment: str = ""
 
 
-def _serialize_take_for_ui(take: TakeRecord, redact: bool, blind_label: str) -> dict[str, Any]:
+def _serialize_take_for_ui(
+    manager: SessionManager,
+    session_id: str,
+    take: TakeRecord,
+    redact: bool,
+    blind_label: str,
+) -> dict[str, Any]:
+    has_res = manager.can_stream_residual(session_id, take.take_id)
     if redact:
         return {
             "take_id": take.take_id,
@@ -39,7 +48,7 @@ def _serialize_take_for_ui(take: TakeRecord, redact: bool, blind_label: str) -> 
             },
             "events": [],
             "recipe": None,
-            "has_residual": take.residual_path is not None,
+            "has_residual": has_res,
             "has_diff_spectrogram": take.diff_spectrogram_path is not None,
         }
     return {
@@ -48,7 +57,7 @@ def _serialize_take_for_ui(take: TakeRecord, redact: bool, blind_label: str) -> 
         "metrics": take.metrics.model_dump(),
         "events": [e.model_dump() for e in take.events],
         "recipe": take.recipe.model_dump() if take.recipe else None,
-        "has_residual": take.residual_path is not None,
+        "has_residual": has_res,
         "has_diff_spectrogram": take.diff_spectrogram_path is not None,
     }
 
@@ -64,9 +73,9 @@ def _enrich_ab_payload(
         "ab_test": ab.model_dump(),
         "redacted": redact,
         "takes": {
-            "a": _serialize_take_for_ui(take_a, redact=redact, blind_label="Candidate A (Blind)"),
-            "b": _serialize_take_for_ui(take_b, redact=redact, blind_label="Candidate B (Blind)"),
-            "original": _serialize_take_for_ui(take_o, redact=False, blind_label="Original"),
+            "a": _serialize_take_for_ui(manager, session_id, take_a, redact, "Candidate A (Blind)"),
+            "b": _serialize_take_for_ui(manager, session_id, take_b, redact, "Candidate B (Blind)"),
+            "original": _serialize_take_for_ui(manager, session_id, take_o, False, "Original"),
         },
     }
 
@@ -75,7 +84,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     """Create the FastAPI application for the local A/B Listening Studio."""
     cfg = settings or Settings.from_env()
     manager = SessionManager(cfg)
-    app = FastAPI(title="AmbientSound A/B Listening Studio", version="0.1.0")
+    app = FastAPI(title="AmbientSound A/B Listening Studio", version=__version__)
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> HTMLResponse:
@@ -152,19 +161,80 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return FileResponse(str(p), media_type=media_type)
 
     @app.get("/api/sessions/{session_id}/takes/{take_id}/audio")
-    def api_take_audio(session_id: str, take_id: str) -> FileResponse:
+    def api_take_audio(
+        session_id: str,
+        take_id: str,
+        start_s: float | None = None,
+        end_s: float | None = None,
+    ) -> Response:
+        if start_s is not None or end_s is not None:
+            try:
+                arr, sr = manager.load_take_audio_slice(
+                    session_id, take_id, start_s=start_s or 0.0, end_s=end_s
+                )
+            except (FileNotFoundError, ValueError) as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            return Response(content=render_wav_bytes(arr, sr), media_type="audio/wav")
         return _take_file_response(session_id, take_id, "audio_path", "audio/wav")
 
     @app.get("/api/sessions/{session_id}/takes/{take_id}/residual")
-    def api_take_residual(session_id: str, take_id: str) -> FileResponse:
+    def api_take_residual(
+        session_id: str,
+        take_id: str,
+        start_s: float | None = None,
+        end_s: float | None = None,
+    ) -> Response:
+        if start_s is not None or end_s is not None:
+            try:
+                arr, sr = manager.load_take_residual_slice(
+                    session_id, take_id, start_s=start_s or 0.0, end_s=end_s
+                )
+            except (FileNotFoundError, ValueError) as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            return Response(content=render_wav_bytes(arr, sr), media_type="audio/wav")
         return _take_file_response(session_id, take_id, "residual_path", "audio/wav")
 
     @app.get("/api/sessions/{session_id}/takes/{take_id}/spectrogram")
-    def api_take_spectrogram(session_id: str, take_id: str) -> FileResponse:
+    def api_take_spectrogram(
+        session_id: str,
+        take_id: str,
+        start_s: float | None = None,
+        end_s: float | None = None,
+    ) -> FileResponse:
+        if start_s is not None or end_s is not None:
+            try:
+                vis = manager.render_take_visuals(
+                    session_id, take_id, start_s=start_s, end_s=end_s
+                )
+            except (FileNotFoundError, ValueError) as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            return FileResponse(vis["spectrogram_path"], media_type="image/png")
         return _take_file_response(session_id, take_id, "spectrogram_path", "image/png")
 
     @app.get("/api/sessions/{session_id}/takes/{take_id}/diff-spectrogram")
-    def api_take_diff_spectrogram(session_id: str, take_id: str) -> FileResponse:
+    def api_take_diff_spectrogram(
+        session_id: str,
+        take_id: str,
+        start_s: float | None = None,
+        end_s: float | None = None,
+    ) -> FileResponse:
+        if start_s is not None or end_s is not None:
+            try:
+                take = manager.get_take(session_id, take_id)
+                if not take.parent_take_id:
+                    raise HTTPException(
+                        status_code=404, detail=f"diff_spectrogram not available for {take_id}."
+                    )
+                vis = manager.render_take_visuals(
+                    session_id,
+                    take_id,
+                    compare_to_take_id=take.parent_take_id,
+                    start_s=start_s,
+                    end_s=end_s,
+                )
+            except (FileNotFoundError, ValueError) as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            return FileResponse(vis["diff_spectrogram_path"], media_type="image/png")
         return _take_file_response(session_id, take_id, "diff_spectrogram_path", "image/png")
 
     return app

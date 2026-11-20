@@ -73,6 +73,36 @@ def test_web_ui_endpoints_and_blind_redaction(tmp_path: Path) -> None:
         == 200
     )
 
+    # Sliced audio, residual, and spectrogram assets stream cleanly
+    r_slice_a = client.get(
+        f"/api/sessions/{session.session_id}/takes/{t1.take_id}/audio?start_s=0.1&end_s=0.6"
+    )
+    assert r_slice_a.status_code == 200
+    assert len(r_slice_a.content) > 1000
+
+    # Dynamic sliced residual even if residual.wav was not materialized on disk
+    Path(t1.residual_path).unlink()
+    r_slice_r = client.get(
+        f"/api/sessions/{session.session_id}/takes/{t1.take_id}/residual?start_s=0.1&end_s=0.6"
+    )
+    assert r_slice_r.status_code == 200
+    assert len(r_slice_r.content) > 1000
+
+    assert (
+        client.get(
+            f"/api/sessions/{session.session_id}/takes/{t1.take_id}/spectrogram"
+            "?start_s=0.1&end_s=0.6"
+        ).status_code
+        == 200
+    )
+    assert (
+        client.get(
+            f"/api/sessions/{session.session_id}/takes/{t1.take_id}/diff-spectrogram"
+            "?start_s=0.1&end_s=0.6"
+        ).status_code
+        == 200
+    )
+
     # Submit verdict -> reveals labels and recipes
     r_verdict = client.post(
         f"/api/sessions/{session.session_id}/ab-tests/{ab.ab_id}/verdict",

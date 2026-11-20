@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pyloudnorm as pyln
 
-from ambient_sound.analysis import analyze_audio
-from ambient_sound.dsp import apply_recipe, compute_residual, list_filter_specs
+from ambient_sound.analysis import analyze_audio, chunked_true_peak_linear
+from ambient_sound.dsp import (
+    apply_recipe,
+    apply_recipe_streaming,
+    compute_residual,
+    list_filter_specs,
+)
+from ambient_sound.io_audio import load_audio, save_wav
 
 
 def _rms_db(x: np.ndarray) -> float:
@@ -191,3 +199,148 @@ def test_eq_and_loudness_normalize_respects_peak_ceiling() -> None:
     lufs = pyln.Meter(sr).integrated_loudness(norm)
     assert abs(lufs - (-18.0)) < 0.8
     assert float(np.max(np.abs(norm))) <= 10.0 ** (-1.0 / 20.0) + 1e-3
+
+
+def test_drone_notch_trim_cut_fade_compress_and_limiter() -> None:
+    sr = 44100
+    dur = 4.0
+    n = int(sr * dur)
+    t = np.arange(n, dtype=np.float64) / sr
+    rng = np.random.default_rng(77)
+    bed = rng.normal(0.0, 0.02, size=(n, 2))
+    drone = (0.12 * np.sin(2.0 * np.pi * 140.0 * t))[:, None]
+    bee = (0.08 * np.sin(2.0 * np.pi * 260.0 * t))[:, None]
+    sig = bed + drone + bee
+
+    notched = apply_recipe(
+        sig,
+        sr,
+        [
+            {
+                "filter_name": "drone_notch",
+                "params": {"freqs_hz": [140.0], "q": 25.0, "attenuation_db": -24.0},
+            }
+        ],
+    )
+    p140_in = abs(float(np.mean(sig[:, 0] * np.sin(2.0 * np.pi * 140.0 * t))))
+    p140_out = abs(float(np.mean(notched[:, 0] * np.sin(2.0 * np.pi * 140.0 * t))))
+    p260_in = abs(float(np.mean(sig[:, 0] * np.sin(2.0 * np.pi * 260.0 * t))))
+    p260_out = abs(float(np.mean(notched[:, 0] * np.sin(2.0 * np.pi * 260.0 * t))))
+    assert p140_out < p140_in * 0.2
+    assert p260_out > p260_in * 0.85
+
+    trimmed = apply_recipe(
+        notched, sr, [{"filter_name": "trim_range", "params": {"start_s": 0.5, "end_s": 2.5}}]
+    )
+    assert abs(trimmed.shape[0] - sr * 2) <= 2
+
+    cut = apply_recipe(
+        notched,
+        sr,
+        [
+            {
+                "filter_name": "cut_regions",
+                "params": {"regions": [{"start_s": 1.0, "end_s": 1.8}], "crossfade_ms": 200.0},
+            }
+        ],
+    )
+    assert cut.shape[0] < notched.shape[0] - int(0.6 * sr)
+
+    faded = apply_recipe(
+        notched,
+        sr,
+        [{"filter_name": "fade_edges", "params": {"fade_in_s": 0.3, "fade_out_s": 0.4}}],
+    )
+    assert float(np.max(np.abs(faded[:10]))) < 1e-4
+    assert float(np.max(np.abs(faded[-10:]))) < 1e-4
+
+    # Compressor + true_peak_limiter
+    spiky = bed.copy() * 4.0
+    spiky[sr : sr + 50, :] = 1.8
+    mastered = apply_recipe(
+        spiky,
+        sr,
+        [
+            {
+                "filter_name": "soft_compress",
+                "params": {"threshold_db": -22.0, "ratio": 2.2, "makeup_db": 3.0},
+            },
+            {
+                "filter_name": "true_peak_limiter",
+                "params": {"ceiling_dbtp": -1.0, "release_ms": 60.0},
+            },
+        ],
+    )
+    tp_db = 20.0 * np.log10(max(chunked_true_peak_linear(mastered), 1e-12))
+    assert tp_db <= -0.95
+
+
+def test_batched_spans_and_streaming_pipeline(tmp_path: Path) -> None:
+    sr = 44100
+    n = sr * 5
+    t = np.arange(n, dtype=np.float64) / sr
+    rng = np.random.default_rng(101)
+    bed = rng.normal(0.0, 0.025, size=(n, 2))
+    burst1 = np.zeros_like(bed)
+    burst1[int(0.8 * sr) : int(1.6 * sr), :] = (
+        0.14 * np.sin(2.0 * np.pi * 110.0 * t[int(0.8 * sr) : int(1.6 * sr)])
+    )[:, None]
+    burst2 = np.zeros_like(bed)
+    burst2[int(3.0 * sr) : int(3.8 * sr), :] = (
+        0.14 * np.sin(2.0 * np.pi * 110.0 * t[int(3.0 * sr) : int(3.8 * sr)])
+    )[:, None]
+    noisy = bed + burst1 + burst2
+
+    multi_att = apply_recipe(
+        noisy,
+        sr,
+        [
+            {
+                "filter_name": "band_attenuate",
+                "params": {
+                    "low_hz": 70.0,
+                    "high_hz": 170.0,
+                    "attenuation_db": -22.0,
+                    "fade_ms": 150.0,
+                    "envelope_mode": "swell",
+                    "spans": [
+                        {"start_s": 0.8, "end_s": 1.6},
+                        {"start_s": 3.0, "end_s": 3.8},
+                    ],
+                },
+            }
+        ],
+    )
+    assert _rms_db(multi_att[int(0.95 * sr) : int(1.45 * sr)]) < _rms_db(
+        noisy[int(0.95 * sr) : int(1.45 * sr)]
+    ) - 8.0
+    assert _rms_db(multi_att[int(3.15 * sr) : int(3.65 * sr)]) < _rms_db(
+        noisy[int(3.15 * sr) : int(3.65 * sr)]
+    ) - 8.0
+
+    src_wav = save_wav(tmp_path / "stream_in.wav", noisy, sr, subtype="PCM_24")
+    dst_wav = tmp_path / "stream_out.wav"
+    steps = [
+        {"filter_name": "highpass_rumble", "params": {"cutoff_hz": 55.0}},
+        {
+            "filter_name": "ambience_patch",
+            "params": {
+                "crossfade_ms": 50.0,
+                "spans": [
+                    {"start_s": 0.8, "end_s": 1.6},
+                    {"start_s": 3.0, "end_s": 3.8},
+                ],
+            },
+        },
+        {
+            "filter_name": "loudness_normalize",
+            "params": {"target_lufs": -16.0, "true_peak_ceiling_dbtp": -1.0},
+        },
+        {"filter_name": "fade_edges", "params": {"fade_in_s": 0.2, "fade_out_s": 0.2}},
+    ]
+    out_info = apply_recipe_streaming(src_wav, dst_wav, steps, subtype="PCM_24", block_seconds=2.0)
+    assert out_info.frames == n
+    loaded, _ = load_audio(dst_wav)
+    assert loaded.shape == noisy.shape
+    lufs = pyln.Meter(sr).integrated_loudness(loaded)
+    assert abs(lufs - (-16.0)) < 1.0

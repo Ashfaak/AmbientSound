@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import numpy as np
+import pyloudnorm as pyln
 
-from ambient_sound.analysis import analyze_audio
+from ambient_sound.analysis import StreamingLUFS, analyze_audio, analyze_file
+from ambient_sound.io_audio import save_wav
 
 
 def _make_pink_bed(n_samples: int, channels: int, seed: int = 7) -> np.ndarray:
@@ -73,3 +76,56 @@ def test_analyze_handles_short_and_silent_audio_without_nan() -> None:
     assert m_silent.rms_dbfs is None
     assert ev_silent == []
     json.dumps(m_silent.model_dump(), allow_nan=False)
+
+
+def test_streaming_lufs_parity_and_analyze_file_region(tmp_path: Path) -> None:
+    sr = 48000
+    n = sr * 6
+    bed = _make_pink_bed(n, 2, seed=19)
+    ref_lufs = float(pyln.Meter(sr).integrated_loudness(bed))
+
+    acc = StreamingLUFS(sr, 2)
+    acc.update(bed[: sr * 3])
+    acc.update(bed[sr * 3 :])
+    stream_lufs = acc.finalize()
+    assert stream_lufs is not None
+    assert abs(stream_lufs - ref_lufs) < 0.2
+
+    wav_path = save_wav(tmp_path / "long_test.wav", bed, sr, subtype="PCM_24")
+    m_reg, _ = analyze_file(wav_path, start_s=1.0, end_s=5.0)
+    assert abs(m_reg.duration_s - 4.0) < 0.05
+    assert m_reg.integrated_lufs is not None
+    assert abs(m_reg.integrated_lufs - ref_lufs) < 0.5
+
+
+def test_configurable_detection_slow_pass_and_machine_drone() -> None:
+    sr = 44100
+    dur = 8.0
+    n = int(sr * dur)
+    t = np.arange(n, dtype=np.float64) / sr
+    bed = _make_pink_bed(n, 2, seed=31) * 0.4
+
+    # Continuous 140 Hz machine drone (non-50/60 Hz)
+    drone = (0.025 * np.sin(2.0 * np.pi * 140.0 * t))[:, np.newaxis]
+
+    # Slow 4.0 s passing vehicle rumble centered around 90 Hz from 2.5 s to 6.5 s
+    p0, p1 = int(2.5 * sr), int(6.5 * sr)
+    swell = np.hanning(p1 - p0)
+    vehicle = np.zeros_like(bed)
+    vehicle[p0:p1, :] = (0.14 * swell * np.sin(2.0 * np.pi * 90.0 * t[p0:p1]))[:, np.newaxis]
+
+    mix = bed + drone + vehicle
+    metrics, events = analyze_audio(
+        mix,
+        sr,
+        sensitivity="high",
+        min_event_s=0.2,
+        max_event_s=20.0,
+        freq_range_hz=(40.0, 130.0),
+    )
+    assert any(abs(f - 140.0) <= 5.0 for f in metrics.tonal_peaks_hz)
+    kinds = {ev.kind for ev in events}
+    assert "machine_drone" in kinds
+    assert "slow_pass" in kinds
+    slow_passes = [ev for ev in events if ev.kind == "slow_pass"]
+    assert any(ev.start_s <= 3.5 and ev.end_s >= 5.5 for ev in slow_passes)

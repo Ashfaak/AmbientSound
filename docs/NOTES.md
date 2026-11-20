@@ -37,7 +37,11 @@ Working notes on DSP design choices, tuning heuristics for ambient soundscapes, 
 
 ## 3. Experiment Log
 
-### 2026-11-20 — Synthetic Demo Validation Plan
+### 2026-11-20 — Synthetic Demo & v0.2.0 Streaming Architecture Notes
 - Demo fixture simulates: stereo pink-noise rain bed + `60 Hz` + `120 Hz` hum + impulsive mic click + `950 Hz` distraction burst (`2.4s–3.1s`).
 - Candidate A compares surgical `band_attenuate` (`750–1200 Hz`, `-22 dB`) against Candidate B `ambience_patch` (`2.35s–3.15s`).
 - Listen to `Residual` (`hotkey 4`) in the A/B Studio to verify rain texture outside the distraction stays intact.
+- **Bee-Hive & Passing-Vehicle Notes (`ZOOM0001.WAV` class):**
+  - Honeybee hive buzzing concentrates fundamental energy around `200–300 Hz` plus upper harmonics, overlapping engine/tyre passes (`80–1000 Hz`).
+  - Use `analyze_region(..., freq_range_hz=[35, 160], sensitivity="high")` to locate vehicle swells below the hive fundamental without false triggers, then preview `trim_range` on a `30 s` slice before executing full-file batched `band_attenuate(envelope_mode="swell", fade_ms=1500+)` or `cut_regions(crossfade_ms=1000+)`.
+  - For YouTube ASMR delivery (`-14 LUFS`), chain gentle `parametric_eq` (`lowshelf` warmth + `>10 kHz` `highshelf` air), `soft_compress` (`ratio 1.8`), `loudness_normalize(target_lufs=-14.0)`, `true_peak_limiter(ceiling_dbtp=-1.0)`, and `fade_edges`.
