@@ -27,7 +27,7 @@ def _rms_db(x: np.ndarray) -> float:
 def test_filter_specs_registered() -> None:
     specs = list_filter_specs()
     names = {s["name"] for s in specs}
-    assert len(specs) == 16
+    assert len(specs) == 21
     assert {
         "highpass_rumble",
         "dehum_notch",
@@ -45,6 +45,11 @@ def test_filter_specs_registered() -> None:
         "soft_compress",
         "true_peak_limiter",
         "loudness_normalize",
+        "declip_from_backup",
+        "spatial_mix",
+        "harmonic_track_suppress",
+        "distance_soften",
+        "bed_shape",
     }.issubset(names)
 
 

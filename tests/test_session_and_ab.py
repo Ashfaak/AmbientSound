@@ -7,9 +7,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import ambient_sound.analysis as analysis_mod
 import ambient_sound.session as session_mod
 from ambient_sound.config import Settings
-from ambient_sound.io_audio import save_wav
+from ambient_sound.io_audio import compile_audio_span, load_audio, save_wav
 from ambient_sound.models import DistractionEvent
 from ambient_sound.session import SessionManager
 from ambient_sound.visuals import (
@@ -413,3 +414,117 @@ def test_v040_copy_source_false_and_sequence_pipeline(tmp_path: Path) -> None:
     # Deleting session with copy_source=False must NEVER delete the external raw WAV
     manager.delete_session(s1.session_id)
     assert p1.exists()
+
+
+def test_v051_compile_clean_sections_and_guards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(analysis_mod, "YOUTUBE_ASMR_DURATIONS_MIN", (1,))
+    settings = Settings(workspace_dir=tmp_path / ".ambientsound", allowed_roots=[tmp_path])
+    manager = SessionManager(settings)
+
+    sr = 8000
+    n_each = sr * 35
+    total_n = n_each * 2
+    t = np.arange(total_n, dtype=np.float64) / sr
+    rng = np.random.default_rng(501)
+    # Continuous low-level drone + noise across split boundary so 60 s span stitches cleanly
+    full = rng.normal(0.0, 0.015, size=(total_n, 2)) + (
+        0.04 * np.sin(2.0 * np.pi * 220.0 * t)
+    )[:, None]
+
+    raw_dir = tmp_path / "raw_split"
+    p1 = save_wav(raw_dir / "ZOOM0010.WAV", full[:n_each], sr, subtype="PCM_24")
+    p2 = save_wav(raw_dir / "ZOOM0011.WAV", full[n_each:], sr, subtype="PCM_24")
+    s1 = manager.create_session(p1, name="Split 10", copy_source=False)
+    s2 = manager.create_session(p2, name="Split 11", copy_source=False)
+
+    out_dir = tmp_path / "clean_out"
+    res = manager.compile_clean_sections(
+        sequence=[(s1.session_id, "take_000"), (s2.session_id, "take_000")],
+        output_dir=out_dir,
+        targets=["1 min"],
+        include_full_masters=True,
+        include_combined_full=True,
+        filename_prefix="beehive",
+        fade_in_s=0.1,
+        fade_out_s=0.1,
+    )
+    assert res["compiled_count"] == 1
+    assert res["masters_count"] == 2
+    assert res["total_bytes"] > 0
+    assert res["tool_version"]
+    assert res["parameters"]["filename_prefix"] == "beehive"
+    sec = res["compiled_sections"][0]
+    assert sec["spans_multiple_files"] is True
+    assert sec["requested_target"] == "1 min"
+    assert sec["fade_in_s"] == 0.1 and sec["fade_out_s"] == 0.1
+    assert sec["peak_measured_on"] == "output"
+    assert len(sec["seams"]) == 1
+    assert sec["seams"][0]["from_file"] == "ZOOM0010.WAV"
+    assert sec["seams"][0]["to_file"] == "ZOOM0011.WAV"
+    assert len(sec["source_slices"]) == 2
+    assert sec["source_slices"][0]["source_file"] == "ZOOM0010.WAV"
+    assert sec["source_slices"][1]["source_file"] == "ZOOM0011.WAV"
+    assert len(res["full_masters"]) == 2
+    assert Path(res["full_masters"][0]["output_path"]).name == "beehive_ZOOM0010_master.wav"
+    assert res["full_masters"][0]["prefix_applied"] is True
+    assert res["full_masters"][0]["metrics_source"] == "cached_take_metrics"
+    assert res["combined_full"] is not None
+    assert Path(res["manifest_path"]).exists()
+
+    compiled_arr, compiled_sr = load_audio(sec["output_path"])
+    assert compiled_sr == sr
+    assert compiled_arr.shape[0] == int(round(sec["duration_s"] * sr))
+    # Outer edges obey fades while interior preserves continuous signal across seam
+    assert float(np.max(np.abs(compiled_arr[:4]))) < 1e-4
+    assert float(np.max(np.abs(compiled_arr[-4:]))) < 1e-4
+
+    # Distinct-regions check: two 1-minute spans across a 130 s recording must not overlap
+    monkeypatch.setattr(analysis_mod, "YOUTUBE_ASMR_DURATIONS_MIN", (1, 2))
+    out_dist = tmp_path / "distinct_out"
+    p_d1 = save_wav(raw_dir / "DIST01.WAV", full, sr, subtype="PCM_24")
+    p_d2 = save_wav(raw_dir / "DIST02.WAV", full, sr, subtype="PCM_24")
+    sd1 = manager.create_session(p_d1, name="D1", copy_source=False)
+    sd2 = manager.create_session(p_d2, name="D2", copy_source=False)
+    res_dist = manager.compile_clean_sections(
+        sequence=[(sd1.session_id, "take_000"), (sd2.session_id, "take_000")],
+        output_dir=out_dist,
+        targets=["1 min", "2 min"],
+        distinct_regions=True,
+        fade_in_s=0.05,
+        fade_out_s=0.05,
+    )
+    assert res_dist["compiled_count"] == 1
+    assert len(res_dist["skipped_targets"]) == 1
+
+    # Direct multi-slice span check verifies exact interior sample continuity across stitch point
+    direct_out = tmp_path / "direct_stitch.wav"
+    direct_info = compile_audio_span(
+        segments=[(p1, 35.0), (p2, 35.0)],
+        start_s=30.0,
+        end_s=40.0,
+        dst_path=direct_out,
+        audio_format="wav",
+        fade_in_s=0.05,
+        fade_out_s=0.05,
+    )
+    stitched, _ = load_audio(direct_out)
+    assert direct_info["duration_s"] == 10.0
+    expected_mid = full[sr * 32 : sr * 38]
+    assert float(np.max(np.abs(stitched[sr * 2 : sr * 8] - expected_mid))) < 1e-5
+
+    # Safety guards: forbid compiling into workspace/sessions or outside allowed_roots
+    with pytest.raises(ValueError):
+        manager.compile_clean_sections(
+            sequence=[(s1.session_id, "take_000")],
+            output_dir=settings.workspace_dir / "sessions" / "forbidden",
+            targets=["largest"],
+        )
+    with pytest.raises(PermissionError):
+        manager.compile_clean_sections(
+            sequence=[(s1.session_id, "take_000")],
+            output_dir="C:/Windows/Temp/outside_clean_out",
+            targets=["largest"],
+        )
+

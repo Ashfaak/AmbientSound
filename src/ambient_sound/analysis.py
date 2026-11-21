@@ -11,6 +11,18 @@ import numpy as np
 import pyloudnorm as pyln
 from scipy import ndimage, signal
 
+from ambient_sound.engines import (
+    block_roughness_sample,
+    compute_band_metrics_from_psd,
+    compute_pleasantness_metrics,
+    detect_channel_layout,
+    detect_channel_layout_from_stats,
+    detect_click_trains_and_crackles,
+    detect_spatial_anomalies,
+    detect_synthetic_beeps,
+    detect_variable_rpm_engines,
+    detect_voice_and_dog_barks,
+)
 from ambient_sound.io_audio import (
     ensure_2d_audio,
     iter_audio_blocks,
@@ -52,8 +64,9 @@ def summarize_events(
     events: list[DistractionEvent],
     event_kinds: list[str] | None = None,
     max_events: int = 50,
+    include_clicks: bool | None = None,
 ) -> tuple[list[DistractionEvent], dict[str, int], int, bool]:
-    """Filter and bound events for compact MCP payloads, prioritizing non-click distractions."""
+    """Filter and bound events for compact MCP payloads, protecting the macro budget."""
     counts = event_kind_counts(events)
     if event_kinds is not None:
         allowed = {str(k).strip() for k in event_kinds if str(k).strip()}
@@ -64,17 +77,34 @@ def summarize_events(
     total_filtered = len(filtered)
     if max_events <= 0:
         return [], counts, total_filtered, total_filtered > 0
-    if total_filtered <= max_events:
-        return filtered, counts, total_filtered, False
 
     non_clicks = [ev for ev in filtered if ev.kind != "impulsive_click"]
     clicks = [ev for ev in filtered if ev.kind == "impulsive_click"]
-    selected = non_clicks[:max_events]
-    remaining = max_events - len(selected)
-    if remaining > 0 and clicks:
-        selected.extend(clicks[:remaining])
+    hide_clicks = (
+        event_kinds is None
+        and (include_clicks is False or (include_clicks is None and len(clicks) > 25))
+    )
+
+    if hide_clicks:
+        pool = non_clicks
+        if len(pool) <= max_events:
+            return pool, counts, total_filtered, len(clicks) > 0
+    elif total_filtered <= max_events:
+        return filtered, counts, total_filtered, False
+
+    sev_rank = {"high": 0, "medium": 1, "low": 2}
+    if len(non_clicks) > max_events:
+        ranked = sorted(
+            non_clicks, key=lambda ev: (sev_rank.get(ev.severity, 9), ev.start_s, ev.end_s)
+        )
+        selected = ranked[:max_events]
+    else:
+        selected = list(non_clicks)
+        remaining = max_events - len(selected)
+        if remaining > 0 and clicks and not hide_clicks:
+            selected.extend(clicks[:remaining])
     selected.sort(key=lambda ev: (ev.start_s, ev.end_s))
-    return selected, counts, total_filtered, True
+    return selected, counts, total_filtered, len(selected) < total_filtered
 
 
 def _finite_or_none(value: float | np.floating | None, digits: int = 4) -> float | None:
@@ -620,11 +650,44 @@ def _rumble_events_from_curve(
     threshold = max(med + excess_req, med + mad_mult * max(mad, 1.0))
     floor_db = max(-92.0, float(ambient_bed_dbfs) - 22.0) if ambient_bed_dbfs is not None else -92.0
     mask = (rms_db > threshold) & (rms_db > floor_db)
-    spans = _merge_intervals(mask, times, win_dur_s, max_gap_s=0.40)
+    raw_spans = _merge_intervals(mask, times, win_dur_s, max_gap_s=0.60)
+
+    # Extend core spans outward onto smoothed curve until rumble drops within +1.5 dB of floor
+    hop_s = float(times[1] - times[0]) if times.size > 1 else win_dur_s
+    k_sm = max(1, int(round(0.8 / max(hop_s, 1e-3))))
+    sm = (
+        ndimage.uniform_filter1d(rms_db, size=k_sm, mode="nearest")
+        if rms_db.size >= max(4, k_sm) and k_sm > 1
+        else rms_db
+    )
+    med_sm = float(np.median(sm))
+    ext_thr = med_sm + 1.5
+    extended: list[tuple[float, float]] = []
+    for s0, e0 in raw_spans:
+        i0 = max(0, min(sm.size - 1, int(np.searchsorted(times, s0, side="left"))))
+        i1 = max(i0, min(sm.size - 1, int(np.searchsorted(times, e0 - win_dur_s, side="left"))))
+        while (
+            i0 > 0
+            and sm[i0 - 1] > ext_thr
+            and (float(times[i1]) + win_dur_s - float(times[i0 - 1])) <= max_event_s
+        ):
+            i0 -= 1
+        while (
+            i1 < sm.size - 1
+            and sm[i1 + 1] > ext_thr
+            and (float(times[i1 + 1]) + win_dur_s - float(times[i0])) <= max_event_s
+        ):
+            i1 += 1
+        ns = float(times[i0])
+        ne = float(times[i1]) + win_dur_s
+        if extended and ns <= extended[-1][1] + 0.40:
+            extended[-1] = (extended[-1][0], max(extended[-1][1], ne))
+        else:
+            extended.append((ns, ne))
 
     min_dur = max(0.2, float(min_event_s))
     events: list[DistractionEvent] = []
-    for s, e in spans:
+    for s, e in extended:
         e_clamped = min(e, duration_s)
         dur = e_clamped - s
         if dur < min_dur or dur > max_event_s:
@@ -774,16 +837,25 @@ def _foreground_events_from_curve(
             sensitivity, _SLOW_SENSITIVITY_PARAMS["medium"]
         )
         thr_sm = max(med_sm + s_ex, med_sm + s_mad * max(mad_sm, 0.5))
-        ext_thr = med_sm + max(1.8, 1.8 * max(mad_sm, 0.5))
+        # Extend detected passes outward to within +1.5 dB of local floor (catches approach/tail)
+        ext_thr = med_sm + 1.5
         raw_slow = _merge_intervals(
             (sm > thr_sm) & (sm > -92.0), times, win_dur_s, max_gap_s=1.5
         )
         for s0, e0 in raw_slow:
             i0 = max(0, min(sm.size - 1, int(np.searchsorted(times, s0, side="left"))))
             i1 = max(i0, min(sm.size - 1, int(np.searchsorted(times, e0 - win_dur_s, side="left"))))
-            while i0 > 0 and sm[i0 - 1] > ext_thr:
+            while (
+                i0 > 0
+                and sm[i0 - 1] > ext_thr
+                and (float(times[i1]) + win_dur_s - float(times[i0 - 1])) <= max_event_s
+            ):
                 i0 -= 1
-            while i1 < sm.size - 1 and sm[i1 + 1] > ext_thr:
+            while (
+                i1 < sm.size - 1
+                and sm[i1 + 1] > ext_thr
+                and (float(times[i1 + 1]) + win_dur_s - float(times[i0])) <= max_event_s
+            ):
                 i1 += 1
             ns = float(times[i0])
             ne = float(times[i1]) + win_dur_s
@@ -1039,6 +1111,7 @@ def analyze_audio(
 
     stereo_correlation: float | None = None
     mid_side_ratio_db: float | None = None
+    channel_balance_db: float | None = None
     if num_channels >= 2:
         l_ch, r_ch = arr[:, 0], arr[:, 1]
         l_zm, r_zm = l_ch - np.mean(l_ch), r_ch - np.mean(r_ch)
@@ -1046,6 +1119,12 @@ def analyze_audio(
         if denom > 1e-12:
             corr = max(-1.0, min(1.0, float(np.dot(l_zm, r_zm) / denom)))
             stereo_correlation = _finite_or_none(corr)
+        rms_l = float(np.sqrt(np.mean(l_ch * l_ch)))
+        rms_r = float(np.sqrt(np.mean(r_ch * r_ch)))
+        if rms_l > 1e-12 or rms_r > 1e-12:
+            channel_balance_db = _finite_or_none(
+                20.0 * math.log10(max(rms_l, 1e-12) / max(rms_r, 1e-12)), digits=3
+            )
         mid = 0.5 * (l_ch + r_ch)
         side = 0.5 * (l_ch - r_ch)
         mid_rms = float(np.sqrt(np.mean(mid * mid)))
@@ -1053,26 +1132,35 @@ def analyze_audio(
         if mid_rms > 1e-12:
             mid_side_ratio_db = _finite_or_none(20.0 * math.log10(mid_rms / max(side_rms, 1e-12)))
 
+    layout_info = detect_channel_layout(arr, sample_rate)
+
     centroid_hz = rolloff_hz = flatness = rumble_ratio_db = None
     hum_peaks_hz: list[float] = []
     tonal_peaks_hz: list[float] = []
     freqs_ref = np.zeros(0, dtype=np.float64)
     psd_ref = np.zeros(0, dtype=np.float64)
+    segment_psds_full: list[np.ndarray] = []
+    seg_freqs_full: np.ndarray | None = None
 
     if num_samples >= 64 and float(np.max(np.abs(mono))) > 1e-12:
         nperseg = min(num_samples, 16384)
         freqs_ref, psd_ref = signal.welch(mono, fs=sample_rate, nperseg=nperseg)
-        band_mask = freqs_ref <= 8500.0
-        freqs_band = freqs_ref[band_mask]
+        freqs_band = freqs_ref[freqs_ref <= 8500.0]
         segment_psds_band: list[np.ndarray] = []
-        if duration_s >= 15.0:
-            n_segs = min(12, max(3, int(duration_s // 5.0)))
+        seg_freqs_band: np.ndarray | None = None
+        if duration_s >= 2.0:
+            n_segs = min(12, max(4, int(duration_s // 5.0)))
             seg_len = num_samples // n_segs
-            if seg_len >= nperseg:
+            seg_nperseg = min(nperseg, seg_len)
+            if seg_nperseg >= 1024:
                 for seg_idx in range(n_segs):
                     chunk = mono[seg_idx * seg_len : (seg_idx + 1) * seg_len]
-                    _, p_seg = signal.welch(chunk, fs=sample_rate, nperseg=nperseg)
-                    segment_psds_band.append(p_seg[band_mask])
+                    sf_i, p_seg = signal.welch(chunk, fs=sample_rate, nperseg=seg_nperseg)
+                    seg_b_mask = sf_i <= 8500.0
+                    seg_freqs_full = sf_i
+                    seg_freqs_band = sf_i[seg_b_mask]
+                    segment_psds_band.append(p_seg[seg_b_mask])
+                    segment_psds_full.append(p_seg)
         (
             centroid_hz,
             rolloff_hz,
@@ -1084,9 +1172,25 @@ def analyze_audio(
             freqs_ref,
             psd_ref,
             sample_rate,
-            freqs_band=freqs_band,
+            freqs_band=seg_freqs_band if seg_freqs_band is not None else freqs_band,
             segment_psds_band=segment_psds_band,
         )
+
+    rough_val = block_roughness_sample(mono, sample_rate)
+    pleasant = compute_pleasantness_metrics(
+        freqs_ref,
+        psd_ref,
+        roughness_values=[rough_val] if rough_val is not None else [],
+        rumble_ratio_db=rumble_ratio_db,
+        num_drones=len(hum_peaks_hz) + len(tonal_peaks_hz),
+    )
+    band_metrics = compute_band_metrics_from_psd(
+        freqs_ref,
+        psd_ref,
+        custom_range=freq_range_hz,
+        seg_psds=segment_psds_full or None,
+        seg_freqs=seg_freqs_full if seg_freqs_full is not None else freqs_ref,
+    )
 
     events: list[DistractionEvent] = _build_global_events(
         duration_s,
@@ -1218,6 +1322,30 @@ def analyze_audio(
                 )
             )
 
+    # Outdoor nature / distraction classifiers (gated cleanly by allowed_kinds & freq_range_hz)
+    f_lo_req = float(freq_range_hz[0]) if freq_range_hz is not None else 0.0
+    f_hi_req = float(freq_range_hz[1]) if freq_range_hz is not None else float(sample_rate * 0.5)
+    if (allowed_kinds is None or "synthetic_beep" in allowed_kinds) and f_hi_req >= 1400.0:
+        events.extend(detect_synthetic_beeps(mono, sample_rate, time_offset_s, sensitivity))
+    if (
+        allowed_kinds is None or bool({"click_train", "crackle_burst"} & allowed_kinds)
+    ) and f_hi_req >= 1800.0:
+        events.extend(
+            detect_click_trains_and_crackles(arr, sample_rate, time_offset_s, sensitivity)
+        )
+    if (
+        allowed_kinds is None or bool({"dog_bark", "human_voice"} & allowed_kinds)
+    ) and f_hi_req >= 220.0 and f_lo_req <= 3400.0:
+        events.extend(detect_voice_and_dog_barks(mono, sample_rate, time_offset_s, sensitivity))
+    if (allowed_kinds is None or "variable_rpm_engine" in allowed_kinds) and f_lo_req <= 1200.0:
+        events.extend(detect_variable_rpm_engines(mono, sample_rate, time_offset_s, sensitivity))
+    if (
+        num_channels >= 2
+        and (allowed_kinds is None or bool({"wind_noise", "channel_biased_noise"} & allowed_kinds))
+        and f_lo_req <= 1500.0
+    ):
+        events.extend(detect_spatial_anomalies(arr, sample_rate, time_offset_s, sensitivity))
+
     # Clipping detector
     clipped_mask = np.any(np.abs(arr) >= 0.9999, axis=1)
     clipped_samples = int(np.sum(np.abs(arr) >= 0.9999))
@@ -1287,6 +1415,15 @@ def analyze_audio(
         texture_tick_rate_per_min=texture_tick_rate_per_min,
         short_term_lufs_stats=short_term_lufs_stats,
         short_term_lufs_timeline=short_term_lufs_timeline,
+        sharpness_acum=pleasant["sharpness_acum"],
+        roughness_index=pleasant["roughness_index"],
+        ndsi=pleasant["ndsi"],
+        spectral_slope_db_per_oct=pleasant["spectral_slope_db_per_oct"],
+        channel_balance_db=channel_balance_db,
+        stereo_layout_hint=layout_info["layout"],
+        stereo_layout_confidence=layout_info["confidence"],
+        pleasantness_score=pleasant["pleasantness_score"],
+        band_metrics=band_metrics,
     )
     return metrics, events
 
@@ -1347,6 +1484,9 @@ def analyze_file(
     clip_indices: list[int] = []
 
     sum_l = sum_r = sum_l2 = sum_r2 = sum_lr = sum_mid2 = sum_side2 = 0.0
+    max_l_lin = max_r_lin = 0.0
+    e1_low = e1_mid = e2_low = e2_mid = 0.0
+    csd_lf_real = csd_lf_imag = lf_p1 = lf_p2 = 0.0
 
     nperseg = 16384
     freqs_ref = np.fft.rfftfreq(nperseg, d=1.0 / sr)
@@ -1355,9 +1495,30 @@ def analyze_file(
     band_mask = freqs_ref <= 8500.0
     freqs_band = freqs_ref[band_mask]
     segment_psds_band: list[np.ndarray] = []
+    segment_psds_full: list[np.ndarray] = []
     segment_bounds_s: list[tuple[float, float]] = []
     skip_rumble = freq_range_hz is not None and float(freq_range_hz[0]) >= 80.0
     skip_clicks = freq_range_hz is not None and float(freq_range_hz[1]) <= 1500.0
+
+    f_lo_req = float(freq_range_hz[0]) if freq_range_hz is not None else 0.0
+    f_hi_req = float(freq_range_hz[1]) if freq_range_hz is not None else float(sr * 0.5)
+    run_beeps = (allowed_kinds is None or "synthetic_beep" in allowed_kinds) and f_hi_req >= 1400.0
+    run_clicks_crackles = (
+        allowed_kinds is None or bool({"click_train", "crackle_burst"} & allowed_kinds)
+    ) and f_hi_req >= 1800.0
+    run_voice_bark = (
+        allowed_kinds is None or bool({"dog_bark", "human_voice"} & allowed_kinds)
+    ) and f_hi_req >= 220.0 and f_lo_req <= 3400.0
+    run_engines = (
+        allowed_kinds is None or "variable_rpm_engine" in allowed_kinds
+    ) and f_lo_req <= 1200.0
+    run_spatial = (
+        ch >= 2
+        and (allowed_kinds is None or bool({"wind_noise", "channel_biased_noise"} & allowed_kinds))
+        and f_lo_req <= 1500.0
+    )
+    roughness_samples: list[float] = []
+    outdoor_events: list[DistractionEvent] = []
 
     floor_hop = max(1, int(0.1 * sr))
     floor_tail = np.zeros(0, dtype=np.float64)
@@ -1439,15 +1600,51 @@ def analyze_file(
             sum_l2 += float(np.sum(l_b * l_b))
             sum_r2 += float(np.sum(r_b * r_b))
             sum_lr += float(np.dot(l_b, r_b))
+            max_l_lin = max(max_l_lin, float(np.max(np.abs(l_b))))
+            max_r_lin = max(max_r_lin, float(np.max(np.abs(r_b))))
             mid_b = 0.5 * (l_b + r_b)
             side_b = 0.5 * (l_b - r_b)
             sum_mid2 += float(np.sum(mid_b * mid_b))
             sum_side2 += float(np.sum(side_b * side_b))
+            if sr >= 1200 and n_b >= 512:
+                nps_c = min(4096, n_b)
+                f_c, p1_c = signal.welch(l_b, fs=sr, nperseg=nps_c)
+                _, p2_c = signal.welch(r_b, fs=sr, nperseg=nps_c)
+                _, p12_c = signal.csd(l_b, r_b, fs=sr, nperseg=nps_c)
+                lm_c = (f_c >= 30.0) & (f_c <= 250.0)
+                mm_c = (f_c >= 500.0) & (f_c <= min(4000.0, sr * 0.45))
+                if np.any(lm_c) and np.any(mm_c):
+                    e1_low += float(np.mean(p1_c[lm_c])) * n_b
+                    e1_mid += float(np.mean(p1_c[mm_c])) * n_b
+                    e2_low += float(np.mean(p2_c[lm_c])) * n_b
+                    e2_mid += float(np.mean(p2_c[mm_c])) * n_b
+                lf_c = (f_c >= 30.0) & (f_c <= 200.0)
+                if np.any(lf_c):
+                    csd_lf_real += float(np.sum(p12_c[lf_c].real)) * n_b
+                    csd_lf_imag += float(np.sum(p12_c[lf_c].imag)) * n_b
+                    lf_p1 += float(np.sum(p1_c[lf_c])) * n_b
+                    lf_p2 += float(np.sum(p2_c[lf_c])) * n_b
 
         lufs_acc.update(block)
         tp_acc.update(block)
 
         mono = np.mean(block, axis=1)
+        blk_offset_s = s0 + rel_start_frame / float(sr)
+        r_b_sample = block_roughness_sample(mono, sr)
+        if r_b_sample is not None:
+            roughness_samples.append(r_b_sample)
+        if run_beeps:
+            outdoor_events.extend(detect_synthetic_beeps(mono, sr, blk_offset_s, sensitivity))
+        if run_clicks_crackles:
+            outdoor_events.extend(
+                detect_click_trains_and_crackles(block, sr, blk_offset_s, sensitivity)
+            )
+        if run_voice_bark:
+            outdoor_events.extend(detect_voice_and_dog_barks(mono, sr, blk_offset_s, sensitivity))
+        if run_engines:
+            outdoor_events.extend(detect_variable_rpm_engines(mono, sr, blk_offset_s, sensitivity))
+        if run_spatial:
+            outdoor_events.extend(detect_spatial_anomalies(block, sr, blk_offset_s, sensitivity))
         if sos_hf_floor is not None and zi_hf_floor is not None:
             hf_b, zi_hf_floor = signal.sosfilt(sos_hf_floor, mono, zi=zi_hf_floor)
             hf_sq = hf_b * hf_b
@@ -1465,6 +1662,8 @@ def analyze_file(
             psd_accum += p_b * n_b
             psd_weight += n_b
             segment_psds_band.append(p_b[band_mask].copy())
+            if len(segment_psds_full) < 256:
+                segment_psds_full.append(p_b.copy())
             segment_bounds_s.append(
                 (s0 + rel_start_frame / float(sr), s0 + (rel_start_frame + n_b) / float(sr))
             )
@@ -1561,6 +1760,10 @@ def analyze_file(
 
     stereo_correlation: float | None = None
     mid_side_ratio_db: float | None = None
+    channel_balance_db: float | None = None
+    ch2_low_loss_db: float | None = None
+    lf_coherence: float | None = None
+    directivity_diff_db: float | None = None
     if ch >= 2:
         n_f = float(total_frames)
         var_l = max(0.0, sum_l2 - (sum_l * sum_l) / n_f)
@@ -1569,10 +1772,37 @@ def analyze_file(
         if denom > 1e-12:
             cov = sum_lr - (sum_l * sum_r) / n_f
             stereo_correlation = _finite_or_none(max(-1.0, min(1.0, cov / denom)))
+        rms_l_g = math.sqrt(sum_l2 / n_f)
+        rms_r_g = math.sqrt(sum_r2 / n_f)
+        if rms_l_g > 1e-12 or rms_r_g > 1e-12:
+            channel_balance_db = _finite_or_none(
+                20.0 * math.log10(max(rms_l_g, 1e-12) / max(rms_r_g, 1e-12)), digits=3
+            )
+            c1 = 20.0 * math.log10(max(max_l_lin, 1e-12) / max(rms_l_g, 1e-12))
+            c2 = 20.0 * math.log10(max(max_r_lin, 1e-12) / max(rms_r_g, 1e-12))
+            directivity_diff_db = (c1 - c2) + abs(channel_balance_db or 0.0) * 0.5
+        if e1_mid > 0.0 and e2_mid > 0.0 and e1_low > 0.0 and e2_low > 0.0:
+            c1_lm = 10.0 * math.log10(e1_low / e1_mid)
+            c2_lm = 10.0 * math.log10(e2_low / e2_mid)
+            ch2_low_loss_db = c1_lm - c2_lm
+        if lf_p1 > 0.0 and lf_p2 > 0.0:
+            lf_coherence = max(
+                0.0, min(1.0, math.hypot(csd_lf_real, csd_lf_imag) / math.sqrt(lf_p1 * lf_p2))
+            )
         mid_rms = math.sqrt(sum_mid2 / n_f)
         side_rms = math.sqrt(sum_side2 / n_f)
         if mid_rms > 1e-12:
             mid_side_ratio_db = _finite_or_none(20.0 * math.log10(mid_rms / max(side_rms, 1e-12)))
+
+    layout_info = detect_channel_layout_from_stats(
+        ch,
+        stereo_correlation,
+        mid_side_ratio_db,
+        channel_balance_db,
+        ch2_low_loss_db=ch2_low_loss_db,
+        low_freq_coherence=lf_coherence,
+        directivity_diff_db=directivity_diff_db,
+    )
 
     centroid_hz = rolloff_hz = flatness = rumble_ratio_db = None
     hum_peaks_hz: list[float] = []
@@ -1595,6 +1825,34 @@ def analyze_file(
             segment_psds_band=segment_psds_band,
         )
 
+    pleasant = compute_pleasantness_metrics(
+        freqs_ref,
+        psd_mean,
+        roughness_values=roughness_samples,
+        rumble_ratio_db=rumble_ratio_db,
+        num_drones=len(hum_peaks_hz) + len(tonal_peaks_hz),
+    )
+    band_metrics = compute_band_metrics_from_psd(
+        freqs_ref,
+        psd_mean,
+        custom_range=freq_range_hz,
+        seg_psds=segment_psds_full or None,
+        seg_freqs=freqs_ref,
+    )
+
+    # Cross-block synthetic beep frequency fingerprinting
+    beep_events = [ev for ev in outdoor_events if ev.kind == "synthetic_beep"]
+    if len(beep_events) >= 2:
+        centers = [
+            0.5 * (b.freq_band_hz[0] + b.freq_band_hz[1]) if b.freq_band_hz else 0.0
+            for b in beep_events
+        ]
+        for b, fc in zip(beep_events, centers, strict=True):
+            reps = sum(1 for c in centers if abs(c - fc) <= 4.0)
+            if reps >= 2:
+                b.severity = "high"
+                b.confidence = _finite_or_none(min(0.99, max(b.confidence or 0.7, 0.94)), 2)
+
     events: list[DistractionEvent] = _build_global_events(
         duration_s,
         s0,
@@ -1602,6 +1860,7 @@ def analyze_file(
         tonal_peaks_hz,
         freq_range_hz=freq_range_hz,
     )
+    events.extend(outdoor_events)
 
     if len(segment_psds_band) >= 3 and (allowed_kinds is None or "machine_drone" in allowed_kinds):
         events.extend(
@@ -1739,6 +1998,15 @@ def analyze_file(
         texture_tick_rate_per_min=texture_tick_rate_per_min,
         short_term_lufs_stats=short_term_lufs_stats,
         short_term_lufs_timeline=short_term_lufs_timeline,
+        sharpness_acum=pleasant["sharpness_acum"],
+        roughness_index=pleasant["roughness_index"],
+        ndsi=pleasant["ndsi"],
+        spectral_slope_db_per_oct=pleasant["spectral_slope_db_per_oct"],
+        channel_balance_db=channel_balance_db,
+        stereo_layout_hint=layout_info["layout"],
+        stereo_layout_confidence=layout_info["confidence"],
+        pleasantness_score=pleasant["pleasantness_score"],
+        band_metrics=band_metrics,
     )
     return metrics, events
 
@@ -1761,7 +2029,20 @@ YOUTUBE_ASMR_DURATIONS_MIN: tuple[int, ...] = (
 )
 
 _LOCALIZED_DISTRACTION_KINDS = frozenset(
-    {"low_freq_rumble", "transient_distraction", "slow_pass", "clipping"}
+    {
+        "low_freq_rumble",
+        "transient_distraction",
+        "slow_pass",
+        "clipping",
+        "synthetic_beep",
+        "click_train",
+        "crackle_burst",
+        "human_voice",
+        "dog_bark",
+        "variable_rpm_engine",
+        "channel_biased_noise",
+        "wind_noise",
+    }
 )
 
 
@@ -1856,7 +2137,16 @@ def extract_localized_edit_spans(
     for st in steps:
         fname = st.get("filter_name") if isinstance(st, dict) else st.filter_name
         params = st.get("params") or {} if isinstance(st, dict) else dict(st.params)
-        if fname in {"band_attenuate", "spectral_match_suppress", "ambience_patch"}:
+        is_local_declick = fname == "declick_impulse" and bool(
+            params.get("spans") or params.get("start_s") is not None
+        )
+        if fname in {
+            "band_attenuate",
+            "spectral_match_suppress",
+            "ambience_patch",
+            "harmonic_track_suppress",
+            "distance_soften",
+        } or is_local_declick:
             if params.get("spans"):
                 for sp in params["spans"]:
                     s = sp.get("start_s")
@@ -1933,6 +2223,8 @@ def compute_clean_sections(
     segments: list[dict[str, Any]],
     max_edits_per_hour: float = 2.0,
     max_edited_pct: float = 1.0,
+    round_to_file_local_minutes: bool = False,
+    exclude_spans: list[tuple[float, float]] | None = None,
 ) -> dict[str, Any]:
     """Find largest untouched and minimal-edit stretches sized for YouTube ASMR videos."""
     if not segments:
@@ -1997,7 +2289,11 @@ def compute_clean_sections(
             idx -= 1
         b_s, _, b_label = seg_bounds[idx]
         local_s = max(0.0, clamped - b_s)
-        return b_label, round(local_s, 1), _format_hms(local_s)
+        return b_label, round(local_s, 3), _format_hms(local_s)
+
+    excl_merged = _merge_span_list(
+        [(float(a), float(b)) for a, b in (exclude_spans or []) if float(b) > float(a)]
+    )
 
     merged_edits = _merge_span_list(all_edits)
     merged_distractions = _merge_span_list(all_distractions)
@@ -2068,6 +2364,15 @@ def compute_clean_sections(
         cand_starts: set[float] = {0.0, round(max_start, 2)}
         for m in range(int(max_start // 60.0) + 1):
             cand_starts.add(float(m * 60))
+        local_minute_starts: set[float] = set()
+        if round_to_file_local_minutes:
+            for b_s, b_e, _ in seg_bounds:
+                seg_dur = max(0.0, b_e - b_s)
+                for m in range(int(seg_dur // 60.0) + 1):
+                    cand_val = b_s + float(m * 60)
+                    if cand_val <= max_start + 1e-6:
+                        cand_starts.add(min(max_start, cand_val))
+                        local_minute_starts.add(round(min(max_start, cand_val), 3))
         for g0, g1 in untouched_gaps:
             s_ceil = float(math.ceil(g0))
             if s_ceil <= max_start + 1e-6:
@@ -2081,13 +2386,19 @@ def compute_clean_sections(
         for s_cand in sorted(cand_starts):
             w0 = max(0.0, min(max_start, s_cand))
             w1 = w0 + win_s
+            if excl_merged and any(w1 > ex0 + 1e-6 and w0 < ex1 - 1e-6 for ex0, ex1 in excl_merged):
+                continue
             n_ed, edited_s = _count_and_overlap(
                 merged_edits, edit_starts, edit_ends, w0, w1, prefix_dur=edit_prefix
             )
             n_dist, dist_s = _count_and_overlap(
                 merged_distractions, dist_starts, dist_ends, w0, w1, prefix_dur=dist_prefix
             )
-            round_pref = 0 if abs(w0 % 60.0) < 1e-6 else 1
+            is_local_round = round_to_file_local_minutes and (round(w0, 3) in local_minute_starts)
+            if round_to_file_local_minutes:
+                round_pref = 0 if is_local_round else (1 if abs(w0 % 60.0) < 1e-6 else 2)
+            else:
+                round_pref = 0 if abs(w0 % 60.0) < 1e-6 else 1
             score_key = (n_ed + n_dist, round(edited_s + dist_s, 3), round_pref, w0)
             if best_key is None or score_key < best_key:
                 best_key = score_key
@@ -2100,35 +2411,46 @@ def compute_clean_sections(
         edited_pct = round(100.0 * edited_s / max(win_s, 1e-6), 3)
         dist_pct = round(100.0 * dist_s / max(win_s, 1e-6), 3)
         max_allowed = max(1, int(round(float(max_edits_per_hour) * (d_min / 60.0))))
+        violations: list[str] = []
         if n_ed == 0 and n_dist == 0:
             tier = "untouched"
         elif n_ed <= max_allowed and n_dist <= max_allowed and edited_pct <= float(max_edited_pct):
             tier = "minimal_edits"
         else:
             tier = "moderate_edits"
+            if n_ed > max_allowed:
+                violations.append(f"edit_count {n_ed} > max_allowed {max_allowed}")
+            if n_dist > max_allowed:
+                violations.append(f"distraction_count {n_dist} > max_allowed {max_allowed}")
+            if edited_pct > float(max_edited_pct):
+                violations.append(f"edited_pct {edited_pct:.3f}% > {float(max_edited_pct):.3f}%")
 
-        sf_name, _, s_loc_hms = _map_cum_time(w0)
-        ef_name, _, e_loc_hms = _map_cum_time(w1)
+        sf_name, s_loc_s, s_loc_hms = _map_cum_time(w0)
+        ef_name, e_loc_s, e_loc_hms = _map_cum_time(w1)
         asmr_targets.append(
             {
                 "duration_label": _format_round_duration(d_min),
                 "duration_min": int(d_min),
                 "tier": tier,
-                "start_s": round(w0, 1),
-                "end_s": round(w1, 1),
+                "eligible": tier in {"untouched", "minimal_edits"},
+                "violations": violations,
+                "start_s": round(w0, 3),
+                "end_s": round(w1, 3),
                 "start_hms": _format_hms(w0),
                 "end_hms": _format_hms(w1),
                 "start_file": sf_name,
+                "start_local_s": s_loc_s,
                 "start_local_hms": s_loc_hms,
                 "end_file": ef_name,
+                "end_local_s": e_loc_s,
                 "end_local_hms": e_loc_hms,
                 "edit_count": int(n_ed),
                 "raw_edit_span_count": int(raw_ed),
                 "distraction_count": int(n_dist),
                 "residual_distraction_count": int(n_dist),
-                "edited_s": round(edited_s, 1),
+                "edited_s": round(edited_s, 3),
                 "edited_pct": edited_pct,
-                "residual_distraction_s": round(dist_s, 1),
+                "residual_distraction_s": round(dist_s, 3),
                 "residual_distraction_pct": dist_pct,
             }
         )

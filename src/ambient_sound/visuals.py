@@ -140,6 +140,14 @@ def _plot_spectrogram_figure(
                 "transient_distraction": "#f43f5e",
                 "slow_pass": "#fb7185",
                 "clipping": "#dc2626",
+                "synthetic_beep": "#22d3ee",
+                "click_train": "#f97316",
+                "crackle_burst": "#eab308",
+                "human_voice": "#a855f7",
+                "dog_bark": "#ec4899",
+                "variable_rpm_engine": "#d97706",
+                "channel_biased_noise": "#38bdf8",
+                "wind_noise": "#22c55e",
             }
             for ev in events:
                 if ev.kind in {"mains_hum", "machine_drone"}:

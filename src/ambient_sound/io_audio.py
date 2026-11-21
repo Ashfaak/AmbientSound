@@ -5,11 +5,15 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import math
+import os
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any
+from uuid import uuid4
 
 import numpy as np
 import soundfile as sf
@@ -332,7 +336,9 @@ def export_audio(
     scale = (0.999 / peak) if peak > 1.0 else 1.0
 
     if fmt in {"wav", "flac"}:
-        out_fmt = "WAV" if fmt == "wav" else "FLAC"
+        bytes_per_sample = 3
+        est_bytes = info.frames * info.channels * bytes_per_sample + 4096
+        out_fmt = ("RF64" if est_bytes >= 3_800_000_000 else "WAV") if fmt == "wav" else "FLAC"
         with sf.SoundFile(
             str(dst),
             mode="w",
@@ -371,3 +377,250 @@ def sha256_file(path: str | Path) -> str:
         for chunk in iter(lambda: fh.read(65536), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+class CompilationCancelledError(RuntimeError):
+    """Raised when a streaming copy or span compilation is cooperatively cancelled."""
+
+
+def copy_file_with_sha256(
+    src_path: str | Path,
+    dst_path: str | Path,
+    *,
+    block_bytes: int = 4 * 1024 * 1024,
+    on_progress: Callable[[int, int], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> tuple[int, str]:
+    """Stream-copy a file atomically via `.partial` while hashing SHA-256 in a single pass."""
+    src = Path(src_path)
+    dst = Path(dst_path)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    total_bytes = int(src.stat().st_size)
+    chunk_n = max(65536, int(block_bytes))
+    tmp_dst = dst.with_name(f".{dst.name}.{uuid4().hex[:6]}.partial")
+    digest = hashlib.sha256()
+    written = 0
+    try:
+        with src.open("rb") as fin, tmp_dst.open("wb") as fout:
+            while True:
+                if cancel_check is not None and cancel_check():
+                    raise CompilationCancelledError("File copy cancelled.")
+                buf = fin.read(chunk_n)
+                if not buf:
+                    break
+                fout.write(buf)
+                digest.update(buf)
+                written += len(buf)
+                if on_progress is not None:
+                    on_progress(written, total_bytes)
+        os.replace(tmp_dst, dst)
+        return written, digest.hexdigest()
+    except Exception:
+        if tmp_dst.exists():
+            tmp_dst.unlink(missing_ok=True)
+        raise
+
+
+def compile_audio_span(
+    segments: list[tuple[str | Path, float]],
+    start_s: float,
+    end_s: float,
+    dst_path: str | Path,
+    *,
+    audio_format: str = "wav",
+    subtype: str = "PCM_24",
+    fade_in_s: float = 2.0,
+    fade_out_s: float = 3.0,
+    fade_curve: str = "cosine",
+    block_seconds: float = 30.0,
+    on_block: Callable[[np.ndarray], None] | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
+    """Stream-compile a [start_s, end_s] span across ordered audio files into one output."""
+    if not segments:
+        raise ValueError("compile_audio_span requires at least one segment.")
+    fmt = audio_format.strip().lower()
+    if fmt not in {"wav", "flac", "mp3", "ogg"}:
+        raise ValueError(
+            f"Unsupported export format '{audio_format}'. Use wav, flac, mp3, or ogg."
+        )
+    sub_u = subtype.strip().upper()
+    if sub_u not in {"PCM_24", "PCM_16", "FLOAT"}:
+        raise ValueError(f"Unsupported subtype '{subtype}'. Use PCM_24, PCM_16, or FLOAT.")
+    curve = fade_curve.strip().lower()
+
+    dst = Path(dst_path)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    seg_meta: list[tuple[int, Path, int, int]] = []
+    sr: int | None = None
+    ch: int | None = None
+    cum_frames = 0
+    for seg_idx, (seg_p_raw, _) in enumerate(segments):
+        seg_p = Path(seg_p_raw)
+        info = probe_audio(seg_p)
+        if sr is None:
+            sr, ch = info.sample_rate, info.channels
+        elif info.sample_rate != sr or info.channels != ch:
+            raise ValueError(
+                f"Segment format mismatch for {seg_p.name}: "
+                f"{info.sample_rate}Hz/{info.channels}ch vs {sr}Hz/{ch}ch."
+            )
+        seg_meta.append((seg_idx, seg_p, cum_frames, cum_frames + info.frames))
+        cum_frames += info.frames
+
+    assert sr is not None and ch is not None
+    req0 = max(0, int(round(float(start_s) * sr)))
+    req1 = min(cum_frames, int(round(float(end_s) * sr)))
+    if req1 <= req0:
+        raise ValueError(f"Requested compile window [{start_s}, {end_s}] is empty.")
+
+    slices: list[tuple[int, Path, int, int, float, float, float, float]] = []
+    for seg_idx, seg_p, g0, g1 in seg_meta:
+        ov0 = max(req0, g0)
+        ov1 = min(req1, g1)
+        if ov1 <= ov0:
+            continue
+        loc0 = ov0 - g0
+        take_n = ov1 - ov0
+        slices.append(
+            (
+                seg_idx,
+                seg_p,
+                loc0,
+                take_n,
+                round(loc0 / float(sr), 3),
+                round((loc0 + take_n) / float(sr), 3),
+                round(ov0 / float(sr), 3),
+                round(ov1 / float(sr), 3),
+            )
+        )
+
+    total_frames = sum(s[3] for s in slices)
+    fade_in_n = min(total_frames // 2, max(0, int(round(max(0.0, float(fade_in_s)) * sr))))
+    fade_out_n = min(
+        total_frames - fade_in_n, max(0, int(round(max(0.0, float(fade_out_s)) * sr)))
+    )
+    out_start = total_frames - fade_out_n
+    block_frames = max(4096, int(round(max(1.0, float(block_seconds)) * sr)))
+    bytes_per_sample = 4 if sub_u == "FLOAT" else (2 if sub_u == "PCM_16" else 3)
+    est_bytes = total_frames * ch * bytes_per_sample + 4096
+
+    def _stream_into(target_wav: Path, container: str, out_subtype: str) -> int:
+        written = 0
+        with sf.SoundFile(
+            str(target_wav),
+            mode="w",
+            samplerate=sr,
+            channels=ch,
+            subtype=out_subtype,
+            format=container,
+        ) as fout:
+            global_cursor = 0
+            for _, seg_p, loc0, take_n, _, _, _, _ in slices:
+                with sf.SoundFile(str(seg_p), mode="r") as fin:
+                    fin.seek(loc0)
+                    rem = take_n
+                    while rem > 0:
+                        if cancel_check is not None and cancel_check():
+                            raise CompilationCancelledError("Compilation cancelled.")
+                        blk = fin.read(min(block_frames, rem), always_2d=True, dtype="float64")
+                        if blk.size == 0:
+                            break
+                        n_b = blk.shape[0]
+                        b_end = global_cursor + n_b
+                        if fade_in_n > 0 and global_cursor < fade_in_n:
+                            lo = global_cursor
+                            hi = min(b_end, fade_in_n)
+                            t = np.arange(lo, hi, dtype=np.float64) / max(fade_in_n - 1, 1)
+                            ramp = t if curve == "linear" else 0.5 * (1.0 - np.cos(math.pi * t))
+                            blk[: hi - lo] *= ramp[:, np.newaxis]
+                        if fade_out_n > 0 and b_end > out_start:
+                            lo = max(global_cursor, out_start)
+                            hi = b_end
+                            t = 1.0 - (np.arange(lo, hi, dtype=np.float64) - out_start) / max(
+                                fade_out_n - 1, 1
+                            )
+                            ramp = t if curve == "linear" else 0.5 * (1.0 - np.cos(math.pi * t))
+                            blk[lo - global_cursor : hi - global_cursor] *= ramp[:, np.newaxis]
+                        if out_subtype != "FLOAT":
+                            blk = np.clip(blk, -1.0, 0.999999)
+                        if on_block is not None:
+                            on_block(blk)
+                        fout.write(blk)
+                        global_cursor += n_b
+                        written += n_b
+                        rem -= n_b
+                        if on_progress is not None:
+                            on_progress(written, total_frames)
+        return written
+
+    if fmt in {"wav", "flac"}:
+        container = ("RF64" if est_bytes >= 3_800_000_000 else "WAV") if fmt == "wav" else "FLAC"
+        tmp_dst = dst.with_name(f".{dst.name}.{uuid4().hex[:6]}.partial")
+        try:
+            written = _stream_into(tmp_dst, container, sub_u if fmt == "wav" else "PCM_24")
+            os.replace(tmp_dst, dst)
+        except Exception:
+            if tmp_dst.exists():
+                tmp_dst.unlink(missing_ok=True)
+            raise
+    else:
+        ffmpeg_bin = shutil.which("ffmpeg")
+        if ffmpeg_bin is None:
+            raise RuntimeError(f"Exporting to '{fmt}' requires ffmpeg on PATH.")
+        container = fmt.upper()
+        tmp_dst = dst.with_name(f".{dst.stem}.{uuid4().hex[:6]}.partial.{fmt}")
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp_wav = Path(tmpdir) / "compile_tmp.wav"
+                written = _stream_into(tmp_wav, "RF64", "FLOAT")
+                codec_args = (
+                    ["-c:a", "libmp3lame", "-b:a", "320k"]
+                    if fmt == "mp3"
+                    else ["-c:a", "libvorbis", "-q:a", "7"]
+                )
+                cmd = [
+                    ffmpeg_bin,
+                    "-y",
+                    "-v",
+                    "error",
+                    "-i",
+                    str(tmp_wav),
+                    *codec_args,
+                    str(tmp_dst),
+                ]
+                proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                if proc.returncode != 0 or not tmp_dst.exists():
+                    raise RuntimeError(f"ffmpeg export failed: {proc.stderr.strip()}")
+            os.replace(tmp_dst, dst)
+        except Exception:
+            if tmp_dst.exists():
+                tmp_dst.unlink(missing_ok=True)
+            raise
+
+    return {
+        "output_path": str(dst),
+        "format": fmt,
+        "container": container,
+        "subtype": sub_u if fmt == "wav" else fmt.upper(),
+        "size_bytes": int(dst.stat().st_size),
+        "duration_s": round(written / float(sr), 3),
+        "sample_rate": int(sr),
+        "channels": int(ch),
+        "sha256": sha256_file(dst),
+        "source_slices": [
+            {
+                "segment_index": seg_idx,
+                "file": p.name,
+                "local_start_s": l0,
+                "local_end_s": l1,
+                "local_start_sample": int(loc0),
+                "local_end_sample": int(loc0 + take_n),
+                "global_start_s": g0_s,
+                "global_end_s": g1_s,
+            }
+            for seg_idx, p, loc0, take_n, l0, l1, g0_s, g1_s in slices
+        ],
+    }

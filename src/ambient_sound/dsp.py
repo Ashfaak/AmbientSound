@@ -18,6 +18,19 @@ from ambient_sound.analysis import (
     StreamingTruePeak,
     chunked_true_peak_linear,
 )
+from ambient_sound.engines import (
+    _hf_patch_flatness,
+    apply_masked_stft_transform,
+    ar_interpolate_gap,
+    compute_bird_protect_mask,
+    cosine_edge_mask,
+    detect_channel_layout,
+    detect_clipping_mask,
+    estimate_gcc_phat_lag,
+    finite_or_none,
+    fit_least_squares_fir,
+    fractional_shift_channel,
+)
 from ambient_sound.io_audio import (
     ensure_2d_audio,
     iter_audio_blocks,
@@ -76,15 +89,20 @@ FILTER_SPECS: list[dict[str, Any]] = [
     {
         "name": "declick_impulse",
         "summary": (
-            "MAD spike detector + monotonicity-preserving PCHIP interpolation for mic clicks."
+            "MAD spike detector + PCHIP or AR interpolation (global or localized spans)."
         ),
         "ambient_guidance": (
-            "Ideal for isolated mic-housing clicks, static pops, or branch snaps. Skip globally "
-            "when metrics.texture_tick_rate_per_min >= 30 (organic hive/insect ticks)."
+            "Pass spans=[{start_s, end_s}], method='ar', min_flatness=0.20 for cable-tie ratchet "
+            "click trains while protecting birdsong and skipping global organic ticks."
         ),
         "params": {
             "threshold_sigma": {"type": "float", "default": 6.0, "min": 3.0, "max": 20.0},
             "max_width_ms": {"type": "float", "default": 3.0, "min": 0.5, "max": 12.0},
+            "start_s": {"type": "float | null", "default": None},
+            "end_s": {"type": "float | null", "default": None},
+            "spans": {"type": "list[dict] | null", "default": None},
+            "method": {"type": "str", "default": "pchip", "choices": ["pchip", "ar"]},
+            "min_flatness": {"type": "float", "default": 0.0, "min": 0.0, "max": 1.0},
         },
     },
     {
@@ -106,12 +124,13 @@ FILTER_SPECS: list[dict[str, Any]] = [
     {
         "name": "spectral_match_suppress",
         "summary": (
-            "Per-bin dynamic excess suppressor with clean-context spectral texture fill "
-            "for moving vehicles, Doppler sweeps, and sirens."
+            "Excess-capped, bird-safe dynamic spectral suppressor with gap-buffered context "
+            "and optional L/R channel-excess or narrowband tone surgery."
         ),
         "ambient_guidance": (
-            "Targets moving broadband/harmonic intrusions above the local clean bed "
-            "while leaving surrounding ambience intact and filling deep cuts with clean texture."
+            "Use spatial_mode='channel_excess' for L/R-biased cars, narrowband_mode=True "
+            "+ protect_birds=True for Garmin watch beeps / steady narrow lines, and "
+            "context_gap_s=1.5-3.0 so context never samples a car's own tail."
         ),
         "params": {
             "start_s": {"type": "float | null", "default": None},
@@ -122,10 +141,18 @@ FILTER_SPECS: list[dict[str, Any]] = [
             "max_attenuation_db": {"type": "float", "default": -32.0, "min": -60.0, "max": -3.0},
             "texture_fill": {"type": "float", "default": 0.65, "min": 0.0, "max": 1.0},
             "context_s": {"type": "float", "default": 6.0, "min": 1.0, "max": 20.0},
+            "context_gap_s": {"type": "float", "default": 1.5, "min": 0.0, "max": 15.0},
             "fade_ms": {"type": "float", "default": 1500.0, "min": 20.0, "max": 5000.0},
             "n_fft": {"type": "int", "default": 4096, "min": 1024, "max": 8192},
             "ref_start_s": {"type": "float | null", "default": None},
             "ref_end_s": {"type": "float | null", "default": None},
+            "protect_birds": {"type": "bool", "default": False},
+            "spatial_mode": {
+                "type": "str",
+                "default": "linked",
+                "choices": ["linked", "channel_excess"],
+            },
+            "narrowband_mode": {"type": "bool", "default": False},
             "spans": {"type": "list[dict] | null", "default": None},
         },
     },
@@ -160,18 +187,19 @@ FILTER_SPECS: list[dict[str, Any]] = [
     {
         "name": "ambience_patch",
         "summary": (
-            "Replaces distracted time span(s) with matched clean ambient texture via crossfades."
+            "Replaces distracted time span(s) with non-repeating, knock-screened clean texture."
         ),
         "ambient_guidance": (
-            "Supports crossfade_ms up to 5000 ms and batch spans=[{start_s, end_s, "
-            "crossfade_ms?, source_start_s?}] for per-span crossfades and explicit donors. "
-            "Auto-selects clean donor outside all target spans and records donor provenance."
+            "Supports min_donor_distance_s (avoids event tails), max_donor_crest 50ms knock gate, "
+            "crossfade_ms up to 5000 ms, and reports loop_count & donor_quality."
         ),
         "params": {
             "start_s": {"type": "float | null", "default": None},
             "end_s": {"type": "float | null", "default": None},
             "source_start_s": {"type": "float | null", "default": None},
             "crossfade_ms": {"type": "float", "default": 40.0, "min": 5.0, "max": 5000.0},
+            "min_donor_distance_s": {"type": "float", "default": 5.0, "min": 0.0, "max": 120.0},
+            "max_donor_crest": {"type": "float", "default": 6.0, "min": 2.5, "max": 20.0},
             "spans": {"type": "list[dict] | null", "default": None},
         },
     },
@@ -277,6 +305,139 @@ FILTER_SPECS: list[dict[str, Any]] = [
             "true_peak_ceiling_dbtp": {"type": "float", "default": -1.0, "min": -6.0, "max": -0.1},
             "limit_peaks": {"type": "bool", "default": False},
             "limiter_release_ms": {"type": "float", "default": 80.0, "min": 10.0, "max": 1000.0},
+        },
+    },
+    {
+        "name": "declip_from_backup",
+        "summary": (
+            "Sub-sample GCC-PHAT lag + LS-FIR repair of clipped regions using a -12 dB "
+            "safety backup WAV (with AR interpolation fallback)."
+        ),
+        "ambient_guidance": (
+            "Splices calibrated safety-track audio ONLY across digital/analog-clipped spans with "
+            "short crossfades so backup preamp noise is never exposed in quiet passages."
+        ),
+        "params": {
+            "backup_audio_path": {"type": "str", "required": True},
+            "clip_threshold": {"type": "float", "default": 0.985, "min": 0.85, "max": 0.9999},
+            "crossfade_ms": {"type": "float", "default": 2.0, "min": 0.2, "max": 20.0},
+            "fir_taps": {"type": "int", "default": 31, "min": 5, "max": 127},
+            "max_lag_ms": {"type": "float", "default": 250.0, "min": 5.0, "max": 2000.0},
+            "ar_fallback": {"type": "bool", "default": True},
+        },
+    },
+    {
+        "name": "spatial_mix",
+        "summary": (
+            "Channel layout conversion & spatial cleanup: SSH-6 M/S decode, SGH-6 dual-mic "
+            "crossover/aligned blend, bass mono-ing, wind side-HPF, and L/R balance."
+        ),
+        "ambient_guidance": (
+            "Check metrics.stereo_layout_hint first. Use low_mono_hz=120-160 + side_hpf_hz=140 "
+            "for uncorrelated outdoor wind, or crossover_hz=600 for unaligned shotgun+surround."
+        ),
+        "params": {
+            "mode": {
+                "type": "str",
+                "default": "lr_adjust",
+                "choices": [
+                    "auto",
+                    "ms_decode",
+                    "dual_mic_blend",
+                    "dual_mono_to_stereo",
+                    "lr_adjust",
+                ],
+            },
+            "side_gain_db": {"type": "float", "default": 0.0, "min": -24.0, "max": 12.0},
+            "directional_weight": {"type": "float", "default": 0.5, "min": 0.0, "max": 1.0},
+            "directional_channel": {"type": "int", "default": 0, "min": 0, "max": 1},
+            "crossover_hz": {"type": "float", "default": 0.0, "min": 0.0, "max": 4000.0},
+            "align_delay": {"type": "bool", "default": True},
+            "low_mono_hz": {"type": "float", "default": 0.0, "min": 0.0, "max": 300.0},
+            "side_hpf_hz": {"type": "float", "default": 0.0, "min": 0.0, "max": 500.0},
+            "balance_db": {"type": "float", "default": 0.0, "min": -12.0, "max": 12.0},
+            "auto_balance": {"type": "bool", "default": False},
+            "decorrelate_ms": {"type": "float", "default": 0.0, "min": 0.0, "max": 25.0},
+        },
+    },
+    {
+        "name": "harmonic_track_suppress",
+        "summary": (
+            "Frame-wise sweeping fundamental f0(t) harmonic comb suppressor for "
+            "variable-RPM leafblowers, trimmers, and shifting engines."
+        ),
+        "ambient_guidance": (
+            "Tracks f0(t) dynamically across 55-300 Hz harmonics with content-defined bird "
+            "chirp protection and optional channel-bias excess capping."
+        ),
+        "params": {
+            "start_s": {"type": "float | null", "default": None},
+            "end_s": {"type": "float | null", "default": None},
+            "f0_min_hz": {"type": "float", "default": 55.0, "min": 30.0, "max": 200.0},
+            "f0_max_hz": {"type": "float", "default": 300.0, "min": 80.0, "max": 600.0},
+            "max_harmonics": {"type": "int", "default": 12, "min": 3, "max": 20},
+            "bandwidth_hz": {"type": "float", "default": 18.0, "min": 6.0, "max": 60.0},
+            "strength": {"type": "float", "default": 1.0, "min": 0.1, "max": 1.5},
+            "max_attenuation_db": {"type": "float", "default": -28.0, "min": -60.0, "max": -3.0},
+            "broadband_assist": {"type": "float", "default": 0.35, "min": 0.0, "max": 1.0},
+            "spatial_bias": {"type": "bool", "default": True},
+            "protect_birds": {"type": "bool", "default": True},
+            "texture_fill": {"type": "float", "default": 0.55, "min": 0.0, "max": 1.0},
+            "context_s": {"type": "float", "default": 6.0, "min": 1.0, "max": 20.0},
+            "context_gap_s": {"type": "float", "default": 1.5, "min": 0.0, "max": 15.0},
+            "fade_ms": {"type": "float", "default": 1000.0, "min": 20.0, "max": 5000.0},
+            "n_fft": {"type": "int", "default": 4096, "min": 1024, "max": 8192},
+            "spans": {"type": "list[dict] | null", "default": None},
+        },
+    },
+    {
+        "name": "distance_soften",
+        "summary": (
+            "Excess-capped psychoacoustic distance pushback & voice muffling with air-absorption "
+            "HF rolloff, onset smearing, and bird chirp protection."
+        ),
+        "ambient_guidance": (
+            "Use mode='distance' for dog barks or close distractions; mode='voice_muffle' "
+            "with formant_blur for speech. Preserves FM bird syllables."
+        ),
+        "params": {
+            "start_s": {"type": "float | null", "default": None},
+            "end_s": {"type": "float | null", "default": None},
+            "mode": {"type": "str", "default": "distance", "choices": ["distance", "voice_muffle"]},
+            "low_hz": {"type": "float", "default": 150.0, "min": 20.0, "max": 4000.0},
+            "high_hz": {"type": "float", "default": 6000.0, "min": 200.0, "max": 20000.0},
+            "attenuation_db": {"type": "float", "default": -14.0, "min": -36.0, "max": -2.0},
+            "air_absorption": {"type": "float", "default": 0.65, "min": 0.0, "max": 1.0},
+            "attack_smear_ms": {"type": "float", "default": 12.0, "min": 0.0, "max": 30.0},
+            "formant_blur": {"type": "float", "default": 0.5, "min": 0.0, "max": 1.0},
+            "narrow_stereo": {"type": "float", "default": 0.35, "min": 0.0, "max": 1.0},
+            "protect_birds": {"type": "bool", "default": True},
+            "context_s": {"type": "float", "default": 6.0, "min": 1.0, "max": 20.0},
+            "context_gap_s": {"type": "float", "default": 1.5, "min": 0.0, "max": 15.0},
+            "fade_ms": {"type": "float", "default": 500.0, "min": 20.0, "max": 5000.0},
+            "n_fft": {"type": "int", "default": 2048, "min": 512, "max": 8192},
+            "spans": {"type": "list[dict] | null", "default": None},
+        },
+    },
+    {
+        "name": "bed_shape",
+        "summary": (
+            "Slow stationary-bed psychoacoustic comfort shaper (warmth tilt, 2-5 kHz de-harsh, "
+            "comfort floor preservation, and optional subtle bed width boost)."
+        ),
+        "ambient_guidance": (
+            "Whole-clip polishing filter beyond normalization. Shapes only the slow stationary "
+            "noise bed toward a warmer slope while leaving FM birdsong & transients untouched."
+        ),
+        "params": {
+            "sub_rumble_cut_db": {"type": "float", "default": -6.0, "min": -24.0, "max": 0.0},
+            "harshness_dip_db": {"type": "float", "default": -3.0, "min": -12.0, "max": 0.0},
+            "warmth_tilt_db": {"type": "float", "default": -1.5, "min": -6.0, "max": 6.0},
+            "floor_preserve": {"type": "float", "default": 0.85, "min": 0.3, "max": 1.0},
+            "bed_width_boost": {"type": "float", "default": 0.0, "min": -0.5, "max": 0.5},
+            "deharsh_dynamic": {"type": "bool", "default": True},
+            "protect_birds": {"type": "bool", "default": True},
+            "n_fft": {"type": "int", "default": 2048, "min": 512, "max": 8192},
         },
     },
 ]
@@ -416,44 +577,88 @@ def _declick_impulse(
     sample_rate: int,
     threshold_sigma: float = 6.0,
     max_width_ms: float = 3.0,
+    start_s: float | None = None,
+    end_s: float | None = None,
+    spans: list[dict[str, Any]] | None = None,
+    method: str = "pchip",
+    min_flatness: float = 0.0,
 ) -> np.ndarray:
     n_samples, n_channels = audio.shape
     if n_samples < 32:
         return audio.copy()
 
+    active_intervals: list[tuple[int, int]] = []
+    if spans:
+        for sp in spans:
+            i0 = max(0, min(n_samples, int(round(float(sp["start_s"]) * sample_rate))))
+            i1 = max(0, min(n_samples, int(round(float(sp["end_s"]) * sample_rate))))
+            if i1 > i0 + 8:
+                active_intervals.append((i0, i1))
+        if not active_intervals:
+            return audio.copy()
+    elif start_s is not None or end_s is not None:
+        i0 = max(0, min(n_samples, int(round(float(start_s or 0.0) * sample_rate))))
+        i1 = (
+            n_samples
+            if end_s is None
+            else max(0, min(n_samples, int(round(float(end_s) * sample_rate))))
+        )
+        if i1 <= i0 + 8:
+            return audio.copy()
+        active_intervals.append((i0, i1))
+    else:
+        active_intervals.append((0, n_samples))
+
     out = audio.copy()
     cutoff = min(1500.0, sample_rate * 0.35)
     sos = signal.butter(4, cutoff, btype="highpass", fs=sample_rate, output="sos")
     hp = _safe_sosfiltfilt(sos, out)
+    mono = np.mean(out, axis=1)
 
     max_width_samples = max(4, int(float(max_width_ms) * 0.001 * sample_rate))
     merge_gap = max(1, int(0.001 * sample_rate))
     dilate = max(1, int(0.0005 * sample_rate))
+    use_ar = str(method).strip().lower() == "ar"
+    min_flat = max(0.0, float(min_flatness))
 
     for ch in range(n_channels):
         env = np.abs(hp[:, ch])
         med = float(np.median(env))
         mad = float(np.median(np.abs(env - med))) * 1.4826
         sigma = max(mad, 1e-7)
-        hits = np.flatnonzero(((env - med) / sigma > float(threshold_sigma)) & (env > 2e-3))
+        hit_mask = ((env - med) / sigma > float(threshold_sigma)) & (env > 2e-3)
+        if len(active_intervals) > 1 or active_intervals[0] != (0, n_samples):
+            roi = np.zeros(n_samples, dtype=bool)
+            for a0, a1 in active_intervals:
+                roi[a0:a1] = True
+            hit_mask &= roi
+        hits = np.flatnonzero(hit_mask)
         if hits.size == 0:
             continue
 
-        spans: list[tuple[int, int]] = []
+        spans_i: list[tuple[int, int]] = []
         s = e = int(hits[0])
         for idx in hits[1:]:
             i = int(idx)
             if i - e <= merge_gap:
                 e = i
             else:
-                spans.append((s, e))
+                spans_i.append((s, e))
                 s = e = i
-        spans.append((s, e))
+        spans_i.append((s, e))
 
-        for s_raw, e_raw in spans:
+        for s_raw, e_raw in spans_i:
             s_i = max(1, s_raw - dilate)
             e_i = min(n_samples - 2, e_raw + dilate)
             if (e_i - s_i + 1) > max_width_samples:
+                continue
+            if (
+                min_flat > 0.0
+                and _hf_patch_flatness(mono, (s_i + e_i) // 2, sample_rate) < min_flat
+            ):
+                continue
+            if use_ar:
+                out[s_i : e_i + 1, ch] = ar_interpolate_gap(out[:, ch], s_i, e_i, order=16)
                 continue
             left_ctx = np.arange(max(0, s_i - 4), s_i)
             right_ctx = np.arange(e_i + 1, min(n_samples, e_i + 5))
@@ -787,10 +992,14 @@ def _resolve_match_suppress_spans(
     max_attenuation_db: float,
     texture_fill: float,
     context_s: float,
+    context_gap_s: float,
     fade_ms: float,
     n_fft: int,
     ref_start_s: float | None,
     ref_end_s: float | None,
+    protect_birds: bool,
+    spatial_mode: str,
+    narrowband_mode: bool,
     spans: list[dict[str, Any]] | None,
 ) -> list[dict[str, Any]]:
     raw_list = (
@@ -823,10 +1032,16 @@ def _resolve_match_suppress_spans(
                 ),
                 "texture_fill": max(0.0, min(1.0, float(item.get("texture_fill", texture_fill)))),
                 "context_s": max(1.0, min(20.0, float(item.get("context_s", context_s)))),
+                "context_gap_s": max(
+                    0.0, min(15.0, float(item.get("context_gap_s", context_gap_s)))
+                ),
                 "fade_ms": max(20.0, min(5000.0, float(item.get("fade_ms", fade_ms)))),
                 "n_fft": max(1024, min(8192, int(item.get("n_fft", n_fft)))),
                 "ref_start_s": item.get("ref_start_s", ref_start_s),
                 "ref_end_s": item.get("ref_end_s", ref_end_s),
+                "protect_birds": bool(item.get("protect_birds", protect_birds)),
+                "spatial_mode": str(item.get("spatial_mode", spatial_mode)),
+                "narrowband_mode": bool(item.get("narrowband_mode", narrowband_mode)),
             }
         )
     return resolved
@@ -838,157 +1053,10 @@ def _suppress_window_stft(
     spans: list[dict[str, Any]],
     ref_overrides: dict[int, np.ndarray] | None = None,
 ) -> tuple[np.ndarray, list[dict[str, Any]]]:
-    """Apply per-bin dynamic excess suppression with optional clean-context texture fill."""
-    n_samples, n_ch = audio.shape
-    if n_samples < 64 or not spans:
-        return audio.copy(), []
-    dur_s = n_samples / float(sample_rate)
-    n_fft_val = max(sp["n_fft"] for sp in spans)
-    freqs, times, z_list, nperseg, noverlap = _stft_channels(audio, sample_rate, n_fft_val)
-    power_mean = np.mean([np.abs(z) ** 2 for z in z_list], axis=0)
-    mag = np.sqrt(np.maximum(power_mean, 1e-24))
-    mag_s = ndimage.uniform_filter(mag, size=(3, 5), mode="nearest")
-
-    total_gain_db = np.zeros_like(mag)
-    z_accum = [z.copy() for z in z_list]
-    active_ranges: list[tuple[int, int]] = []
-    logs: list[dict[str, Any]] = []
-    all_intervals = [(float(o["start_s"]), float(o["end_s"])) for o in spans]
-
-    for sp_idx, sp in enumerate(spans):
-        s_t, e_t = sp["start_s"], sp["end_s"]
-        fade_s = sp["fade_ms"] * 0.001
-        ctx_s = sp["context_s"]
-        f_lo, f_hi = sp["low_hz"], min(sample_rate * 0.5, sp["high_hz"])
-        if e_t <= s_t or f_hi <= f_lo:
-            continue
-
-        # Build clean reference magnitude from manual ref, cleaner neighbor context, or non-span bed
-        ext_ref = ref_overrides.get(sp_idx) if ref_overrides else None
-        donor_src = np.zeros((0, n_ch), dtype=np.float64)
-        if ext_ref is not None and ext_ref.shape[0] >= 64:
-            donor_src = ensure_2d_audio(ext_ref)
-        elif sp["ref_start_s"] is not None and sp["ref_end_s"] is not None:
-            rs0 = max(0, int(round(float(sp["ref_start_s"]) * sample_rate)))
-            rs1 = min(n_samples, int(round(float(sp["ref_end_s"]) * sample_rate)))
-            if rs1 - rs0 >= 64:
-                donor_src = audio[rs0:rs1]
-
-        if donor_src.shape[0] >= 64:
-            if donor_src.shape[0] < nperseg:
-                xf_pad = min(256, max(8, donor_src.shape[0] // 4))
-                donor_src = _build_tiled_donor(donor_src, nperseg, xf_pad)
-            _, _, zr_list, _, _ = _stft_channels(donor_src, sample_rate, nperseg)
-            mag_ref = np.sqrt(np.maximum(np.mean([np.abs(z) ** 2 for z in zr_list], axis=0), 1e-24))
-            bed_med = np.median(mag_ref, axis=1, keepdims=True)
-            bed_p80 = np.percentile(mag_ref, 80.0, axis=1, keepdims=True)
-        else:
-            in_any_span = np.zeros(times.size, dtype=bool)
-            for os_t, oe_t in all_intervals:
-                in_any_span |= (times >= os_t) & (times <= oe_t)
-            l_s0 = max(0.0, s_t - fade_s - ctx_s)
-            l_s1 = max(l_s0, s_t - fade_s * 0.25)
-            r_s0 = min(dur_s, e_t + fade_s * 0.25)
-            r_s1 = min(dur_s, e_t + fade_s + ctx_s)
-            m_l = (times >= l_s0) & (times < l_s1) & (~in_any_span)
-            m_r = (times > r_s0) & (times <= r_s1) & (~in_any_span)
-            if np.sum(m_l) < 3:
-                m_l = (times >= l_s0) & (times < l_s1)
-            if np.sum(m_r) < 3:
-                m_r = (times > r_s0) & (times <= r_s1)
-            if np.sum(m_l) >= 3 and np.sum(m_r) >= 3:
-                med_l = np.median(mag[:, m_l], axis=1, keepdims=True)
-                med_r = np.median(mag[:, m_r], axis=1, keepdims=True)
-                p80_l = np.percentile(mag[:, m_l], 80.0, axis=1, keepdims=True)
-                p80_r = np.percentile(mag[:, m_r], 80.0, axis=1, keepdims=True)
-                bed_med = np.minimum(med_l, med_r)
-                bed_p80 = np.minimum(p80_l, p80_r)
-                pick_left = float(np.sum(med_l)) <= float(np.sum(med_r))
-                ds0, ds1 = (l_s0, l_s1) if pick_left else (r_s0, r_s1)
-            elif np.sum(m_l) >= 3 or np.sum(m_r) >= 3:
-                m_use = m_l if np.sum(m_l) >= np.sum(m_r) else m_r
-                bed_med = np.median(mag[:, m_use], axis=1, keepdims=True)
-                bed_p80 = np.percentile(mag[:, m_use], 80.0, axis=1, keepdims=True)
-                ds0, ds1 = (l_s0, l_s1) if np.sum(m_l) >= np.sum(m_r) else (r_s0, r_s1)
-            else:
-                out_m = ~in_any_span
-                if np.sum(out_m) < 3:
-                    out_m = (times < s_t) | (times > e_t)
-                m_use = out_m if np.sum(out_m) >= 3 else np.ones(times.size, dtype=bool)
-                bed_med = np.median(mag[:, m_use], axis=1, keepdims=True)
-                bed_p80 = np.percentile(mag[:, m_use], 80.0, axis=1, keepdims=True)
-                ds0, ds1 = (0.0, max(0.0, s_t)) if s_t >= (dur_s - e_t) else (e_t, dur_s)
-            di0 = max(0, min(n_samples, int(round(ds0 * sample_rate))))
-            di1 = max(di0, min(n_samples, int(round(ds1 * sample_rate))))
-            if di1 > di0:
-                donor_src = audio[di0:di1]
-
-        w_t = _cosine_edge_mask(times, s_t, e_t, fade_s)
-        f_fade = max(15.0, 0.08 * (f_hi - f_lo))
-        w_f = _cosine_edge_mask(freqs, f_lo, f_hi, f_fade)
-        mask_2d = np.outer(w_f, w_t)
-
-        min_gain = 10.0 ** (sp["max_attenuation_db"] / 20.0)
-        over_ratio = mag_s / (bed_p80 + 1e-12)
-        raw_gain = np.where(over_ratio > 1.0, (bed_med / (mag_s + 1e-12)) ** sp["strength"], 1.0)
-        raw_gain = np.clip(raw_gain, min_gain, 1.0)
-        gain_db = 20.0 * np.log10(np.maximum(raw_gain, 1e-6))
-        gain_db_s = ndimage.gaussian_filter(gain_db, sigma=(1.0, 2.5), mode="nearest")
-        applied_db = np.maximum(sp["max_attenuation_db"], gain_db_s * mask_2d)
-        step_db = np.minimum(0.0, np.maximum(sp["max_attenuation_db"] - total_gain_db, applied_db))
-        total_gain_db = total_gain_db + step_db
-        gain_2d = 10.0 ** (step_db / 20.0)
-        for ch in range(n_ch):
-            z_accum[ch] = z_accum[ch] * gain_2d
-
-        if sp["texture_fill"] > 0.0 and donor_src.shape[0] > 64:
-            xf = min(int(0.5 * sample_rate), max(16, donor_src.shape[0] // 4))
-            tiled = _build_tiled_donor(donor_src, n_samples, xf)
-            _, _, z_clean, _, _ = _stft_channels(tiled, sample_rate, nperseg)
-            cut_depth = np.maximum(0.0, -applied_db)
-            blend = sp["texture_fill"] * np.clip((cut_depth - 4.0) / 12.0, 0.0, 1.0) * mask_2d
-            w_orig = np.sqrt(np.maximum(0.0, 1.0 - blend))
-            w_fill = np.sqrt(np.maximum(0.0, blend))
-            for ch in range(n_ch):
-                z_accum[ch] = z_accum[ch] * w_orig + z_clean[ch] * w_fill
-
-        active_tf = np.outer(w_f > 0.2, w_t > 0.1)
-        if np.any(active_tf):
-            peak_ex = round(
-                float(20.0 * np.log10(np.maximum(np.max(over_ratio[active_tf]), 1.0))), 2
-            )
-            cuts = np.maximum(0.0, -applied_db[active_tf])
-            max_cut = round(float(np.max(cuts)), 2)
-            mean_cut = round(float(np.mean(cuts)), 2)
-        else:
-            peak_ex = max_cut = mean_cut = 0.0
-        logs.append(
-            {
-                "start_s": round(s_t, 3),
-                "end_s": round(e_t, 3),
-                "low_hz": round(f_lo, 1),
-                "high_hz": round(f_hi, 1),
-                "peak_excess_db": peak_ex,
-                "max_cut_db": max_cut,
-                "mean_cut_db": mean_cut,
-                "texture_fill": round(sp["texture_fill"], 2),
-            }
-        )
-        pad_s = fade_s + (nperseg / float(sample_rate))
-        active_ranges.append(
-            (
-                max(0, int((s_t - pad_s) * sample_rate)),
-                min(n_samples, int((e_t + pad_s) * sample_rate)),
-            )
-        )
-
-    if not active_ranges:
-        return audio.copy(), []
-    processed = _istft_channels(z_accum, sample_rate, nperseg, noverlap, n_samples)
-    out = audio.copy()
-    for i0, i1 in active_ranges:
-        out[i0:i1] = processed[i0:i1]
-    return out, logs
+    """Delegate spectral_match_suppress to the unified excess-capped masked STFT engine."""
+    return apply_masked_stft_transform(
+        audio, sample_rate, spans, ref_overrides=ref_overrides, mode="spectral_match"
+    )
 
 
 def _spectral_match_suppress_with_info(
@@ -1002,10 +1070,14 @@ def _spectral_match_suppress_with_info(
     max_attenuation_db: float = -32.0,
     texture_fill: float = 0.65,
     context_s: float = 6.0,
+    context_gap_s: float = 1.5,
     fade_ms: float = 1500.0,
     n_fft: int = 4096,
     ref_start_s: float | None = None,
     ref_end_s: float | None = None,
+    protect_birds: bool = False,
+    spatial_mode: str = "linked",
+    narrowband_mode: bool = False,
     spans: list[dict[str, Any]] | None = None,
 ) -> tuple[np.ndarray, list[dict[str, Any]]]:
     dur_s = audio.shape[0] / float(max(sample_rate, 1))
@@ -1020,10 +1092,14 @@ def _spectral_match_suppress_with_info(
         max_attenuation_db,
         texture_fill,
         context_s,
+        context_gap_s,
         fade_ms,
         n_fft,
         ref_start_s,
         ref_end_s,
+        protect_birds,
+        spatial_mode,
+        narrowband_mode,
         spans,
     )
     if not resolved:
@@ -1042,10 +1118,14 @@ def _spectral_match_suppress(
     max_attenuation_db: float = -32.0,
     texture_fill: float = 0.65,
     context_s: float = 6.0,
+    context_gap_s: float = 1.5,
     fade_ms: float = 1500.0,
     n_fft: int = 4096,
     ref_start_s: float | None = None,
     ref_end_s: float | None = None,
+    protect_birds: bool = False,
+    spatial_mode: str = "linked",
+    narrowband_mode: bool = False,
     spans: list[dict[str, Any]] | None = None,
 ) -> np.ndarray:
     out, _ = _spectral_match_suppress_with_info(
@@ -1059,24 +1139,30 @@ def _spectral_match_suppress(
         max_attenuation_db=max_attenuation_db,
         texture_fill=texture_fill,
         context_s=context_s,
+        context_gap_s=context_gap_s,
         fade_ms=fade_ms,
         n_fft=n_fft,
         ref_start_s=ref_start_s,
         ref_end_s=ref_end_s,
+        protect_birds=protect_birds,
+        spatial_mode=spatial_mode,
+        narrowband_mode=narrowband_mode,
         spans=spans,
     )
     return out
 
 
-def _build_tiled_donor(donor: np.ndarray, target_len: int, xfade: int) -> np.ndarray:
-    """Create a seamless chunk of length target_len by crossfade-tiling donor."""
+def _build_tiled_donor_with_info(
+    donor: np.ndarray, target_len: int, xfade: int
+) -> tuple[np.ndarray, int]:
+    """Create chunk of length target_len by crossfade-tiling donor; return (arr, loop_count)."""
     if donor.shape[0] >= target_len:
-        return donor[:target_len].copy()
+        return donor[:target_len].copy(), 0
 
     n_channels = donor.shape[1]
     if donor.shape[0] <= 2 * max(xfade, 1):
-        reps = math.ceil(target_len / donor.shape[0])
-        return np.tile(donor, (reps, 1))[:target_len]
+        reps = math.ceil(target_len / max(donor.shape[0], 1))
+        return np.tile(donor, (reps, 1))[:target_len], max(1, reps - 1)
 
     xf = min(xfade, donor.shape[0] // 4)
     step = donor.shape[0] - xf
@@ -1087,6 +1173,7 @@ def _build_tiled_donor(donor: np.ndarray, target_len: int, xfade: int) -> np.nda
     fade_out = np.cos(t_xf)
 
     pos = 0
+    tiles = 0
     first = True
     while pos < target_len:
         chunk = donor.copy()
@@ -1097,7 +1184,8 @@ def _build_tiled_donor(donor: np.ndarray, target_len: int, xfade: int) -> np.nda
             out[pos : pos + donor.shape[0]] = chunk
             first = False
         pos += step
-    return out[:target_len]
+        tiles += 1
+    return out[:target_len], max(0, tiles - 1)
 
 
 def _merge_sample_intervals(
@@ -1216,8 +1304,9 @@ def _score_donor_windows_from_stats(
     target_mid_frame: float,
     target_rms: float,
     sample_rate: int,
+    max_donor_crest: float = 6.0,
 ) -> tuple[int, int, int] | None:
-    """Select optimal contiguous window [b0, b1] and window count across precomputed block stats."""
+    """Select optimal contiguous window [b0, b1] avoiding high-crest knocks."""
     total_w = win_rms.size
     if total_w == 0 or not free_spans:
         return None
@@ -1226,6 +1315,7 @@ def _score_donor_windows_from_stats(
     k_target = max(1, int(math.ceil(target_len / float(win_frames))))
     ref_rms = max(float(target_rms), 1e-6)
     norm_600s = max(float(sample_rate) * 600.0, 1.0)
+    crest_cap = max(2.0, float(max_donor_crest))
 
     for fs0, fs1 in free_spans:
         w0 = (fs0 + win_frames - 1) // win_frames
@@ -1234,7 +1324,6 @@ def _score_donor_windows_from_stats(
             continue
         avail_k = w1 - w0
         k_use = min(avail_k, k_target)
-        # Vectorized sliding-window scoring across [w0..w1]
         seg_rms = win_rms[w0:w1]
         seg_pk = win_peak[w0:w1]
         seg_low = win_low_ratio[w0:w1]
@@ -1242,6 +1331,7 @@ def _score_donor_windows_from_stats(
             mean_rms = seg_rms
             std_rms = np.zeros_like(seg_rms)
             max_pk = seg_pk
+            max_block_crest = seg_pk / np.maximum(seg_rms, 1e-9)
             mean_low = seg_low
         else:
             cs1 = np.concatenate([[0.0], np.cumsum(seg_rms)])
@@ -1252,16 +1342,26 @@ def _score_donor_windows_from_stats(
             std_rms = np.sqrt(var_rms)
             mean_low = (csl[k_use:] - csl[:-k_use]) / k_use
             max_pk = np.lib.stride_tricks.sliding_window_view(seg_pk, k_use).max(axis=1)
+            win_c = seg_pk / np.maximum(seg_rms, 1e-9)
+            max_block_crest = np.lib.stride_tricks.sliding_window_view(win_c, k_use).max(axis=1)
 
         rms_err = np.abs(mean_rms - ref_rms) / ref_rms
         cv = std_rms / np.maximum(mean_rms, 1e-9)
         crest = max_pk / np.maximum(mean_rms, 1e-9)
+        knock_pen = np.where((crest > crest_cap) | (max_block_crest > crest_cap), 120.0, 0.0)
         starts_f = (w0 + np.arange(mean_rms.size)) * win_frames
         mids_f = starts_f + 0.5 * k_use * win_frames
         prox = np.minimum(1.0, np.abs(mids_f - target_mid_frame) / norm_600s)
-        # Slight penalty when candidate is shorter than target_len so full-span non-tiled wins win
         short_pen = 0.4 * max(0.0, 1.0 - (k_use / float(max(1, k_target))))
-        scores = 2.5 * rms_err + 0.6 * cv + 0.35 * crest + 0.25 * mean_low + 0.08 * prox + short_pen
+        scores = (
+            2.5 * rms_err
+            + 0.6 * cv
+            + 0.35 * crest
+            + 0.25 * mean_low
+            + 0.08 * prox
+            + short_pen
+            + knock_pen
+        )
         loc_idx = int(np.argmin(scores))
         sc = float(scores[loc_idx])
         if sc < best_score:
@@ -1297,12 +1397,12 @@ def _build_window_stats_array(
 
 def _stitch_non_repeating_chunks(
     chunks: list[np.ndarray], target_len: int, xfade: int
-) -> np.ndarray:
-    """Combine multiple distinct donor chunks with equal-power crossfades up to target_len."""
+) -> tuple[np.ndarray, int]:
+    """Combine distinct donor chunks up to target_len; return (array, loop_count)."""
     if not chunks:
-        return np.zeros((target_len, 2), dtype=np.float64)
+        return np.zeros((target_len, 2), dtype=np.float64), 0
     if len(chunks) == 1:
-        return _build_tiled_donor(chunks[0], target_len, xfade)
+        return _build_tiled_donor_with_info(chunks[0], target_len, xfade)
     out = chunks[0].copy()
     for seg in chunks[1:]:
         xf = min(xfade, out.shape[0] // 4, seg.shape[0] // 4)
@@ -1313,8 +1413,8 @@ def _stitch_non_repeating_chunks(
         else:
             out = np.vstack([out, seg])
         if out.shape[0] >= target_len:
-            return out[:target_len].copy()
-    return _build_tiled_donor(out, target_len, xfade)
+            return out[:target_len].copy(), 0
+    return _build_tiled_donor_with_info(out, target_len, xfade)
 
 
 def _pick_clean_donor_with_span(
@@ -1328,22 +1428,30 @@ def _pick_clean_donor_with_span(
     target_mid_frame: float | None = None,
     target_rms: float | None = None,
     stats_cache: tuple[int, np.ndarray, np.ndarray, np.ndarray] | None = None,
-) -> tuple[np.ndarray, float, float]:
-    """Select an unrepeated, event-screened clean donor segment with full-span scoring."""
+    min_donor_distance_s: float = 5.0,
+    max_donor_crest: float = 6.0,
+) -> tuple[np.ndarray, float, float, int, int]:
+    """Select an unrepeated, event- and knock-screened clean donor segment."""
     n_samples, n_ch = audio.shape
     patch_margin = int(0.15 * sample_rate)
+    dist_margin = max(patch_margin, int(max(0.0, float(min_donor_distance_s)) * sample_rate))
     event_margin = int(5.0 * sample_rate)
     win_frames = stats_cache[0] if stats_cache else max(64, int(round(0.25 * sample_rate)))
     min_region = max(win_frames * 2, int(0.25 * sample_rate))
 
     ex_patch = [(s - patch_margin, e + patch_margin) for s, e in exclude_spans]
+    ex_dist = [(s - dist_margin, e + dist_margin) for s, e in exclude_spans]
     ex_used = [(s - patch_margin, e + patch_margin) for s, e in (used_spans or [])]
     ex_events = [
         (int(round(es * sample_rate)) - event_margin, int(round(ee * sample_rate)) + event_margin)
         for es, ee in (exclude_events_s or [])
     ]
 
-    free_spans = _complement_sample_intervals(ex_patch + ex_used + ex_events, n_samples, min_region)
+    free_spans = _complement_sample_intervals(ex_dist + ex_used + ex_events, n_samples, min_region)
+    if not free_spans:
+        free_spans = _complement_sample_intervals(
+            ex_patch + ex_used + ex_events, n_samples, min_region
+        )
     if not free_spans:
         free_spans = _complement_sample_intervals(ex_patch + ex_used, n_samples, min_region)
     if not free_spans:
@@ -1353,11 +1461,14 @@ def _pick_clean_donor_with_span(
         fb0, fb1 = (0, ex0) if ex0 >= (n_samples - ex1) else (ex1, n_samples)
         fallback = audio[fb0:fb1] if fb1 > fb0 else audio
         if fallback.shape[0] == 0:
-            return np.zeros((target_len, n_ch), dtype=np.float64), 0.0, 0.0
+            return np.zeros((target_len, n_ch), dtype=np.float64), 0.0, 0.0, 0, 1
+        tiled, loops = _build_tiled_donor_with_info(fallback, target_len, xfade)
         return (
-            _build_tiled_donor(fallback, target_len, xfade),
+            tiled,
             round(fb0 / float(sample_rate), 3),
             round(fb1 / float(sample_rate), 3),
+            loops,
+            1,
         )
 
     if stats_cache is None:
@@ -1373,7 +1484,16 @@ def _pick_clean_donor_with_span(
     mid_f = float(target_mid_frame) if target_mid_frame is not None else 0.5 * n_samples
 
     picked = _score_donor_windows_from_stats(
-        free_spans, win_frames, w_rms, w_pk, w_low, target_len, mid_f, ref_rms, sample_rate
+        free_spans,
+        win_frames,
+        w_rms,
+        w_pk,
+        w_low,
+        target_len,
+        mid_f,
+        ref_rms,
+        sample_rate,
+        max_donor_crest=max_donor_crest,
     )
     if picked is None:
         fs0, fs1 = free_spans[0]
@@ -1389,9 +1509,10 @@ def _pick_clean_donor_with_span(
             audio[b0 : b0 + target_len].copy(),
             round(b0 / float(sample_rate), 3),
             round((b0 + target_len) / float(sample_rate), 3),
+            0,
+            1,
         )
 
-    # Assemble non-repeating clean chunks across disjoint intervals before falling back to tiling
     chunks = [audio[b0:b1]]
     got = b1 - b0
     local_used = list(used_spans or [])
@@ -1399,10 +1520,18 @@ def _pick_clean_donor_with_span(
         local_used.append((b0, b1))
     while got < target_len:
         cur_free = _complement_sample_intervals(
-            ex_patch + [(s - patch_margin, e + patch_margin) for s, e in local_used] + ex_events,
+            ex_dist + [(s - patch_margin, e + patch_margin) for s, e in local_used] + ex_events,
             n_samples,
             min_region,
         )
+        if not cur_free:
+            cur_free = _complement_sample_intervals(
+                ex_patch
+                + [(s - patch_margin, e + patch_margin) for s, e in local_used]
+                + ex_events,
+                n_samples,
+                min_region,
+            )
         if not cur_free:
             cur_free = _complement_sample_intervals(
                 ex_patch + [(s - patch_margin, e + patch_margin) for s, e in local_used],
@@ -1412,7 +1541,16 @@ def _pick_clean_donor_with_span(
         if not cur_free:
             break
         nxt = _score_donor_windows_from_stats(
-            cur_free, win_frames, w_rms, w_pk, w_low, target_len - got, mid_f, ref_rms, sample_rate
+            cur_free,
+            win_frames,
+            w_rms,
+            w_pk,
+            w_low,
+            target_len - got,
+            mid_f,
+            ref_rms,
+            sample_rate,
+            max_donor_crest=max_donor_crest,
         )
         if nxt is None:
             break
@@ -1423,20 +1561,14 @@ def _pick_clean_donor_with_span(
             used_spans.append((nb0, nb1))
         got += nb1 - nb0
 
-    assembled = _stitch_non_repeating_chunks(chunks, target_len, xfade)
-    return assembled, round(b0 / float(sample_rate), 3), round(b1 / float(sample_rate), 3)
-
-
-def _pick_clean_donor(
-    audio: np.ndarray,
-    sample_rate: int,
-    exclude_spans: list[tuple[int, int]],
-    target_len: int,
-    xfade: int,
-) -> np.ndarray:
-    """Select the lowest-crest, smoothest clean segment outside all excluded sample intervals."""
-    donor, _, _ = _pick_clean_donor_with_span(audio, sample_rate, exclude_spans, target_len, xfade)
-    return donor
+    assembled, loops = _stitch_non_repeating_chunks(chunks, target_len, xfade)
+    return (
+        assembled,
+        round(b0 / float(sample_rate), 3),
+        round(b1 / float(sample_rate), 3),
+        loops,
+        len(chunks),
+    )
 
 
 def _apply_patch_slice(
@@ -1525,6 +1657,8 @@ def _ambience_patch_with_info(
     end_s: float | None = None,
     source_start_s: float | None = None,
     crossfade_ms: float = 40.0,
+    min_donor_distance_s: float = 5.0,
+    max_donor_crest: float = 6.0,
     spans: list[dict[str, Any]] | None = None,
     exclude_events: list[tuple[float, float]] | None = None,
 ) -> tuple[np.ndarray, list[dict[str, Any]]]:
@@ -1565,12 +1699,13 @@ def _ambience_patch_with_info(
             raw_donor = audio[src_i0:src_i1]
             if raw_donor.shape[0] == 0:
                 raw_donor = audio
-            donor = _build_tiled_donor(raw_donor, patch_len, r["desired_xf"])
+            donor, loops = _build_tiled_donor_with_info(raw_donor, patch_len, r["desired_xf"])
             donor_s0 = round(src_i0 / float(sample_rate), 3)
             donor_s1 = round(src_i1 / float(sample_rate), 3)
+            donor_chunks = 1
             src_mode = "manual"
         else:
-            donor, donor_s0, donor_s1 = _pick_clean_donor_with_span(
+            donor, donor_s0, donor_s1, loops, donor_chunks = _pick_clean_donor_with_span(
                 audio,
                 sample_rate,
                 exclude_spans,
@@ -1581,6 +1716,8 @@ def _ambience_patch_with_info(
                 target_mid_frame=0.5 * (p0 + p1),
                 target_rms=t_rms,
                 stats_cache=stats_cache,
+                min_donor_distance_s=min_donor_distance_s,
+                max_donor_crest=max_donor_crest,
             )
             src_mode = "auto"
 
@@ -1598,6 +1735,8 @@ def _ambience_patch_with_info(
                 "donor_end_s": donor_s1,
                 "source_mode": src_mode,
                 "crossfade_ms": round(float(r.get("crossfade_ms", crossfade_ms)), 1),
+                "loop_count": int(loops),
+                "donor_chunks": int(donor_chunks),
                 "donor_quality": quality,
             }
         )
@@ -1611,10 +1750,20 @@ def _ambience_patch(
     end_s: float | None = None,
     source_start_s: float | None = None,
     crossfade_ms: float = 40.0,
+    min_donor_distance_s: float = 5.0,
+    max_donor_crest: float = 6.0,
     spans: list[dict[str, Any]] | None = None,
 ) -> np.ndarray:
     out, _ = _ambience_patch_with_info(
-        audio, sample_rate, start_s, end_s, source_start_s, crossfade_ms, spans
+        audio,
+        sample_rate,
+        start_s=start_s,
+        end_s=end_s,
+        source_start_s=source_start_s,
+        crossfade_ms=crossfade_ms,
+        min_donor_distance_s=min_donor_distance_s,
+        max_donor_crest=max_donor_crest,
+        spans=spans,
     )
     return out
 
@@ -1893,8 +2042,8 @@ def _loudness_normalize_with_info(
         tp_db = 20.0 * math.log10(tp_lin)
         applied_gain_db = min(desired_gain_db, ceiling - tp_db)
         return audio * (10.0 ** (applied_gain_db / 20.0)), {
-            "target_lufs": round(float(target_lufs), 2),
-            "applied_gain_db": round(applied_gain_db, 3),
+            "target_lufs": finite_or_none(target_lufs, digits=2),
+            "applied_gain_db": finite_or_none(applied_gain_db, digits=3) or 0.0,
             "peak_limited": False,
         }
 
@@ -1930,10 +2079,10 @@ def _loudness_normalize_with_info(
         total_gain_db += trim_db
 
     return out, {
-        "target_lufs": round(float(target_lufs), 2),
-        "applied_gain_db": round(total_gain_db, 3),
+        "target_lufs": finite_or_none(target_lufs, digits=2),
+        "applied_gain_db": finite_or_none(total_gain_db, digits=3) or 0.0,
         "peak_limited": True,
-        "ceiling_dbtp": round(ceiling, 2),
+        "ceiling_dbtp": finite_or_none(ceiling, digits=2),
     }
 
 
@@ -1956,6 +2105,849 @@ def _loudness_normalize(
     return out
 
 
+# ---------------------------------------------------------------------------
+# v0.5.0 Nature, Hardware Ingest & Psychoacoustic Filters
+# ---------------------------------------------------------------------------
+
+
+def _repair_clipped_channel_slice(
+    main_ch: np.ndarray,
+    b_matched_ch: np.ndarray,
+    clip_mask_ch: np.ndarray,
+    backup_raw_ch: np.ndarray,
+    backup_offset: float,
+    sample_rate: int,
+    xf_n: int,
+    ar_fallback: bool,
+    active_lo: int = 0,
+    active_hi: int | None = None,
+) -> tuple[np.ndarray, int, int, int]:
+    """Repair merged clipped spans on a 1D slice via matched backup + optional AR fallback."""
+    n_samples = main_ch.size
+    a_hi = n_samples if active_hi is None else min(n_samples, active_hi)
+    out = main_ch.copy()
+    idx_c = np.flatnonzero(clip_mask_ch)
+    if idx_c.size == 0:
+        return out, 0, 0, 0
+
+    spans_c: list[tuple[int, int]] = []
+    s = e = int(idx_c[0])
+    merge_gap = max(2, int(0.001 * sample_rate))
+    for idx in idx_c[1:]:
+        ii = int(idx)
+        if ii - e <= merge_gap:
+            e = ii
+        else:
+            spans_c.append((s, e))
+            s = e = ii
+    spans_c.append((s, e))
+
+    repaired_regions = 0
+    repaired_samples = 0
+    ar_fallback_regions = 0
+    for s_raw, e_raw in spans_c:
+        mid = (s_raw + e_raw) // 2
+        in_active = active_lo <= mid < a_hi
+        s_i = max(0, s_raw - xf_n)
+        e_i = min(n_samples - 1, e_raw + xf_n)
+        b_lo = max(0, int(round(s_raw + backup_offset)) - 4)
+        b_hi = min(backup_raw_ch.size, int(round(e_raw + backup_offset)) + 5)
+        core_b_raw = backup_raw_ch[b_lo:b_hi] if b_hi > b_lo else np.zeros(0)
+        backup_clipped = (
+            float(np.max(np.abs(core_b_raw))) >= 0.995 if core_b_raw.size else False
+        )
+        if backup_clipped and ar_fallback:
+            out[s_raw : e_raw + 1] = ar_interpolate_gap(out, s_raw, e_raw, order=16)
+            if in_active:
+                ar_fallback_regions += 1
+                repaired_regions += 1
+                repaired_samples += e_raw - s_raw + 1
+            continue
+
+        seg_b = b_matched_ch[s_i : e_i + 1].copy()
+        seg_len = seg_b.size
+        if seg_len <= 0:
+            continue
+        xf = min(xf_n, max(1, seg_len // 3))
+        if xf > 0 and s_i > 0 and e_i < n_samples - 1:
+            w_l = 0.5 * (1.0 - np.cos(np.linspace(0.0, np.pi, xf, endpoint=True)))
+            w_r = 0.5 * (1.0 + np.cos(np.linspace(0.0, np.pi, xf, endpoint=True)))
+            seg_b[:xf] = main_ch[s_i : s_i + xf] * (1.0 - w_l) + seg_b[:xf] * w_l
+            seg_b[-xf:] = seg_b[-xf:] * w_r + main_ch[e_i + 1 - xf : e_i + 1] * (1.0 - w_r)
+        out[s_i : e_i + 1] = seg_b
+        if in_active:
+            repaired_regions += 1
+            repaired_samples += e_raw - s_raw + 1
+    return out, repaired_regions, repaired_samples, ar_fallback_regions
+
+
+def _declip_from_backup_with_info(
+    audio: np.ndarray,
+    sample_rate: int,
+    backup_audio_path: str,
+    clip_threshold: float = 0.985,
+    crossfade_ms: float = 2.0,
+    fir_taps: int = 31,
+    max_lag_ms: float = 250.0,
+    ar_fallback: bool = True,
+    head_pad_frames: int = 0,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Repair main-track digital/analog clipping via sub-sample aligned LS-FIR backup splice."""
+    full_main = ensure_2d_audio(audio)
+    total_samples, n_ch = full_main.shape
+    hp_frames = max(0, min(total_samples, int(head_pad_frames)))
+    main = full_main[hp_frames:]
+    n_samples = main.shape[0]
+    if n_samples < 32:
+        return full_main.copy(), {"repaired_regions": 0, "repaired_samples": 0}
+
+    b_path = Path(str(backup_audio_path))
+    if not b_path.exists():
+        raise FileNotFoundError(f"Backup audio file not found: {b_path}")
+    b_info = probe_audio(b_path)
+    if b_info.sample_rate != sample_rate or b_info.channels != n_ch:
+        raise ValueError(
+            f"Backup format mismatch ({b_info.sample_rate}Hz/{b_info.channels}ch) "
+            f"vs main ({sample_rate}Hz/{n_ch}ch)."
+        )
+
+    backup_raw, _ = load_audio_slice(
+        b_path, start_s=0.0, end_s=n_samples / float(max(sample_rate, 1)), dtype="float64"
+    )
+    active_len = min(n_samples, backup_raw.shape[0])
+    if active_len < 32:
+        return full_main.copy(), {"repaired_regions": 0, "repaired_samples": 0}
+    main_active = main[:active_len]
+    backup_raw = backup_raw[:active_len]
+
+    clip_mask_2d = detect_clipping_mask(main_active, threshold=clip_threshold)
+    any_clipped = np.any(clip_mask_2d, axis=1)
+    repaired_regions = 0
+    repaired_samples = 0
+    ar_fallback_regions = 0
+
+    lag_samples, coh = estimate_gcc_phat_lag(
+        main_active[:, 0], backup_raw[:, 0], sample_rate, max_lag_ms=max_lag_ms
+    )
+
+    out_full = full_main.copy()
+    out = out_full[hp_frames : hp_frames + active_len]
+    gain_dbs: list[float | None] = []
+    null_dbs: list[float | None] = []
+    xf_n = max(1, int(round(max(0.2, float(crossfade_ms)) * 0.001 * sample_rate)))
+
+    for ch in range(n_ch):
+        b_aligned = fractional_shift_channel(backup_raw[:, ch], -lag_samples)
+        valid_fit = (~any_clipped) & (np.abs(main_active[:, ch]) > 1e-5)
+        if int(np.sum(valid_fit)) >= max(64, int(fir_taps) * 4):
+            coeffs, g_db, null_db = fit_least_squares_fir(
+                b_aligned,
+                main_active[:, ch],
+                taps=fir_taps,
+                valid_mask=~clip_mask_2d[:, ch],
+            )
+            b_matched = signal.fftconvolve(b_aligned, coeffs, mode="same")
+        else:
+            rms_m = float(np.sqrt(np.mean(main_active[:, ch] ** 2))) + 1e-12
+            rms_b = float(np.sqrt(np.mean(b_aligned**2))) + 1e-12
+            g = max(0.05, min(20.0, rms_m / rms_b))
+            b_matched = b_aligned * g
+            g_db = finite_or_none(20.0 * math.log10(g), digits=3) or 0.0
+            null_db = 0.0
+        gain_dbs.append(g_db)
+        null_dbs.append(null_db)
+
+        rep_ch, reg_c, samp_c, ar_c = _repair_clipped_channel_slice(
+            main_active[:, ch],
+            b_matched,
+            clip_mask_2d[:, ch],
+            backup_raw[:, ch],
+            lag_samples,
+            sample_rate,
+            xf_n,
+            ar_fallback,
+        )
+        out[:, ch] = rep_ch
+        repaired_regions += reg_c
+        repaired_samples += samp_c
+        ar_fallback_regions += ar_c
+
+    return out_full, {
+        "lag_samples": finite_or_none(lag_samples, digits=3) or 0.0,
+        "alignment_coherence": finite_or_none(coh, digits=3) or 0.0,
+        "fitted_gain_db": gain_dbs[0] if len(gain_dbs) == 1 else gain_dbs,
+        "fit_null_residual_db": null_dbs[0] if len(null_dbs) == 1 else null_dbs,
+        "repaired_regions": repaired_regions,
+        "repaired_samples": repaired_samples,
+        "ar_fallback_regions": ar_fallback_regions,
+    }
+
+
+def _declip_from_backup(
+    audio: np.ndarray,
+    sample_rate: int,
+    backup_audio_path: str,
+    clip_threshold: float = 0.985,
+    crossfade_ms: float = 2.0,
+    fir_taps: int = 31,
+    max_lag_ms: float = 250.0,
+    ar_fallback: bool = True,
+) -> np.ndarray:
+    out, _ = _declip_from_backup_with_info(
+        audio,
+        sample_rate,
+        backup_audio_path=backup_audio_path,
+        clip_threshold=clip_threshold,
+        crossfade_ms=crossfade_ms,
+        fir_taps=fir_taps,
+        max_lag_ms=max_lag_ms,
+        ar_fallback=ar_fallback,
+    )
+    return out
+
+
+def _resolve_spatial_mix_globals(
+    cal_audio: np.ndarray,
+    sample_rate: int,
+    mode: str,
+    directional_channel: int,
+    align_delay: bool,
+    crossover_hz: float,
+    auto_balance: bool,
+    balance_db: float,
+    decorrelate_ms: float,
+) -> dict[str, Any]:
+    """Resolve deterministic global mode, GCC-PHAT lag, and L/R trim before processing."""
+    arr = ensure_2d_audio(cal_audio)
+    ch = arr.shape[1]
+    layout_info = detect_channel_layout(arr, sample_rate)
+    req_mode = str(mode).strip().lower()
+    eff_mode = req_mode
+    if req_mode == "auto":
+        hint = layout_info["layout"]
+        if hint == "raw_ms":
+            eff_mode = "ms_decode"
+        elif hint == "directional_plus_surround":
+            eff_mode = "dual_mic_blend"
+        elif hint == "dual_mono" and float(decorrelate_ms) > 0.0:
+            eff_mode = "dual_mono_to_stereo"
+        else:
+            eff_mode = "lr_adjust"
+
+    lag_samples = 0.0
+    dir_idx = 0 if int(directional_channel) <= 0 else 1
+    if eff_mode == "dual_mic_blend" and ch >= 2 and float(crossover_hz) <= 0.0 and align_delay:
+        lag_samples, _ = estimate_gcc_phat_lag(
+            arr[:, dir_idx], arr[:, 1 - dir_idx], sample_rate, max_lag_ms=50.0
+        )
+
+    eff_balance_db = float(balance_db)
+    if auto_balance and ch >= 2 and eff_mode in {"lr_adjust", "ms_decode", "dual_mic_blend"}:
+        l_r = float(np.sqrt(np.mean(arr[:, 0] ** 2))) + 1e-12
+        r_r = float(np.sqrt(np.mean(arr[:, 1] ** 2))) + 1e-12
+        bal = 20.0 * math.log10(l_r / r_r)
+        eff_balance_db = max(-6.0, min(6.0, -bal))
+
+    return {
+        "requested_mode": req_mode,
+        "effective_mode": eff_mode,
+        "detected_layout": layout_info["layout"],
+        "layout_confidence": layout_info["confidence"],
+        "lag_samples": round(float(lag_samples), 3),
+        "effective_balance_db": round(float(eff_balance_db), 3),
+    }
+
+
+def _apply_spatial_mix_chunk(
+    audio: np.ndarray,
+    sample_rate: int,
+    globals_cfg: dict[str, Any],
+    side_gain_db: float = 0.0,
+    directional_weight: float = 0.5,
+    directional_channel: int = 0,
+    crossover_hz: float = 0.0,
+    low_mono_hz: float = 0.0,
+    side_hpf_hz: float = 0.0,
+    decorrelate_ms: float = 0.0,
+) -> np.ndarray:
+    arr = ensure_2d_audio(audio)
+    n_samples, n_ch = arr.shape
+    eff_mode = globals_cfg["effective_mode"]
+    side_lin = 10.0 ** (max(-24.0, min(12.0, float(side_gain_db))) / 20.0)
+    nyq = sample_rate * 0.5
+
+    if n_ch == 1:
+        if eff_mode == "dual_mono_to_stereo" and n_samples >= 32:
+            m = arr[:, 0]
+            dec_ms = max(2.0, float(decorrelate_ms) or 6.0)
+            delay_n = max(4, int(round(dec_ms * 0.001 * sample_rate)))
+            sos_s = signal.butter(
+                2, min(250.0, nyq * 0.6), btype="highpass", fs=sample_rate, output="sos"
+            )
+            hf_m = _safe_sosfiltfilt(sos_s, m)
+            delayed = np.zeros_like(hf_m)
+            if delay_n < n_samples:
+                delayed[delay_n:] = hf_m[:-delay_n]
+            s = 0.25 * (hf_m - delayed)
+            out = np.column_stack([m + s, m - s])
+        else:
+            return arr.copy()
+    else:
+        ch0, ch1 = arr[:, 0], arr[:, 1]
+        if eff_mode == "ms_decode":
+            m = ch0
+            s = ch1 * side_lin
+            if side_hpf_hz > 0.0 and side_hpf_hz < nyq * 0.85 and n_samples >= 24:
+                sos_sh = signal.butter(
+                    4, float(side_hpf_hz), btype="highpass", fs=sample_rate, output="sos"
+                )
+                s = _safe_sosfiltfilt(sos_sh, s)
+            left = (m + s) * 0.7071067811865475
+            right = (m - s) * 0.7071067811865475
+            out = np.column_stack([left, right])
+        elif eff_mode == "dual_mic_blend":
+            dir_idx = 0 if int(directional_channel) <= 0 else 1
+            d_ch = ch0 if dir_idx == 0 else ch1
+            s_ch = ch1 if dir_idx == 0 else ch0
+            w_dir = max(0.0, min(1.0, float(directional_weight)))
+            if float(crossover_hz) > 10.0 and float(crossover_hz) < nyq * 0.8 and n_samples >= 32:
+                fc = float(crossover_hz)
+                sos_lp = signal.butter(4, fc, btype="lowpass", fs=sample_rate, output="sos")
+                sos_hp = signal.butter(4, fc, btype="highpass", fs=sample_rate, output="sos")
+                low_part = _safe_sosfiltfilt(sos_lp, s_ch)
+                high_part = _safe_sosfiltfilt(sos_hp, d_ch)
+                center = low_part * (1.0 - 0.5 * w_dir) + high_part * (0.5 + 0.5 * w_dir)
+                amb_side = 0.35 * (low_part - _safe_sosfiltfilt(sos_lp, d_ch)) * side_lin
+                out = np.column_stack([center + amb_side, center - amb_side])
+            else:
+                s_aligned = fractional_shift_channel(s_ch, -float(globals_cfg["lag_samples"]))
+                center = w_dir * d_ch + (1.0 - w_dir) * s_aligned
+                diff = 0.30 * (s_aligned - d_ch) * side_lin
+                out = np.column_stack([center + diff, center - diff])
+        elif eff_mode == "dual_mono_to_stereo":
+            m = 0.5 * (ch0 + ch1)
+            dec_ms = max(2.0, float(decorrelate_ms) or 6.0)
+            delay_n = max(4, int(round(dec_ms * 0.001 * sample_rate)))
+            sos_s = signal.butter(
+                2, min(250.0, nyq * 0.6), btype="highpass", fs=sample_rate, output="sos"
+            )
+            hf_m = _safe_sosfiltfilt(sos_s, m)
+            delayed = np.zeros_like(hf_m)
+            if delay_n < n_samples:
+                delayed[delay_n:] = hf_m[:-delay_n]
+            s = 0.25 * (hf_m - delayed)
+            out = np.column_stack([m + s, m - s])
+        else:
+            m = 0.5 * (ch0 + ch1)
+            s = 0.5 * (ch0 - ch1) * side_lin
+            hpf_cut = max(float(side_hpf_hz), float(low_mono_hz))
+            if hpf_cut > 0.0 and hpf_cut < nyq * 0.85 and n_samples >= 24:
+                sos_sh = signal.butter(4, hpf_cut, btype="highpass", fs=sample_rate, output="sos")
+                s = _safe_sosfiltfilt(sos_sh, s)
+            out = np.column_stack([m + s, m - s])
+
+    if (
+        eff_mode != "lr_adjust"
+        and max(float(low_mono_hz), float(side_hpf_hz)) > 0.0
+        and n_samples >= 24
+    ):
+        cut = min(nyq * 0.85, max(float(low_mono_hz), float(side_hpf_hz)))
+        m = 0.5 * (out[:, 0] + out[:, 1])
+        s = 0.5 * (out[:, 0] - out[:, 1])
+        sos_lm = signal.butter(4, cut, btype="highpass", fs=sample_rate, output="sos")
+        s = _safe_sosfiltfilt(sos_lm, s)
+        out = np.column_stack([m + s, m - s])
+
+    eff_bal = float(globals_cfg["effective_balance_db"])
+    if abs(eff_bal) > 1e-4:
+        g_l = 10.0 ** ((0.5 * eff_bal) / 20.0)
+        g_r = 10.0 ** ((-0.5 * eff_bal) / 20.0)
+        out[:, 0] *= g_l
+        out[:, 1] *= g_r
+    return out
+
+
+def _spatial_mix_with_info(
+    audio: np.ndarray,
+    sample_rate: int,
+    mode: str = "lr_adjust",
+    side_gain_db: float = 0.0,
+    directional_weight: float = 0.5,
+    directional_channel: int = 0,
+    crossover_hz: float = 0.0,
+    align_delay: bool = True,
+    low_mono_hz: float = 0.0,
+    side_hpf_hz: float = 0.0,
+    balance_db: float = 0.0,
+    auto_balance: bool = False,
+    decorrelate_ms: float = 0.0,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    arr = ensure_2d_audio(audio)
+    globals_cfg = _resolve_spatial_mix_globals(
+        arr,
+        sample_rate,
+        mode=mode,
+        directional_channel=directional_channel,
+        align_delay=align_delay,
+        crossover_hz=crossover_hz,
+        auto_balance=auto_balance,
+        balance_db=balance_db,
+        decorrelate_ms=decorrelate_ms,
+    )
+    out = _apply_spatial_mix_chunk(
+        arr,
+        sample_rate,
+        globals_cfg,
+        side_gain_db=side_gain_db,
+        directional_weight=directional_weight,
+        directional_channel=directional_channel,
+        crossover_hz=crossover_hz,
+        low_mono_hz=low_mono_hz,
+        side_hpf_hz=side_hpf_hz,
+        decorrelate_ms=decorrelate_ms,
+    )
+    return out, globals_cfg
+
+
+def _spatial_mix(
+    audio: np.ndarray,
+    sample_rate: int,
+    mode: str = "lr_adjust",
+    side_gain_db: float = 0.0,
+    directional_weight: float = 0.5,
+    directional_channel: int = 0,
+    crossover_hz: float = 0.0,
+    align_delay: bool = True,
+    low_mono_hz: float = 0.0,
+    side_hpf_hz: float = 0.0,
+    balance_db: float = 0.0,
+    auto_balance: bool = False,
+    decorrelate_ms: float = 0.0,
+) -> np.ndarray:
+    out, _ = _spatial_mix_with_info(
+        audio,
+        sample_rate,
+        mode=mode,
+        side_gain_db=side_gain_db,
+        directional_weight=directional_weight,
+        directional_channel=directional_channel,
+        crossover_hz=crossover_hz,
+        align_delay=align_delay,
+        low_mono_hz=low_mono_hz,
+        side_hpf_hz=side_hpf_hz,
+        balance_db=balance_db,
+        auto_balance=auto_balance,
+        decorrelate_ms=decorrelate_ms,
+    )
+    return out
+
+
+def _resolve_harmonic_track_spans(
+    duration_s: float,
+    sample_rate: int,
+    start_s: float | None,
+    end_s: float | None,
+    f0_min_hz: float,
+    f0_max_hz: float,
+    max_harmonics: int,
+    bandwidth_hz: float,
+    strength: float,
+    max_attenuation_db: float,
+    broadband_assist: float,
+    spatial_bias: bool,
+    protect_birds: bool,
+    texture_fill: float,
+    context_s: float,
+    context_gap_s: float,
+    fade_ms: float,
+    n_fft: int,
+    spans: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    raw_list = (
+        spans
+        if spans
+        else (
+            [{"start_s": start_s, "end_s": end_s}]
+            if start_s is not None and end_s is not None
+            else ([{"start_s": 0.0, "end_s": duration_s}] if duration_s > 0.0 else [])
+        )
+    )
+    resolved: list[dict[str, Any]] = []
+    for item in raw_list:
+        s_t = max(0.0, float(item["start_s"]))
+        e_t = min(duration_s, float(item["end_s"]))
+        if e_t <= s_t:
+            continue
+        f_lo = max(30.0, float(item.get("f0_min_hz", f0_min_hz)))
+        f_hi_max = min(
+            sample_rate * 0.45, max(1000.0, float(item.get("f0_max_hz", f0_max_hz)) * 12.0)
+        )
+        resolved.append(
+            {
+                "start_s": s_t,
+                "end_s": e_t,
+                "low_hz": f_lo,
+                "high_hz": f_hi_max,
+                "f0_min_hz": f_lo,
+                "f0_max_hz": max(f_lo + 10.0, float(item.get("f0_max_hz", f0_max_hz))),
+                "max_harmonics": max(3, min(20, int(item.get("max_harmonics", max_harmonics)))),
+                "bandwidth_hz": max(6.0, min(60.0, float(item.get("bandwidth_hz", bandwidth_hz)))),
+                "strength": max(0.1, min(1.5, float(item.get("strength", strength)))),
+                "max_attenuation_db": max(
+                    -60.0, min(-3.0, float(item.get("max_attenuation_db", max_attenuation_db)))
+                ),
+                "broadband_assist": max(
+                    0.0, min(1.0, float(item.get("broadband_assist", broadband_assist)))
+                ),
+                "spatial_bias": bool(item.get("spatial_bias", spatial_bias)),
+                "protect_birds": bool(item.get("protect_birds", protect_birds)),
+                "texture_fill": max(0.0, min(1.0, float(item.get("texture_fill", texture_fill)))),
+                "context_s": max(1.0, min(20.0, float(item.get("context_s", context_s)))),
+                "context_gap_s": max(
+                    0.0, min(15.0, float(item.get("context_gap_s", context_gap_s)))
+                ),
+                "fade_ms": max(20.0, min(5000.0, float(item.get("fade_ms", fade_ms)))),
+                "n_fft": max(1024, min(8192, int(item.get("n_fft", n_fft)))),
+            }
+        )
+    return resolved
+
+
+def _harmonic_track_suppress_with_info(
+    audio: np.ndarray,
+    sample_rate: int,
+    start_s: float | None = None,
+    end_s: float | None = None,
+    f0_min_hz: float = 55.0,
+    f0_max_hz: float = 300.0,
+    max_harmonics: int = 12,
+    bandwidth_hz: float = 18.0,
+    strength: float = 1.0,
+    max_attenuation_db: float = -28.0,
+    broadband_assist: float = 0.35,
+    spatial_bias: bool = True,
+    protect_birds: bool = True,
+    texture_fill: float = 0.55,
+    context_s: float = 6.0,
+    context_gap_s: float = 1.5,
+    fade_ms: float = 1000.0,
+    n_fft: int = 4096,
+    spans: list[dict[str, Any]] | None = None,
+) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    dur_s = audio.shape[0] / float(max(sample_rate, 1))
+    resolved = _resolve_harmonic_track_spans(
+        dur_s,
+        sample_rate,
+        start_s,
+        end_s,
+        f0_min_hz,
+        f0_max_hz,
+        max_harmonics,
+        bandwidth_hz,
+        strength,
+        max_attenuation_db,
+        broadband_assist,
+        spatial_bias,
+        protect_birds,
+        texture_fill,
+        context_s,
+        context_gap_s,
+        fade_ms,
+        n_fft,
+        spans,
+    )
+    if not resolved:
+        return audio.copy(), []
+    return apply_masked_stft_transform(audio, sample_rate, resolved, mode="harmonic_comb")
+
+
+def _harmonic_track_suppress(
+    audio: np.ndarray,
+    sample_rate: int,
+    start_s: float | None = None,
+    end_s: float | None = None,
+    f0_min_hz: float = 55.0,
+    f0_max_hz: float = 300.0,
+    max_harmonics: int = 12,
+    bandwidth_hz: float = 18.0,
+    strength: float = 1.0,
+    max_attenuation_db: float = -28.0,
+    broadband_assist: float = 0.35,
+    spatial_bias: bool = True,
+    protect_birds: bool = True,
+    texture_fill: float = 0.55,
+    context_s: float = 6.0,
+    context_gap_s: float = 1.5,
+    fade_ms: float = 1000.0,
+    n_fft: int = 4096,
+    spans: list[dict[str, Any]] | None = None,
+) -> np.ndarray:
+    out, _ = _harmonic_track_suppress_with_info(
+        audio,
+        sample_rate,
+        start_s=start_s,
+        end_s=end_s,
+        f0_min_hz=f0_min_hz,
+        f0_max_hz=f0_max_hz,
+        max_harmonics=max_harmonics,
+        bandwidth_hz=bandwidth_hz,
+        strength=strength,
+        max_attenuation_db=max_attenuation_db,
+        broadband_assist=broadband_assist,
+        spatial_bias=spatial_bias,
+        protect_birds=protect_birds,
+        texture_fill=texture_fill,
+        context_s=context_s,
+        context_gap_s=context_gap_s,
+        fade_ms=fade_ms,
+        n_fft=n_fft,
+        spans=spans,
+    )
+    return out
+
+
+def _resolve_distance_soften_spans(
+    duration_s: float,
+    sample_rate: int,
+    start_s: float | None,
+    end_s: float | None,
+    mode: str,
+    low_hz: float,
+    high_hz: float,
+    attenuation_db: float,
+    air_absorption: float,
+    attack_smear_ms: float,
+    formant_blur: float,
+    narrow_stereo: float,
+    protect_birds: bool,
+    context_s: float,
+    context_gap_s: float,
+    fade_ms: float,
+    n_fft: int,
+    spans: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    raw_list = (
+        spans
+        if spans
+        else (
+            [{"start_s": start_s, "end_s": end_s}]
+            if start_s is not None and end_s is not None
+            else ([{"start_s": 0.0, "end_s": duration_s}] if duration_s > 0.0 else [])
+        )
+    )
+    nyq = sample_rate * 0.5
+    resolved: list[dict[str, Any]] = []
+    for item in raw_list:
+        s_t = max(0.0, float(item["start_s"]))
+        e_t = min(duration_s, float(item["end_s"]))
+        if e_t <= s_t:
+            continue
+        m_mode = str(item.get("mode", mode)).strip().lower()
+        def_lo = 220.0 if m_mode == "voice_muffle" and "low_hz" not in item else low_hz
+        def_hi = 3500.0 if m_mode == "voice_muffle" and "high_hz" not in item else high_hz
+        f_lo = max(20.0, float(item.get("low_hz", def_lo)))
+        f_hi = max(f_lo + 40.0, min(nyq, float(item.get("high_hz", def_hi))))
+        resolved.append(
+            {
+                "start_s": s_t,
+                "end_s": e_t,
+                "mode": m_mode,
+                "low_hz": f_lo,
+                "high_hz": f_hi,
+                "max_attenuation_db": max(
+                    -36.0, min(-2.0, float(item.get("attenuation_db", attenuation_db)))
+                ),
+                "air_absorption": max(
+                    0.0, min(1.0, float(item.get("air_absorption", air_absorption)))
+                ),
+                "attack_smear_ms": max(
+                    0.0, min(30.0, float(item.get("attack_smear_ms", attack_smear_ms)))
+                ),
+                "formant_blur": max(0.0, min(1.0, float(item.get("formant_blur", formant_blur)))),
+                "narrow_stereo": max(
+                    0.0, min(1.0, float(item.get("narrow_stereo", narrow_stereo)))
+                ),
+                "protect_birds": bool(item.get("protect_birds", protect_birds)),
+                "context_s": max(1.0, min(20.0, float(item.get("context_s", context_s)))),
+                "context_gap_s": max(
+                    0.0, min(15.0, float(item.get("context_gap_s", context_gap_s)))
+                ),
+                "fade_ms": max(20.0, min(5000.0, float(item.get("fade_ms", fade_ms)))),
+                "n_fft": max(512, min(8192, int(item.get("n_fft", n_fft)))),
+                "texture_fill": 0.0,
+            }
+        )
+    return resolved
+
+
+def _distance_soften_with_info(
+    audio: np.ndarray,
+    sample_rate: int,
+    start_s: float | None = None,
+    end_s: float | None = None,
+    mode: str = "distance",
+    low_hz: float = 150.0,
+    high_hz: float = 6000.0,
+    attenuation_db: float = -14.0,
+    air_absorption: float = 0.65,
+    attack_smear_ms: float = 12.0,
+    formant_blur: float = 0.5,
+    narrow_stereo: float = 0.35,
+    protect_birds: bool = True,
+    context_s: float = 6.0,
+    context_gap_s: float = 1.5,
+    fade_ms: float = 500.0,
+    n_fft: int = 2048,
+    spans: list[dict[str, Any]] | None = None,
+) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    dur_s = audio.shape[0] / float(max(sample_rate, 1))
+    resolved = _resolve_distance_soften_spans(
+        dur_s,
+        sample_rate,
+        start_s,
+        end_s,
+        mode,
+        low_hz,
+        high_hz,
+        attenuation_db,
+        air_absorption,
+        attack_smear_ms,
+        formant_blur,
+        narrow_stereo,
+        protect_birds,
+        context_s,
+        context_gap_s,
+        fade_ms,
+        n_fft,
+        spans,
+    )
+    if not resolved:
+        return audio.copy(), []
+    return apply_masked_stft_transform(audio, sample_rate, resolved, mode="distance_soften")
+
+
+def _distance_soften(
+    audio: np.ndarray,
+    sample_rate: int,
+    start_s: float | None = None,
+    end_s: float | None = None,
+    mode: str = "distance",
+    low_hz: float = 150.0,
+    high_hz: float = 6000.0,
+    attenuation_db: float = -14.0,
+    air_absorption: float = 0.65,
+    attack_smear_ms: float = 12.0,
+    formant_blur: float = 0.5,
+    narrow_stereo: float = 0.35,
+    protect_birds: bool = True,
+    context_s: float = 6.0,
+    context_gap_s: float = 1.5,
+    fade_ms: float = 500.0,
+    n_fft: int = 2048,
+    spans: list[dict[str, Any]] | None = None,
+) -> np.ndarray:
+    out, _ = _distance_soften_with_info(
+        audio,
+        sample_rate,
+        start_s=start_s,
+        end_s=end_s,
+        mode=mode,
+        low_hz=low_hz,
+        high_hz=high_hz,
+        attenuation_db=attenuation_db,
+        air_absorption=air_absorption,
+        attack_smear_ms=attack_smear_ms,
+        formant_blur=formant_blur,
+        narrow_stereo=narrow_stereo,
+        protect_birds=protect_birds,
+        context_s=context_s,
+        context_gap_s=context_gap_s,
+        fade_ms=fade_ms,
+        n_fft=n_fft,
+        spans=spans,
+    )
+    return out
+
+
+def _bed_shape(
+    audio: np.ndarray,
+    sample_rate: int,
+    sub_rumble_cut_db: float = -6.0,
+    harshness_dip_db: float = -3.0,
+    warmth_tilt_db: float = -1.5,
+    floor_preserve: float = 0.85,
+    bed_width_boost: float = 0.0,
+    deharsh_dynamic: bool = True,
+    protect_birds: bool = True,
+    n_fft: int = 2048,
+) -> np.ndarray:
+    """Reshape slow stationary background bed toward a warmer psychoacoustic slope."""
+    arr = ensure_2d_audio(audio)
+    n_samples, n_ch = arr.shape
+    if n_samples < 64:
+        return arr.copy()
+
+    freqs, times, z_list, nperseg, noverlap = _stft_channels(arr, sample_rate, n_fft)
+    mag_mean = np.sqrt(np.maximum(np.mean([np.abs(z) ** 2 for z in z_list], axis=0), 1e-24))
+    dt = float(times[1] - times[0]) if times.size > 1 else 0.02
+
+    k_pre = max(3, int(round(0.45 / max(dt, 1e-4))))
+    k_win = max(5, int(round(4.0 / max(dt, 1e-4))))
+    k_post = max(3, int(round(1.5 / max(dt, 1e-4))))
+    mag_sm = ndimage.uniform_filter1d(mag_mean, size=k_pre, axis=1, mode="nearest")
+    bed_min = ndimage.grey_erosion(mag_sm, size=(1, min(k_win, mag_mean.shape[1])))
+    bed_lin = ndimage.uniform_filter1d(
+        bed_min, size=min(k_post, mag_mean.shape[1]), axis=1, mode="nearest"
+    )
+
+    w_bed = np.clip(bed_lin / (mag_mean + 1e-12), 0.0, 1.0) ** 2
+    if protect_birds:
+        bird_mask = compute_bird_protect_mask(freqs, times, mag_mean)
+        w_bed = w_bed * (1.0 - 0.90 * bird_mask)
+
+    sub_cut = max(-24.0, min(0.0, float(sub_rumble_cut_db)))
+    w_sub = np.clip((110.0 - freqs) / 60.0, 0.0, 1.0)
+    curve_db = sub_cut * w_sub
+
+    tilt = max(-6.0, min(6.0, float(warmth_tilt_db)))
+    oct_offset = np.log2(np.maximum(freqs, 40.0) / 600.0)
+    tilt_w = np.clip((freqs - 80.0) / 100.0, 0.0, 1.0) * np.exp(
+        -np.maximum(0.0, freqs - 10000.0) / 6000.0
+    )
+    curve_db = curve_db + tilt * np.clip(oct_offset, -1.5, 2.5) * 0.45 * tilt_w
+
+    harsh_dip = max(-12.0, min(0.0, float(harshness_dip_db)))
+    bell_harsh = np.exp(-0.5 * ((freqs - 3200.0) / 1100.0) ** 2)
+    if deharsh_dynamic and np.any((freqs >= 2000.0) & (freqs <= 5000.0)):
+        m_hi = (freqs >= 2000.0) & (freqs <= 5000.0)
+        m_mid = (freqs >= 300.0) & (freqs <= 1000.0)
+        e_hi = float(np.mean(bed_lin[m_hi] ** 2)) + 1e-24
+        e_mid = float(np.mean(bed_lin[m_mid] ** 2)) + 1e-24
+        ratio_db = 10.0 * math.log10(e_hi / e_mid)
+        dyn_scale = max(0.35, min(1.35, 1.0 + (ratio_db + 8.0) / 12.0))
+        curve_db = curve_db + harsh_dip * dyn_scale * bell_harsh
+    else:
+        curve_db = curve_db + harsh_dip * bell_harsh
+
+    fp = max(0.3, min(1.0, float(floor_preserve)))
+    max_body_cut = -((1.0 - fp) * 24.0 + 3.0)
+    curve_db = np.where(freqs >= 100.0, np.maximum(curve_db, max_body_cut), curve_db)
+
+    applied_db = curve_db[:, np.newaxis] * w_bed
+    gain_2d = 10.0 ** (applied_db / 20.0)
+    z_out = [z * gain_2d for z in z_list]
+
+    wb = max(-0.5, min(0.5, float(bed_width_boost)))
+    if abs(wb) > 1e-4 and n_ch >= 2:
+        f_side_w = cosine_edge_mask(freqs, 250.0, 9000.0, 100.0)[:, np.newaxis]
+        mid_z = 0.5 * (z_out[0] + z_out[1])
+        side_z = 0.5 * (z_out[0] - z_out[1]) * (1.0 + wb * f_side_w * w_bed)
+        z_out[0] = mid_z + side_z
+        z_out[1] = mid_z - side_z
+
+    return _istft_channels(z_out, sample_rate, nperseg, noverlap, n_samples)
+
+
 _FILTER_HANDLERS = {
     "highpass_rumble": _highpass_rumble,
     "dehum_notch": _dehum_notch,
@@ -1973,6 +2965,11 @@ _FILTER_HANDLERS = {
     "soft_compress": _soft_compress,
     "true_peak_limiter": _true_peak_limiter,
     "loudness_normalize": _loudness_normalize,
+    "declip_from_backup": _declip_from_backup,
+    "spatial_mix": _spatial_mix,
+    "harmonic_track_suppress": _harmonic_track_suppress,
+    "distance_soften": _distance_soften,
+    "bed_shape": _bed_shape,
 }
 
 _LOCAL_STREAMABLE_FILTERS = {
@@ -1986,6 +2983,7 @@ _LOCAL_STREAMABLE_FILTERS = {
     "parametric_eq",
     "soft_compress",
     "true_peak_limiter",
+    "bed_shape",
 }
 
 
@@ -2032,6 +3030,7 @@ def apply_recipe_with_telemetry(
     sample_rate: int,
     steps: list[FilterStep] | list[dict[str, Any]],
     exclude_events: list[tuple[float, float]] | None = None,
+    head_pad_frames: int = 0,
 ) -> tuple[np.ndarray, list[StepTelemetry]]:
     """Apply FilterStep chain in memory and return per-step level + provenance telemetry."""
     sr = int(sample_rate)
@@ -2062,6 +3061,20 @@ def apply_recipe_with_telemetry(
         elif step.filter_name == "spectral_match_suppress":
             out, sup_log = _spectral_match_suppress_with_info(out, sr, **step.params)
             details = {"suppressed_spans": sup_log}
+        elif step.filter_name == "harmonic_track_suppress":
+            out, track_log = _harmonic_track_suppress_with_info(out, sr, **step.params)
+            details = {"tracked_spans": track_log}
+        elif step.filter_name == "distance_soften":
+            out, dist_log = _distance_soften_with_info(out, sr, **step.params)
+            details = {"softened_spans": dist_log}
+        elif step.filter_name == "declip_from_backup":
+            out, dc_info = _declip_from_backup_with_info(
+                out, sr, **step.params, head_pad_frames=head_pad_frames
+            )
+            details = dc_info
+        elif step.filter_name == "spatial_mix":
+            out, sp_info = _spatial_mix_with_info(out, sr, **step.params)
+            details = sp_info
         elif step.filter_name == "loudness_normalize":
             out, norm_info = _loudness_normalize_with_info(out, sr, **step.params)
             details = norm_info
@@ -2093,7 +3106,14 @@ def apply_recipe_with_telemetry(
 def _shift_step_times(step: FilterStep, offset_s: float) -> FilterStep:
     """Shift time-based parameters on streamable steps relative to a chunk buffer start."""
     params = copy.deepcopy(step.params)
-    if step.filter_name in {"band_attenuate", "ambience_patch", "spectral_match_suppress"}:
+    if step.filter_name in {
+        "band_attenuate",
+        "ambience_patch",
+        "spectral_match_suppress",
+        "harmonic_track_suppress",
+        "distance_soften",
+        "declick_impulse",
+    }:
         for key in ("start_s", "end_s", "source_start_s", "ref_start_s", "ref_end_s"):
             if params.get(key) is not None:
                 params[key] = float(params[key]) - offset_s
@@ -2132,9 +3152,6 @@ def _adjust_span_telemetry(
                 entry[key] = round(max(0.0, float(entry[key]) - head_pad_s), 3)
         adjusted.append(entry)
     return adjusted
-
-
-_adjust_patched_spans = _adjust_span_telemetry
 
 
 def _prepare_seam_context(
@@ -2251,14 +3268,24 @@ def apply_recipe_with_seam_padding(
         else exclude_events
     )
     processed, telemetry = apply_recipe_with_telemetry(
-        padded, sr, working_steps, exclude_events=shifted_ev
+        padded,
+        sr,
+        working_steps,
+        exclude_events=shifted_ev,
+        head_pad_frames=head_frames,
     )
     sliced = processed[head_frames : head_frames + orig_frames].copy()
 
     for idx, st_orig in enumerate(parsed):
         if idx < len(telemetry):
             telemetry[idx].params = copy.deepcopy(st_orig.params)
-            for det_key in ("patched_spans", "attenuated_spans", "suppressed_spans"):
+            for det_key in (
+                "patched_spans",
+                "attenuated_spans",
+                "suppressed_spans",
+                "tracked_spans",
+                "softened_spans",
+            ):
                 if det_key in telemetry[idx].details:
                     telemetry[idx].details[det_key] = _adjust_span_telemetry(
                         telemetry[idx].details[det_key], head_pad_s
@@ -2319,12 +3346,17 @@ def _stream_local_batch(
     total = info.frames
 
     max_fade_s = 0.0
+    has_bed_shape = False
     for st in steps:
         if st.filter_name == "band_attenuate":
             max_fade_s = max(max_fade_s, float(st.params.get("fade_ms", 30.0)) * 0.001)
             for sp in st.params.get("spans") or []:
                 max_fade_s = max(max_fade_s, float(sp.get("fade_ms", 30.0)) * 0.001)
+        elif st.filter_name == "bed_shape":
+            has_bed_shape = True
     pad_s = min(8.0, max(2.0, max_fade_s + 1.0))
+    if has_bed_shape:
+        pad_s = min(10.0, max(pad_s, 4.5))
 
     n_steps = len(steps)
     stage_sum_sq = [0.0] * (n_steps + 1)
@@ -2476,7 +3508,7 @@ def _stream_fade_edges(src_wav: Path, dst_wav: Path, params: dict[str, Any]) -> 
     total = info.frames
     fade_in_n = min(total, max(0, int(round(float(params.get("fade_in_s", 2.0)) * sr))))
     fade_out_n = min(total, max(0, int(round(float(params.get("fade_out_s", 3.0)) * sr))))
-    curve = str(params.get("curve", "cosine"))
+    curve = str(params.get("curve", "cosine")).strip().lower()
 
     with sf.SoundFile(
         str(dst_wav),
@@ -2669,25 +3701,31 @@ def _pick_streaming_donor_with_span(
     target_mid_frame: float | None = None,
     target_rms: float | None = None,
     stats_cache: tuple[int, np.ndarray, np.ndarray, np.ndarray] | None = None,
-) -> tuple[np.ndarray, float, float]:
+    min_donor_distance_s: float = 5.0,
+    max_donor_crest: float = 6.0,
+) -> tuple[np.ndarray, float, float, int, int]:
     """Locate an unrepeated, event-screened clean donor slice on disk with bounded RAM."""
     info = probe_audio(src_wav)
     sr = info.sample_rate
     ch = info.channels
     total = info.frames
     patch_margin = int(0.15 * sr)
+    dist_margin = max(patch_margin, int(max(0.0, float(min_donor_distance_s)) * sr))
     event_margin = int(5.0 * sr)
     win_frames = stats_cache[0] if stats_cache else max(64, int(round(0.25 * sr)))
     min_region = max(win_frames * 2, int(0.25 * sr))
 
     ex_patch = [(s - patch_margin, e + patch_margin) for s, e in exclude_spans]
+    ex_dist = [(s - dist_margin, e + dist_margin) for s, e in exclude_spans]
     ex_used = [(s - patch_margin, e + patch_margin) for s, e in (used_spans or [])]
     ex_events = [
         (int(round(es * sr)) - event_margin, int(round(ee * sr)) + event_margin)
         for es, ee in (exclude_events_s or [])
     ]
 
-    free_spans = _complement_sample_intervals(ex_patch + ex_used + ex_events, total, min_region)
+    free_spans = _complement_sample_intervals(ex_dist + ex_used + ex_events, total, min_region)
+    if not free_spans:
+        free_spans = _complement_sample_intervals(ex_patch + ex_used + ex_events, total, min_region)
     if not free_spans:
         free_spans = _complement_sample_intervals(ex_patch + ex_used, total, min_region)
     if not free_spans:
@@ -2697,11 +3735,14 @@ def _pick_streaming_donor_with_span(
         fb0, fb1 = (0, ex0) if ex0 >= (total - ex1) else (ex1, total)
         raw_fb = _read_exact_slice(src_wav, fb0, fb1 - fb0, sr)
         if raw_fb.shape[0] == 0:
-            return np.zeros((target_len, ch), dtype=np.float64), 0.0, 0.0
+            return np.zeros((target_len, ch), dtype=np.float64), 0.0, 0.0, 0, 1
+        tiled, loops = _build_tiled_donor_with_info(raw_fb, target_len, xfade)
         return (
-            _build_tiled_donor(raw_fb, target_len, xfade),
+            tiled,
             round(fb0 / float(sr), 3),
             round(fb1 / float(sr), 3),
+            loops,
+            1,
         )
 
     if stats_cache is None:
@@ -2717,7 +3758,16 @@ def _pick_streaming_donor_with_span(
     mid_f = float(target_mid_frame) if target_mid_frame is not None else 0.5 * total
 
     picked = _score_donor_windows_from_stats(
-        free_spans, win_frames, w_rms, w_pk, w_low, target_len, mid_f, ref_rms, sr
+        free_spans,
+        win_frames,
+        w_rms,
+        w_pk,
+        w_low,
+        target_len,
+        mid_f,
+        ref_rms,
+        sr,
+        max_donor_crest=max_donor_crest,
     )
     if picked is None:
         fs0, fs1 = free_spans[0]
@@ -2734,6 +3784,8 @@ def _pick_streaming_donor_with_span(
             exact,
             round(b0 / float(sr), 3),
             round((b0 + exact.shape[0]) / float(sr), 3),
+            0,
+            1,
         )
 
     chunks = [_read_exact_slice(src_wav, b0, b1 - b0, sr)]
@@ -2743,10 +3795,18 @@ def _pick_streaming_donor_with_span(
         local_used.append((b0, b1))
     while got < target_len:
         cur_free = _complement_sample_intervals(
-            ex_patch + [(s - patch_margin, e + patch_margin) for s, e in local_used] + ex_events,
+            ex_dist + [(s - patch_margin, e + patch_margin) for s, e in local_used] + ex_events,
             total,
             min_region,
         )
+        if not cur_free:
+            cur_free = _complement_sample_intervals(
+                ex_patch
+                + [(s - patch_margin, e + patch_margin) for s, e in local_used]
+                + ex_events,
+                total,
+                min_region,
+            )
         if not cur_free:
             cur_free = _complement_sample_intervals(
                 ex_patch + [(s - patch_margin, e + patch_margin) for s, e in local_used],
@@ -2756,7 +3816,16 @@ def _pick_streaming_donor_with_span(
         if not cur_free:
             break
         nxt = _score_donor_windows_from_stats(
-            cur_free, win_frames, w_rms, w_pk, w_low, target_len - got, mid_f, ref_rms, sr
+            cur_free,
+            win_frames,
+            w_rms,
+            w_pk,
+            w_low,
+            target_len - got,
+            mid_f,
+            ref_rms,
+            sr,
+            max_donor_crest=max_donor_crest,
         )
         if nxt is None:
             break
@@ -2770,19 +3839,8 @@ def _pick_streaming_donor_with_span(
             used_spans.append((nb0, nb1))
         got += seg.shape[0]
 
-    assembled = _stitch_non_repeating_chunks(chunks, target_len, xfade)
-    return assembled, round(b0 / float(sr), 3), round(b1 / float(sr), 3)
-
-
-def _pick_streaming_donor(
-    src_wav: Path,
-    exclude_spans: list[tuple[int, int]],
-    target_len: int,
-    xfade: int,
-) -> np.ndarray:
-    """Locate a clean donor slice on disk with bounded RAM using a streaming RMS scan."""
-    donor, _, _ = _pick_streaming_donor_with_span(src_wav, exclude_spans, target_len, xfade)
-    return donor
+    assembled, loops = _stitch_non_repeating_chunks(chunks, target_len, xfade)
+    return assembled, round(b0 / float(sr), 3), round(b1 / float(sr), 3), loops, len(chunks)
 
 
 def _stream_ambience_patch(
@@ -2797,6 +3855,8 @@ def _stream_ambience_patch(
     ch = info.channels
     total = info.frames
     default_xf_ms = float(params.get("crossfade_ms", 40.0))
+    min_donor_distance_s = float(params.get("min_donor_distance_s", 5.0))
+    max_donor_crest = float(params.get("max_donor_crest", 6.0))
 
     resolved = _resolve_patch_spans(
         total,
@@ -2839,16 +3899,17 @@ def _stream_ambience_patch(
             s_val = max(0.0, float(r["source_start_s"]))
             src_i0 = max(0, min(total - 1, int(round(s_val * sr))))
             raw_d = _read_exact_slice(src_wav, src_i0, min(patch_len, total - src_i0), sr)
-            donor = (
-                _build_tiled_donor(raw_d, patch_len, r["desired_xf"])
-                if raw_d.size
-                else np.zeros((patch_len, ch), dtype=np.float64)
-            )
+            if raw_d.size:
+                donor, loops = _build_tiled_donor_with_info(raw_d, patch_len, r["desired_xf"])
+            else:
+                donor = np.zeros((patch_len, ch), dtype=np.float64)
+                loops = 0
             donor_s0 = round(src_i0 / float(sr), 3)
             donor_s1 = round((src_i0 + raw_d.shape[0]) / float(sr), 3)
+            donor_chunks = 1
             src_mode = "manual"
         else:
-            donor, donor_s0, donor_s1 = _pick_streaming_donor_with_span(
+            donor, donor_s0, donor_s1, loops, donor_chunks = _pick_streaming_donor_with_span(
                 src_wav,
                 exclude_spans,
                 patch_len,
@@ -2858,6 +3919,8 @@ def _stream_ambience_patch(
                 target_mid_frame=0.5 * (p0 + p1),
                 target_rms=ctx_rms,
                 stats_cache=stats_cache,
+                min_donor_distance_s=min_donor_distance_s,
+                max_donor_crest=max_donor_crest,
             )
             src_mode = "auto"
 
@@ -2883,6 +3946,8 @@ def _stream_ambience_patch(
                     "donor_end_s": donor_s1,
                     "source_mode": src_mode,
                     "crossfade_ms": round(float(r.get("crossfade_ms", default_xf_ms)), 1),
+                    "loop_count": int(loops),
+                    "donor_chunks": int(donor_chunks),
                     "donor_quality": quality,
                 }
             )
@@ -2940,47 +4005,31 @@ def _stream_ambience_patch(
                 fout.write(c)
 
 
-def _stream_spectral_match_suppress(
+def _stream_window_masked_transform(
     src_wav: Path,
     dst_wav: Path,
-    params: dict[str, Any],
-    sup_log_out: list[dict[str, Any]] | None = None,
+    resolved: list[dict[str, Any]],
+    mode: str,
+    log_out: list[dict[str, Any]] | None = None,
 ) -> None:
-    """Stream per-span adaptive spectral excess suppression on bounded window buffers."""
-    info = probe_audio(src_wav)
-    sr = info.sample_rate
-    ch = info.channels
-    total = info.frames
-    dur_s = info.duration_s
-
-    resolved = _resolve_match_suppress_spans(
-        dur_s,
-        sr,
-        params.get("start_s"),
-        params.get("end_s"),
-        float(params.get("low_hz", 25.0)),
-        float(params.get("high_hz", 4000.0)),
-        float(params.get("strength", 1.0)),
-        float(params.get("max_attenuation_db", -32.0)),
-        float(params.get("texture_fill", 0.65)),
-        float(params.get("context_s", 6.0)),
-        float(params.get("fade_ms", 1500.0)),
-        int(params.get("n_fft", 4096)),
-        params.get("ref_start_s"),
-        params.get("ref_end_s"),
-        params.get("spans"),
-    )
+    """Stream any unified masked STFT transform across bounded window buffers."""
     if not resolved:
         shutil.copy2(src_wav, dst_wav)
         return
 
-    resolved.sort(key=lambda sp: sp["start_s"])
+    info = probe_audio(src_wav)
+    sr = info.sample_rate
+    ch = info.channels
+    total = info.frames
+
+    resolved_sorted = sorted(resolved, key=lambda sp: sp["start_s"])
     span_items: list[dict[str, Any]] = []
-    for sp in resolved:
-        fade_s = sp["fade_ms"] * 0.001
-        fft_s = sp["n_fft"] / float(max(sr, 1))
-        act_pad = fade_s + fft_s
-        win_pad = max(act_pad, fade_s + sp["context_s"] + 1.0)
+    for sp in resolved_sorted:
+        fade_s = float(sp.get("fade_ms", 1000.0)) * 0.001
+        fft_s = int(sp.get("n_fft", 2048)) / float(max(sr, 1))
+        gap_s = float(sp.get("context_gap_s", 0.0))
+        act_pad = fade_s + fft_s + 0.1
+        win_pad = max(act_pad, fade_s + float(sp.get("context_s", 6.0)) + gap_s + 1.0)
         act0 = max(0, int(math.floor((sp["start_s"] - act_pad) * sr)))
         act1 = min(total, int(math.ceil((sp["end_s"] + act_pad) * sr)))
         if act1 <= act0:
@@ -3074,20 +4123,24 @@ def _stream_spectral_match_suppress(
                     sh_sp["ref_end_s"] = None
                 shifted_grp.append(sh_sp)
 
-            proc_win, grp_logs = _suppress_window_stft(
-                win_buf, sr, shifted_grp, ref_overrides=ref_overrides or None
+            proc_win, grp_logs = apply_masked_stft_transform(
+                win_buf,
+                sr,
+                shifted_grp,
+                ref_overrides=ref_overrides or None,
+                mode=mode,
             )
             sl0 = max(0, g_act0 - g_win0)
             sl1 = min(proc_win.shape[0], g_act1 - g_win0)
             if sl1 > sl0:
                 fout.write(proc_win[sl0:sl1])
             cursor = max(cursor, g_act1)
-            if sup_log_out is not None:
+            if log_out is not None:
                 for entry in grp_logs:
                     e_copy = dict(entry)
                     e_copy["start_s"] = round(float(e_copy["start_s"]) + win0_s, 3)
                     e_copy["end_s"] = round(float(e_copy["end_s"]) + win0_s, 3)
-                    sup_log_out.append(e_copy)
+                    log_out.append(e_copy)
 
         if cursor < total:
             fin.seek(cursor)
@@ -3096,6 +4149,421 @@ def _stream_spectral_match_suppress(
                 if c.size == 0:
                     break
                 fout.write(c)
+
+
+def _stream_spectral_match_suppress(
+    src_wav: Path,
+    dst_wav: Path,
+    params: dict[str, Any],
+    sup_log_out: list[dict[str, Any]] | None = None,
+) -> None:
+    """Stream per-span adaptive spectral excess suppression on bounded window buffers."""
+    info = probe_audio(src_wav)
+    resolved = _resolve_match_suppress_spans(
+        info.duration_s,
+        info.sample_rate,
+        params.get("start_s"),
+        params.get("end_s"),
+        float(params.get("low_hz", 25.0)),
+        float(params.get("high_hz", 4000.0)),
+        float(params.get("strength", 1.0)),
+        float(params.get("max_attenuation_db", -32.0)),
+        float(params.get("texture_fill", 0.65)),
+        float(params.get("context_s", 6.0)),
+        float(params.get("context_gap_s", 1.5)),
+        float(params.get("fade_ms", 1500.0)),
+        int(params.get("n_fft", 4096)),
+        params.get("ref_start_s"),
+        params.get("ref_end_s"),
+        bool(params.get("protect_birds", False)),
+        str(params.get("spatial_mode", "linked")),
+        bool(params.get("narrowband_mode", False)),
+        params.get("spans"),
+    )
+    _stream_window_masked_transform(
+        src_wav, dst_wav, resolved, mode="spectral_match", log_out=sup_log_out
+    )
+
+
+def _tile_long_spans(
+    resolved: list[dict[str, Any]], max_span_s: float = 45.0
+) -> list[dict[str, Any]]:
+    """Split oversized whole-file spans so streaming STFT windows stay RAM-bounded."""
+    tiled: list[dict[str, Any]] = []
+    for sp in resolved:
+        s0 = float(sp["start_s"])
+        s1 = float(sp["end_s"])
+        if (s1 - s0) <= max_span_s:
+            tiled.append(sp)
+            continue
+        cur = s0
+        while cur < s1 - 1e-6:
+            nxt = min(s1, cur + max_span_s)
+            part = dict(sp)
+            part["start_s"] = cur
+            part["end_s"] = nxt
+            tiled.append(part)
+            cur = nxt
+    return tiled
+
+
+def _stream_harmonic_track_suppress(
+    src_wav: Path,
+    dst_wav: Path,
+    params: dict[str, Any],
+    log_out: list[dict[str, Any]] | None = None,
+) -> None:
+    """Stream variable-RPM harmonic comb suppression across bounded window buffers."""
+    info = probe_audio(src_wav)
+    resolved = _resolve_harmonic_track_spans(
+        info.duration_s,
+        info.sample_rate,
+        params.get("start_s"),
+        params.get("end_s"),
+        float(params.get("f0_min_hz", 55.0)),
+        float(params.get("f0_max_hz", 300.0)),
+        int(params.get("max_harmonics", 12)),
+        float(params.get("bandwidth_hz", 18.0)),
+        float(params.get("strength", 1.0)),
+        float(params.get("max_attenuation_db", -28.0)),
+        float(params.get("broadband_assist", 0.35)),
+        bool(params.get("spatial_bias", True)),
+        bool(params.get("protect_birds", True)),
+        float(params.get("texture_fill", 0.55)),
+        float(params.get("context_s", 6.0)),
+        float(params.get("context_gap_s", 1.5)),
+        float(params.get("fade_ms", 1000.0)),
+        int(params.get("n_fft", 4096)),
+        params.get("spans"),
+    )
+    _stream_window_masked_transform(
+        src_wav,
+        dst_wav,
+        _tile_long_spans(resolved),
+        mode="harmonic_comb",
+        log_out=log_out,
+    )
+
+
+def _stream_distance_soften(
+    src_wav: Path,
+    dst_wav: Path,
+    params: dict[str, Any],
+    log_out: list[dict[str, Any]] | None = None,
+) -> None:
+    """Stream distance softening / voice muffling across bounded window buffers."""
+    info = probe_audio(src_wav)
+    resolved = _resolve_distance_soften_spans(
+        info.duration_s,
+        info.sample_rate,
+        params.get("start_s"),
+        params.get("end_s"),
+        str(params.get("mode", "distance")),
+        float(params.get("low_hz", 150.0)),
+        float(params.get("high_hz", 6000.0)),
+        float(params.get("attenuation_db", -14.0)),
+        float(params.get("air_absorption", 0.65)),
+        float(params.get("attack_smear_ms", 12.0)),
+        float(params.get("formant_blur", 0.5)),
+        float(params.get("narrow_stereo", 0.35)),
+        bool(params.get("protect_birds", True)),
+        float(params.get("context_s", 6.0)),
+        float(params.get("context_gap_s", 1.5)),
+        float(params.get("fade_ms", 500.0)),
+        int(params.get("n_fft", 2048)),
+        params.get("spans"),
+    )
+    _stream_window_masked_transform(
+        src_wav,
+        dst_wav,
+        _tile_long_spans(resolved),
+        mode="distance_soften",
+        log_out=log_out,
+    )
+
+
+def _stream_declip_from_backup(
+    src_wav: Path,
+    dst_wav: Path,
+    params: dict[str, Any],
+    info_out: dict[str, Any] | None = None,
+    head_pad_frames: int = 0,
+) -> None:
+    """Stream main-track declipping against a backup WAV in bounded RAM."""
+    info = probe_audio(src_wav)
+    sr = info.sample_rate
+    ch = info.channels
+    total = info.frames
+    b_path = Path(str(params["backup_audio_path"]))
+    if not b_path.exists():
+        raise FileNotFoundError(f"Backup audio file not found: {b_path}")
+    b_info = probe_audio(b_path)
+    if b_info.sample_rate != sr or b_info.channels != ch:
+        raise ValueError(
+            f"Backup format mismatch ({b_info.sample_rate}Hz/{b_info.channels}ch) "
+            f"vs main ({sr}Hz/{ch}ch)."
+        )
+
+    clip_threshold = float(params.get("clip_threshold", 0.985))
+    crossfade_ms = float(params.get("crossfade_ms", 2.0))
+    fir_taps = int(params.get("fir_taps", 31))
+    max_lag_ms = float(params.get("max_lag_ms", 250.0))
+    ar_fallback = bool(params.get("ar_fallback", True))
+
+    active_end = min(total, head_pad_frames + b_info.frames)
+    overlap_len = max(0, active_end - head_pad_frames)
+    if overlap_len < 32:
+        shutil.copy2(src_wav, dst_wav)
+        if info_out is not None:
+            info_out.update({"repaired_regions": 0, "repaired_samples": 0})
+        return
+
+    cal_len = min(int(60 * sr), overlap_len)
+    main_cal = _read_exact_slice(src_wav, head_pad_frames, cal_len, sr)
+    bk_cal = _read_exact_slice(b_path, 0, cal_len, sr)
+    lag_samples, coh = estimate_gcc_phat_lag(
+        main_cal[:, 0], bk_cal[:, 0], sr, max_lag_ms=max_lag_ms
+    )
+
+    cal_clip_2d = detect_clipping_mask(main_cal, threshold=clip_threshold)
+    any_cal_clip = np.any(cal_clip_2d, axis=1)
+    ch_coeffs: list[np.ndarray | None] = []
+    ch_gains: list[float] = []
+    gain_dbs: list[float] = []
+    null_dbs: list[float] = []
+    for c_idx in range(ch):
+        b_al = fractional_shift_channel(bk_cal[:, c_idx], -lag_samples)
+        valid_fit = (~any_cal_clip) & (np.abs(main_cal[:, c_idx]) > 1e-5)
+        if int(np.sum(valid_fit)) >= max(64, int(fir_taps) * 4):
+            coeffs, g_db, null_db = fit_least_squares_fir(
+                b_al,
+                main_cal[:, c_idx],
+                taps=fir_taps,
+                valid_mask=~cal_clip_2d[:, c_idx],
+            )
+            ch_coeffs.append(coeffs)
+            ch_gains.append(1.0)
+        else:
+            rms_m = float(np.sqrt(np.mean(main_cal[:, c_idx] ** 2))) + 1e-12
+            rms_b = float(np.sqrt(np.mean(b_al**2))) + 1e-12
+            g = max(0.05, min(20.0, rms_m / rms_b))
+            ch_coeffs.append(None)
+            ch_gains.append(g)
+            g_db = round(20.0 * math.log10(g), 3)
+            null_db = 0.0
+        gain_dbs.append(g_db)
+        null_dbs.append(null_db)
+
+    xf_n = max(1, int(round(max(0.2, crossfade_ms) * 0.001 * sr)))
+    pad_n = max(fir_taps * 4, int(0.05 * sr) + xf_n + 64)
+    lag_extra = int(math.ceil(abs(lag_samples))) + fir_taps + 32
+    block_frames = max(4096, sr * 30)
+
+    repaired_regions = 0
+    repaired_samples = 0
+    ar_fallback_regions = 0
+
+    with (
+        sf.SoundFile(str(src_wav), mode="r") as fin,
+        sf.SoundFile(
+            str(dst_wav),
+            mode="w",
+            samplerate=sr,
+            channels=ch,
+            subtype="FLOAT",
+            format=_STREAM_TEMP_FORMAT,
+        ) as fout,
+    ):
+        cursor = 0
+        if head_pad_frames > 0:
+            fin.seek(0)
+            rem = head_pad_frames
+            while rem > 0:
+                c = fin.read(min(block_frames, rem), always_2d=True, dtype="float64")
+                if c.size == 0:
+                    break
+                fout.write(c)
+                rem -= c.shape[0]
+            cursor = head_pad_frames
+
+        while cursor < active_end:
+            b0 = cursor
+            b1 = min(active_end, cursor + block_frames)
+            w0 = max(head_pad_frames, b0 - pad_n)
+            w1 = min(active_end, b1 + pad_n)
+            main_win = _read_exact_slice(src_wav, w0, w1 - w0, sr)
+            clip_win = detect_clipping_mask(main_win, threshold=clip_threshold)
+
+            chk0 = max(0, (b0 - w0) - xf_n)
+            chk1 = min(w1 - w0, (b1 - w0) + xf_n)
+            if not np.any(clip_win[chk0:chk1]):
+                fout.write(main_win[b0 - w0 : b1 - w0])
+                cursor = b1
+                continue
+
+            bk_target0 = w0 - head_pad_frames
+            bk_target1 = w1 - head_pad_frames
+            bk_r0 = max(0, bk_target0 - lag_extra)
+            bk_r1 = min(b_info.frames, bk_target1 + lag_extra)
+            bk_slice = _read_exact_slice(b_path, bk_r0, bk_r1 - bk_r0, sr)
+            win_len = w1 - w0
+            rep_win = main_win.copy()
+
+            for c_idx in range(ch):
+                shifted = fractional_shift_channel(bk_slice[:, c_idx], -lag_samples)
+                coeffs = ch_coeffs[c_idx]
+                if coeffs is not None:
+                    matched_raw = signal.fftconvolve(shifted, coeffs, mode="same")
+                else:
+                    matched_raw = shifted * ch_gains[c_idx]
+
+                # Map window indices [bk_target0 .. bk_target1) out of [bk_r0 .. bk_r1)
+                idx_grid = np.arange(bk_target0, bk_target1, dtype=np.int64) - bk_r0
+                in_b = (idx_grid >= 0) & (idx_grid < matched_raw.size)
+                b_matched_win = np.zeros(win_len, dtype=np.float64)
+                b_raw_aligned = np.zeros(win_len, dtype=np.float64)
+                b_matched_win[in_b] = matched_raw[idx_grid[in_b]]
+
+                raw_idx_grid = (
+                    np.arange(bk_target0, bk_target1, dtype=np.int64)
+                    + int(round(lag_samples))
+                    - bk_r0
+                )
+                in_raw = (raw_idx_grid >= 0) & (raw_idx_grid < bk_slice.shape[0])
+                b_raw_aligned[in_raw] = bk_slice[raw_idx_grid[in_raw], c_idx]
+
+                rep_c, reg_c, samp_c, ar_c = _repair_clipped_channel_slice(
+                    main_win[:, c_idx],
+                    b_matched_win,
+                    clip_win[:, c_idx],
+                    b_raw_aligned,
+                    0.0,
+                    sr,
+                    xf_n,
+                    ar_fallback,
+                    active_lo=b0 - w0,
+                    active_hi=b1 - w0,
+                )
+                rep_win[:, c_idx] = rep_c
+                repaired_regions += reg_c
+                repaired_samples += samp_c
+                ar_fallback_regions += ar_c
+
+            fout.write(rep_win[b0 - w0 : b1 - w0])
+            cursor = b1
+
+        if cursor < total:
+            fin.seek(cursor)
+            while True:
+                c = fin.read(block_frames, always_2d=True, dtype="float64")
+                if c.size == 0:
+                    break
+                fout.write(c)
+
+    if info_out is not None:
+        info_out.update(
+            {
+                "lag_samples": finite_or_none(lag_samples, digits=3) or 0.0,
+                "alignment_coherence": finite_or_none(coh, digits=3) or 0.0,
+                "fitted_gain_db": gain_dbs[0] if len(gain_dbs) == 1 else gain_dbs,
+                "fit_null_residual_db": null_dbs[0] if len(null_dbs) == 1 else null_dbs,
+                "repaired_regions": repaired_regions,
+                "repaired_samples": repaired_samples,
+                "ar_fallback_regions": ar_fallback_regions,
+            }
+        )
+
+
+def _stream_spatial_mix(
+    src_wav: Path,
+    dst_wav: Path,
+    params: dict[str, Any],
+    info_out: dict[str, Any] | None = None,
+) -> None:
+    """Stream deterministic M/S decode, directional blend, L/R balance, or mono stereoizer."""
+    info = probe_audio(src_wav)
+    sr = info.sample_rate
+    ch = info.channels
+    total = info.frames
+    if total < 32:
+        shutil.copy2(src_wav, dst_wav)
+        if info_out is not None:
+            info_out.update({"effective_mode": str(params.get("mode", "lr_adjust"))})
+        return
+
+    cal_len = min(int(45 * sr), total)
+    cal_start = max(0, (total - cal_len) // 2) if total > cal_len else 0
+    cal_audio = _read_exact_slice(src_wav, cal_start, cal_len, sr)
+
+    mode = str(params.get("mode", "lr_adjust"))
+    side_gain_db = float(params.get("side_gain_db", 0.0))
+    directional_weight = float(params.get("directional_weight", 0.5))
+    directional_channel = int(params.get("directional_channel", 0))
+    crossover_hz = float(params.get("crossover_hz", 0.0))
+    align_delay = bool(params.get("align_delay", True))
+    low_mono_hz = float(params.get("low_mono_hz", 0.0))
+    side_hpf_hz = float(params.get("side_hpf_hz", 0.0))
+    balance_db = float(params.get("balance_db", 0.0))
+    auto_balance = bool(params.get("auto_balance", False))
+    decorrelate_ms = float(params.get("decorrelate_ms", 0.0))
+
+    globals_cfg = _resolve_spatial_mix_globals(
+        cal_audio,
+        sr,
+        mode=mode,
+        directional_channel=directional_channel,
+        align_delay=align_delay,
+        crossover_hz=crossover_hz,
+        auto_balance=auto_balance,
+        balance_db=balance_db,
+        decorrelate_ms=decorrelate_ms,
+    )
+    out_ch = (
+        2
+        if (ch >= 2 or globals_cfg["effective_mode"] == "dual_mono_to_stereo")
+        else ch
+    )
+    pad_n = max(64, sr)
+    block_frames = max(4096, sr * 30)
+
+    with (
+        sf.SoundFile(str(src_wav), mode="r") as fin,
+        sf.SoundFile(
+            str(dst_wav),
+            mode="w",
+            samplerate=sr,
+            channels=out_ch,
+            subtype="FLOAT",
+            format=_STREAM_TEMP_FORMAT,
+        ) as fout,
+    ):
+        cursor = 0
+        while cursor < total:
+            b0 = cursor
+            b1 = min(total, cursor + block_frames)
+            w0 = max(0, b0 - pad_n)
+            w1 = min(total, b1 + pad_n)
+            fin.seek(w0)
+            win = fin.read(w1 - w0, always_2d=True, dtype="float64")
+            proc = _apply_spatial_mix_chunk(
+                win,
+                sr,
+                globals_cfg,
+                side_gain_db=side_gain_db,
+                directional_weight=directional_weight,
+                directional_channel=directional_channel,
+                crossover_hz=crossover_hz,
+                low_mono_hz=low_mono_hz,
+                side_hpf_hz=side_hpf_hz,
+                decorrelate_ms=decorrelate_ms,
+            )
+            sl0 = b0 - w0
+            sl1 = b1 - w0
+            fout.write(proc[sl0:sl1])
+            cursor = b1
+
+    if info_out is not None:
+        info_out.update(globals_cfg)
 
 
 def _probe_stream_lufs_tp(wav_path: Path) -> tuple[float | None, float]:
@@ -3154,10 +4622,10 @@ def _stream_loudness_normalize(
         if info_out is not None:
             info_out.update(
                 {
-                    "input_lufs": round(cur_lufs, 3),
-                    "output_lufs": round(out_lufs, 3),
-                    "target_lufs": round(target_lufs, 2),
-                    "applied_gain_db": round(applied_db, 3),
+                    "input_lufs": finite_or_none(cur_lufs, digits=3),
+                    "output_lufs": finite_or_none(out_lufs, digits=3),
+                    "target_lufs": finite_or_none(target_lufs, digits=2),
+                    "applied_gain_db": finite_or_none(applied_db, digits=3) or 0.0,
                     "peak_limited": False,
                 }
             )
@@ -3230,12 +4698,12 @@ def _stream_loudness_normalize(
     if info_out is not None:
         info_out.update(
             {
-                "input_lufs": round(cur_lufs, 3),
-                "output_lufs": round(lufs_1, 3) if lufs_1 is not None else None,
-                "target_lufs": round(target_lufs, 2),
-                "applied_gain_db": round(total_gain_db, 3),
+                "input_lufs": finite_or_none(cur_lufs, digits=3),
+                "output_lufs": finite_or_none(lufs_1, digits=3) if lufs_1 is not None else None,
+                "target_lufs": finite_or_none(target_lufs, digits=2),
+                "applied_gain_db": finite_or_none(total_gain_db, digits=3) or 0.0,
                 "peak_limited": True,
-                "ceiling_dbtp": round(ceiling_dbtp, 2),
+                "ceiling_dbtp": finite_or_none(ceiling_dbtp, digits=2),
             }
         )
 
@@ -3350,11 +4818,10 @@ def apply_recipe_streaming(
                 if telemetry_out is not None and batch_tele:
                     for k, bt in enumerate(batch_tele):
                         bt.params = copy.deepcopy(parsed[batch_base + k].params)
-                        for det_key in ("patched_spans", "attenuated_spans", "suppressed_spans"):
-                            if det_key in bt.details and head_pad_s > 0.0:
-                                bt.details[det_key] = _adjust_span_telemetry(
-                                    bt.details[det_key], head_pad_s
-                                )
+                        if "attenuated_spans" in bt.details and head_pad_s > 0.0:
+                            bt.details["attenuated_spans"] = _adjust_span_telemetry(
+                                bt.details["attenuated_spans"], head_pad_s
+                            )
                     telemetry_out.extend(batch_tele)
                     prev_levels = (
                         batch_tele[-1].output_rms_dbfs,
@@ -3396,6 +4863,32 @@ def apply_recipe_streaming(
                     cur_wav, next_wav, st.params, sup_log_out=sup_log
                 )
                 step_details = {"suppressed_spans": _adjust_span_telemetry(sup_log, head_pad_s)}
+            elif st.filter_name == "harmonic_track_suppress":
+                harm_log: list[dict[str, Any]] = []
+                _stream_harmonic_track_suppress(
+                    cur_wav, next_wav, st.params, log_out=harm_log
+                )
+                step_details = {"tracked_spans": _adjust_span_telemetry(harm_log, head_pad_s)}
+            elif st.filter_name == "distance_soften":
+                dist_log: list[dict[str, Any]] = []
+                _stream_distance_soften(
+                    cur_wav, next_wav, st.params, log_out=dist_log
+                )
+                step_details = {"softened_spans": _adjust_span_telemetry(dist_log, head_pad_s)}
+            elif st.filter_name == "declip_from_backup":
+                declip_info: dict[str, Any] = {}
+                _stream_declip_from_backup(
+                    cur_wav,
+                    next_wav,
+                    st.params,
+                    info_out=declip_info,
+                    head_pad_frames=head_frames,
+                )
+                step_details = declip_info
+            elif st.filter_name == "spatial_mix":
+                spatial_info: dict[str, Any] = {}
+                _stream_spatial_mix(cur_wav, next_wav, st.params, info_out=spatial_info)
+                step_details = spatial_info
             elif st.filter_name == "loudness_normalize":
                 norm_info: dict[str, Any] = {}
                 _stream_loudness_normalize(cur_wav, next_wav, st.params, info_out=norm_info)
@@ -3433,12 +4926,13 @@ def apply_recipe_streaming(
 
         # Materialize final output in requested subtype (slicing off any boundary padding)
         info = probe_audio(cur_wav)
+        out_ch = info.channels
         padded_run = head_frames > 0 or tail_frames > 0
         out_frames = (
             min(orig_info.frames, max(0, info.frames - head_frames)) if padded_run else info.frames
         )
         bytes_per_sample = 4 if subtype == "FLOAT" else 3
-        est_bytes = out_frames * ch * bytes_per_sample + 4096
+        est_bytes = out_frames * out_ch * bytes_per_sample + 4096
         out_format = "RF64" if est_bytes >= 3_800_000_000 else "WAV"
 
         if (
@@ -3457,7 +4951,7 @@ def apply_recipe_streaming(
                     str(dst),
                     mode="w",
                     samplerate=sr,
-                    channels=ch,
+                    channels=out_ch,
                     subtype=subtype,
                     format=out_format,
                 ) as fout,

@@ -25,6 +25,8 @@ from ambient_sound.analysis import (
 )
 from ambient_sound.config import Settings
 from ambient_sound.dsp import list_filter_specs
+from ambient_sound.engines import assess_do_no_harm
+from ambient_sound.jobs import JobManager
 from ambient_sound.models import AudioMetrics, DistractionEvent, TakeRecord
 from ambient_sound.session import STREAMING_THRESHOLD_S, SessionManager
 
@@ -59,6 +61,8 @@ def _compact_events_payload(
     max_events: int,
     include_events: bool,
     stored_counts: dict[str, int] | None = None,
+    include_clicks: bool | None = None,
+    source_offset_s: float = 0.0,
 ) -> dict[str, Any]:
     counts = stored_counts or event_kind_counts(events)
     if not include_events:
@@ -70,7 +74,10 @@ def _compact_events_payload(
                 total_filtered = sum(stored_counts.values())
         else:
             _, _, total_filtered, _ = summarize_events(
-                events, event_kinds=event_kinds, max_events=0
+                events,
+                event_kinds=event_kinds,
+                max_events=0,
+                include_clicks=include_clicks,
             )
         return {
             "event_counts": counts,
@@ -79,14 +86,35 @@ def _compact_events_payload(
             "events": [],
         }
     bounded, computed_counts, total_filtered, truncated = summarize_events(
-        events, event_kinds=event_kinds, max_events=max_events
+        events,
+        event_kinds=event_kinds,
+        max_events=max_events,
+        include_clicks=include_clicks,
     )
+    ev_dicts: list[dict[str, Any]] = []
+    off = float(source_offset_s or 0.0)
+    for ev in bounded:
+        d = ev.model_dump()
+        if off > 0.0:
+            d["parent_start_s"] = round(float(ev.start_s) + off, 3)
+            d["parent_end_s"] = round(float(ev.end_s) + off, 3)
+        ev_dicts.append(d)
     return {
         "event_counts": stored_counts or computed_counts,
         "events_total": total_filtered,
         "events_truncated": truncated,
-        "events": [e.model_dump() for e in bounded],
+        "events": ev_dicts,
     }
+
+
+def _format_job_payload(rec: Any, include_result: bool) -> dict[str, Any]:
+    data = rec.model_dump()
+    res = data.get("result")
+    data["has_result"] = res is not None
+    data["manifest_path"] = res.get("manifest_path") if isinstance(res, dict) else None
+    if not include_result:
+        data["result"] = None
+    return data
 
 
 def _clean_sections_for_take(
@@ -130,6 +158,24 @@ def _parse_sequence_pairs(sequence: list[dict[str, str]]) -> list[tuple[str, str
     return pairs
 
 
+def _resolve_sequence_or_session(
+    manager: SessionManager,
+    *,
+    session_id: str = "",
+    take_id: str = "",
+    sequence: list[dict[str, str]] | None = None,
+) -> list[tuple[str, str]]:
+    if sequence:
+        return _parse_sequence_pairs(sequence)
+    if session_id.strip():
+        summary = manager.get_session(session_id.strip())
+        resolved_tid = take_id.strip() or (
+            summary.takes[-1].take_id if summary.takes else "take_000"
+        )
+        return [(session_id.strip(), resolved_tid)]
+    return []
+
+
 def _format_take_payload(
     manager: SessionManager,
     take: TakeRecord,
@@ -138,7 +184,26 @@ def _format_take_payload(
     include_events: bool = True,
     source_label: str = "",
     compact_metrics: bool = False,
+    include_clicks: bool | None = None,
+    compact_takes: bool = False,
 ) -> dict[str, Any]:
+    if compact_takes:
+        data: dict[str, Any] = {
+            "take_id": take.take_id,
+            "session_id": take.session_id,
+            "label": take.label,
+            "parent_take_id": take.parent_take_id,
+            "created_at": take.created_at,
+            "audio_path": take.audio_path,
+            "spectrogram_path": take.spectrogram_path,
+            "diff_spectrogram_path": take.diff_spectrogram_path,
+            "source_offset_s": take.source_offset_s,
+            "timeline_modified": take.timeline_modified,
+            "metrics": _format_metrics(take.metrics, True),
+            "event_counts": dict(take.event_counts),
+        }
+        return data
+
     data = take.model_dump()
     if compact_metrics and isinstance(data.get("metrics"), dict):
         data["metrics"]["short_term_lufs_timeline"] = []
@@ -152,6 +217,8 @@ def _format_take_payload(
         max_events=max_events,
         include_events=include_events,
         stored_counts=take.event_counts or None,
+        include_clicks=include_clicks,
+        source_offset_s=take.source_offset_s,
     )
     data.update(compact)
     data["clean_sections"] = _clean_sections_for_take(
@@ -164,6 +231,7 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
     """Create and configure the AmbientSound MCPServer instance."""
     cfg = settings or Settings.from_env()
     manager = SessionManager(cfg)
+    job_manager = JobManager(cfg.workspace_dir)
     mcp = MCPServer("ambient-sound")
 
     @mcp.tool()
@@ -185,12 +253,25 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
             "streaming_threshold_s": STREAMING_THRESHOLD_S,
             "ui_base_url": cfg.ui_base_url,
             "filter_count": len(list_filter_specs()),
+            "tool_count": 26,
         }
 
     @mcp.tool()
     def list_filters() -> dict[str, Any]:
         """List all supported ambient restoration DSP filters and parameter schemas."""
-        return {"filters": list_filter_specs()}
+        specs = list_filter_specs()
+        return {
+            "filter_count": len(specs),
+            "filters": specs,
+            "step_schema": {
+                "filter_name": "str (one of the filter names above)",
+                "params": "dict[str, Any] (filter-specific parameters)",
+            },
+            "spans_precedence": (
+                "When 'spans' is non-empty, each span overrides top-level start_s/end_s "
+                "and inherits any omitted defaults from top-level params."
+            ),
+        }
 
     @mcp.tool()
     def create_session(
@@ -199,6 +280,7 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
         event_kinds: list[str] | None = None,
         max_events: int = 50,
         include_events: bool = True,
+        include_clicks: bool | None = None,
         copy_source: bool = True,
         compact_metrics: bool = False,
     ) -> dict[str, Any]:
@@ -216,6 +298,7 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
                     include_events=include_events,
                     source_label=src_label,
                     compact_metrics=compact_metrics,
+                    include_clicks=include_clicks,
                 )
                 for t in summary.takes
             ]
@@ -244,13 +327,21 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
         event_kinds: list[str] | None = None,
         max_events: int = 50,
         include_events: bool = True,
+        include_clicks: bool | None = None,
         compact_metrics: bool = False,
+        take_ids: list[str] | None = None,
+        compact_takes: bool = False,
     ) -> dict[str, Any]:
         """Return session metadata, takes, metrics, bounded events, and A/B tests."""
         with _mcp_errors():
             summary = manager.get_session(session_id)
             src_label = Path(summary.source_path).name if summary.source_path else summary.name
             payload = summary.model_dump()
+            selected = (
+                [t for t in summary.takes if t.take_id in set(take_ids)]
+                if take_ids
+                else summary.takes
+            )
             payload["takes"] = [
                 _format_take_payload(
                     manager,
@@ -260,8 +351,10 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
                     include_events=include_events,
                     source_label=src_label,
                     compact_metrics=compact_metrics,
+                    include_clicks=include_clicks,
+                    compact_takes=compact_takes,
                 )
-                for t in summary.takes
+                for t in selected
             ]
             return payload
 
@@ -276,9 +369,11 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
         event_kinds: list[str] | None = None,
         max_events: int = 50,
         include_events: bool = True,
+        include_clicks: bool | None = None,
         compact_metrics: bool = False,
+        compare_to_take_id: str | None = None,
     ) -> dict[str, Any]:
-        """Compute psychoacoustic metrics and configurable distraction events for a full take."""
+        """Compute psychoacoustic metrics, cleanliness gate, and distraction events for a take."""
         with _mcp_errors():
             summary = manager.get_session(session_id)
             take = manager.get_take(session_id, take_id)
@@ -292,13 +387,27 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
                 freq_range_hz=_parse_freq_range(freq_range_hz),
                 event_kinds=event_kinds,
             )
-            return {
+            out: dict[str, Any] = {
                 "session_id": session_id,
                 "take_id": take_id,
+                "source_offset_s": take.source_offset_s,
                 "metrics": _format_metrics(metrics, compact_metrics),
-                **_compact_events_payload(events, event_kinds, max_events, include_events),
+                **_compact_events_payload(
+                    events,
+                    event_kinds,
+                    max_events,
+                    include_events,
+                    include_clicks=include_clicks,
+                    source_offset_s=take.source_offset_s,
+                ),
+                "cleanliness_assessment": assess_do_no_harm(metrics, events),
                 "clean_sections": _clean_sections_for_take(take, src_label, events),
             }
+            if compare_to_take_id and compare_to_take_id.strip():
+                out["comparison"] = manager.compare_takes(
+                    session_id, take_id, compare_to_take_id.strip()
+                )
+            return out
 
     @mcp.tool()
     def analyze_region(
@@ -313,10 +422,13 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
         event_kinds: list[str] | None = None,
         max_events: int = 50,
         include_events: bool = True,
+        include_clicks: bool | None = None,
         compact_metrics: bool = False,
+        compare_to_take_id: str | None = None,
     ) -> dict[str, Any]:
         """Analyze a specific [start_s, end_s] time window with custom sensitivity & freq filter."""
         with _mcp_errors():
+            take = manager.get_take(session_id, take_id)
             metrics, events = manager.analyze_region(
                 session_id,
                 take_id,
@@ -328,13 +440,31 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
                 freq_range_hz=_parse_freq_range(freq_range_hz),
                 event_kinds=event_kinds,
             )
-            return {
+            out: dict[str, Any] = {
                 "session_id": session_id,
                 "take_id": take_id,
+                "source_offset_s": take.source_offset_s,
                 "window": {"start_s": start_s, "end_s": end_s},
                 "metrics": _format_metrics(metrics, compact_metrics),
-                **_compact_events_payload(events, event_kinds, max_events, include_events),
+                **_compact_events_payload(
+                    events,
+                    event_kinds,
+                    max_events,
+                    include_events,
+                    include_clicks=include_clicks,
+                    source_offset_s=take.source_offset_s,
+                ),
+                "cleanliness_assessment": assess_do_no_harm(metrics, events),
             }
+            if compare_to_take_id and compare_to_take_id.strip():
+                out["comparison"] = manager.compare_takes(
+                    session_id,
+                    take_id,
+                    compare_to_take_id.strip(),
+                    start_s=start_s,
+                    end_s=end_s,
+                )
+            return out
 
     @mcp.tool()
     def render_spectrogram(
@@ -364,6 +494,7 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
         event_kinds: list[str] | None = None,
         max_events: int = 50,
         include_events: bool = True,
+        include_clicks: bool | None = None,
         prev_audio_path: str | None = None,
         next_audio_path: str | None = None,
         seam_context_s: float = 8.0,
@@ -391,6 +522,7 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
                 include_events=include_events,
                 source_label=src_label,
                 compact_metrics=compact_metrics,
+                include_clicks=include_clicks,
             )
 
     @mcp.tool()
@@ -471,16 +603,17 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
         take_id: str,
         output_path: str,
         format: str = "wav",
-    ) -> dict[str, str]:
-        """Export a take to wav, flac, mp3, or ogg inside AMBIENTSOUND_ALLOWED_ROOTS."""
+        discard_take_audio: bool = False,
+    ) -> dict[str, Any]:
+        """Export a take with verified loudness/hash metadata and optional temp audio cleanup."""
         with _mcp_errors():
-            out = manager.export_take(session_id, take_id, output_path, audio_format=format)
-            return {
-                "session_id": session_id,
-                "take_id": take_id,
-                "format": format.lower(),
-                "output_path": str(out),
-            }
+            return manager.export_take_detailed(
+                session_id,
+                take_id,
+                output_path,
+                audio_format=format,
+                discard_take_audio=discard_take_audio,
+            )
 
     @mcp.tool()
     def find_clean_sections(
@@ -490,6 +623,7 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
         max_edits_per_hour: float = 2.0,
         max_edited_pct: float = 1.0,
         include_low_severity: bool = False,
+        round_to_file_local_minutes: bool = False,
     ) -> dict[str, Any]:
         """Rank clean ASMR stretches (15 min-10 hr) for a take or ordered sequence.
 
@@ -497,34 +631,34 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
         sequence accepts [{"session_id": ..., "take_id": ...}, ...].
         """
         with _mcp_errors():
-            pairs: list[tuple[str, str]] = []
-            if sequence:
-                pairs = _parse_sequence_pairs(sequence)
-            elif session_id.strip():
-                summary = manager.get_session(session_id.strip())
-                resolved_tid = take_id.strip() or (
-                    summary.takes[-1].take_id if summary.takes else "take_000"
-                )
-                pairs.append((session_id.strip(), resolved_tid))
+            pairs = _resolve_sequence_or_session(
+                manager, session_id=session_id, take_id=take_id, sequence=sequence
+            )
             return manager.find_clean_sections(
                 pairs,
                 max_edits_per_hour=max_edits_per_hour,
                 max_edited_pct=max_edited_pct,
                 include_low_severity=include_low_severity,
+                round_to_file_local_minutes=round_to_file_local_minutes,
             )
 
     @mcp.tool()
     def verify_seams(
         sequence: list[dict[str, str]],
         window_s: float = 10.0,
+        max_sample_step_excess_db: float = 18.0,
     ) -> dict[str, Any]:
-        """Measure LUFS, 2 s RMS, sample step, and spectral continuity across split seams.
+        """Measure LUFS, 2 s RMS, slew-normalized sample step, and spectral seam continuity.
 
         sequence accepts [{"session_id": ..., "take_id": ...}, ...].
         """
         with _mcp_errors():
             pairs = _parse_sequence_pairs(sequence)
-            return manager.verify_seams(pairs, window_s=window_s)
+            return manager.verify_seams(
+                pairs,
+                window_s=window_s,
+                max_sample_step_excess_db=max_sample_step_excess_db,
+            )
 
     @mcp.tool()
     def calibrate_sequence(
@@ -565,13 +699,22 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
         clean_sections: bool = True,
         export_format: str = "wav",
         discard_take_audio_after_export: bool = False,
+        max_sample_step_excess_db: float = 18.0,
+        output_dir: str | None = None,
+        compile_clean_targets: list[str] | None = None,
+        compile_clean_tiers: list[str] | None = None,
+        include_combined_full: bool = False,
+        clean_fade_in_s: float = 2.0,
+        clean_fade_out_s: float = 3.0,
+        filename_prefix: str = "",
     ) -> dict[str, Any]:
         """Batch-process an ordered split sequence with seam padding, export, and QC.
 
         Each entry in items accepts: {"session_id" (required), "parent_take_id" (default
         "take_000"), "local_steps" (list[FilterStep]), "label", "notes", "export_path"}.
-        Provide "export_path" inside AMBIENTSOUND_ALLOWED_ROOTS for every item to export
-        and/or when discard_take_audio_after_export=True.
+        When output_dir is given inside AMBIENTSOUND_ALLOWED_ROOTS, auto-exports full
+        masters to <output_dir>/<stem>_master.<ext> (unless export_path overrides it)
+        and optionally compiles clean_sections into <output_dir>/clean_sections/.
         """
         with _mcp_errors():
             return manager.process_sequence(
@@ -585,7 +728,199 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
                 clean_sections_flag=clean_sections,
                 export_format=export_format,
                 discard_take_audio_after_export=discard_take_audio_after_export,
+                max_sample_step_excess_db=max_sample_step_excess_db,
+                output_dir=output_dir,
+                compile_clean_targets=compile_clean_targets,
+                compile_clean_tiers=compile_clean_tiers,
+                include_combined_full=include_combined_full,
+                clean_fade_in_s=clean_fade_in_s,
+                clean_fade_out_s=clean_fade_out_s,
+                filename_prefix=filename_prefix,
             )
+
+    @mcp.tool()
+    def start_sequence_job(
+        items: list[dict[str, Any]],
+        shared_prefix_steps: list[dict[str, Any]] | None = None,
+        shared_suffix_steps: list[dict[str, Any]] | None = None,
+        outer_fade_in_s: float = 0.0,
+        outer_fade_out_s: float = 0.0,
+        seam_context_s: float = 8.0,
+        verify_seams: bool = True,
+        clean_sections: bool = True,
+        export_format: str = "wav",
+        discard_take_audio_after_export: bool = False,
+        max_sample_step_excess_db: float = 18.0,
+        output_dir: str | None = None,
+        compile_clean_targets: list[str] | None = None,
+        compile_clean_tiers: list[str] | None = None,
+        include_combined_full: bool = False,
+        clean_fade_in_s: float = 2.0,
+        clean_fade_out_s: float = 3.0,
+        filename_prefix: str = "",
+    ) -> dict[str, Any]:
+        """Launch `process_sequence` asynchronously so long multi-hour runs never time out."""
+        with _mcp_errors():
+            rec = job_manager.start_sequence_job(
+                manager,
+                items=items,
+                shared_prefix_steps=shared_prefix_steps,
+                shared_suffix_steps=shared_suffix_steps,
+                outer_fade_in_s=outer_fade_in_s,
+                outer_fade_out_s=outer_fade_out_s,
+                seam_context_s=seam_context_s,
+                verify_seams=verify_seams,
+                clean_sections=clean_sections,
+                export_format=export_format,
+                discard_take_audio_after_export=discard_take_audio_after_export,
+                max_sample_step_excess_db=max_sample_step_excess_db,
+                output_dir=output_dir,
+                compile_clean_targets=compile_clean_targets,
+                compile_clean_tiers=compile_clean_tiers,
+                include_combined_full=include_combined_full,
+                clean_fade_in_s=clean_fade_in_s,
+                clean_fade_out_s=clean_fade_out_s,
+                filename_prefix=filename_prefix,
+            )
+            return rec.model_dump()
+
+    @mcp.tool()
+    def compile_clean_sections(
+        output_dir: str,
+        session_id: str = "",
+        take_id: str = "",
+        sequence: list[dict[str, str]] | None = None,
+        targets: list[str] | None = None,
+        tiers: list[str] | None = None,
+        include_full_masters: bool = False,
+        include_combined_full: bool = False,
+        filename_prefix: str = "",
+        format: str = "wav",
+        fade_in_s: float = 2.0,
+        fade_out_s: float = 3.0,
+        max_edits_per_hour: float = 2.0,
+        max_edited_pct: float = 1.0,
+        include_low_severity: bool = False,
+        round_to_file_local_minutes: bool = False,
+        distinct_regions: bool = False,
+        max_files: int | None = None,
+    ) -> dict[str, Any]:
+        """Compile ranked YouTube ASMR clean sections (and optional masters) to output_dir.
+
+        Splits within a single take or stitches seamlessly across multi-file sequences,
+        writes clean audio files + clean_sections_manifest.json into output_dir inside
+        AMBIENTSOUND_ALLOWED_ROOTS, and auto-uses RF64 if a WAV export exceeds ~3.8 GB.
+        """
+        with _mcp_errors():
+            pairs = _resolve_sequence_or_session(
+                manager, session_id=session_id, take_id=take_id, sequence=sequence
+            )
+            return manager.compile_clean_sections(
+                sequence=pairs,
+                output_dir=output_dir,
+                targets=targets,
+                tiers=tiers,
+                include_full_masters=include_full_masters,
+                include_combined_full=include_combined_full,
+                filename_prefix=filename_prefix,
+                audio_format=format,
+                fade_in_s=fade_in_s,
+                fade_out_s=fade_out_s,
+                max_edits_per_hour=max_edits_per_hour,
+                max_edited_pct=max_edited_pct,
+                include_low_severity=include_low_severity,
+                round_to_file_local_minutes=round_to_file_local_minutes,
+                distinct_regions=distinct_regions,
+                max_files=max_files,
+            )
+
+    @mcp.tool()
+    def start_compile_clean_sections_job(
+        output_dir: str,
+        session_id: str = "",
+        take_id: str = "",
+        sequence: list[dict[str, str]] | None = None,
+        targets: list[str] | None = None,
+        tiers: list[str] | None = None,
+        include_full_masters: bool = False,
+        include_combined_full: bool = False,
+        filename_prefix: str = "",
+        format: str = "wav",
+        fade_in_s: float = 2.0,
+        fade_out_s: float = 3.0,
+        max_edits_per_hour: float = 2.0,
+        max_edited_pct: float = 1.0,
+        include_low_severity: bool = False,
+        round_to_file_local_minutes: bool = False,
+        distinct_regions: bool = False,
+        max_files: int | None = None,
+    ) -> dict[str, Any]:
+        """Launch `compile_clean_sections` asynchronously for long multi-hour compilations."""
+        with _mcp_errors():
+            pairs = _resolve_sequence_or_session(
+                manager, session_id=session_id, take_id=take_id, sequence=sequence
+            )
+            rec = job_manager.start_compile_clean_sections_job(
+                manager,
+                sequence=pairs,
+                output_dir=output_dir,
+                targets=targets,
+                tiers=tiers,
+                include_full_masters=include_full_masters,
+                include_combined_full=include_combined_full,
+                filename_prefix=filename_prefix,
+                audio_format=format,
+                fade_in_s=fade_in_s,
+                fade_out_s=fade_out_s,
+                max_edits_per_hour=max_edits_per_hour,
+                max_edited_pct=max_edited_pct,
+                include_low_severity=include_low_severity,
+                round_to_file_local_minutes=round_to_file_local_minutes,
+                distinct_regions=distinct_regions,
+                max_files=max_files,
+            )
+            return rec.model_dump()
+
+    @mcp.tool()
+    def get_job_status(job_id: str, include_result: bool = True) -> dict[str, Any]:
+        """Poll progress, per-item status, or final result of a background job."""
+        with _mcp_errors():
+            return _format_job_payload(job_manager.get_job(job_id), include_result)
+
+    @mcp.tool()
+    def wait_for_job(
+        job_id: str,
+        timeout_s: float = 30.0,
+        poll_interval_s: float = 1.0,
+        include_result: bool = True,
+    ) -> dict[str, Any]:
+        """Wait up to timeout_s (<=55 s) for a background job to progress or complete."""
+        with _mcp_errors():
+            return _format_job_payload(
+                job_manager.wait_for_job(
+                    job_id, timeout_s=timeout_s, poll_interval_s=poll_interval_s
+                ),
+                include_result,
+            )
+
+    @mcp.tool()
+    def cancel_job(job_id: str) -> dict[str, Any]:
+        """Request cooperative cancellation of a queued or running background job."""
+        with _mcp_errors():
+            return job_manager.cancel_job(job_id).model_dump()
+
+    @mcp.tool()
+    def list_jobs(
+        status: str | None = None, limit: int = 20, include_result: bool = False
+    ) -> dict[str, Any]:
+        """List recent background jobs persisted in workspace/jobs (compact by default)."""
+        with _mcp_errors():
+            return {
+                "jobs": [
+                    _format_job_payload(j, include_result)
+                    for j in job_manager.list_jobs(status=status, limit=limit)
+                ]
+            }
 
     return mcp
 

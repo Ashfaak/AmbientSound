@@ -16,6 +16,7 @@ from ambient_sound import __version__
 from ambient_sound.analysis import summarize_events
 from ambient_sound.config import Settings
 from ambient_sound.io_audio import render_wav_bytes
+from ambient_sound.jobs import JobManager
 from ambient_sound.models import ABTestRecord, TakeRecord
 from ambient_sound.session import SessionManager
 
@@ -109,6 +110,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {
             "version": __version__,
             "workspace_dir": str(cfg.workspace_dir),
+        }
+
+    @app.get("/api/jobs")
+    def api_list_jobs(status: str | None = None, limit: int = 20) -> dict[str, Any]:
+        jm = JobManager(cfg.workspace_dir)
+        return {
+            "jobs": [
+                j.model_dump()
+                for j in jm.list_jobs(status=status, limit=limit, reconcile_stale=False)
+            ]
         }
 
     @app.get("/api/sessions")

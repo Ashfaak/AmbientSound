@@ -463,6 +463,11 @@
         <button class="chip" type="button">Stereo image shifted</button>
         <button class="chip" type="button">Too dull / muffled</button>
         <button class="chip" type="button">Pumping / breathing</button>
+        <button class="chip" type="button">Birds dulled / cut</button>
+        <button class="chip" type="button">Wind / handling audible</button>
+        <button class="chip" type="button">Pleasant / relaxing bed</button>
+        <button class="chip" type="button">Beep / click remains</button>
+        <button class="chip" type="button">Harsh / shrill</button>
       </div>
 
       <label for="commentBox" style="display:block;font-size:0.82rem;color:var(--muted);margin-bottom:0.35rem;">
@@ -790,8 +795,14 @@
       const { a, b } = payload.takes;
       const ab = payload.ab_test;
       const makeBox = (title, takeObj, gainDb) => {
-        const lufs = takeObj.metrics.integrated_lufs ?? "n/a";
-        const corr = takeObj.metrics.stereo_correlation ?? "n/a";
+        const m = takeObj.metrics || {};
+        const lufs = m.integrated_lufs ?? "n/a";
+        const corr = m.stereo_correlation ?? "n/a";
+        const ndsi = m.ndsi ?? "n/a";
+        const sharp = m.sharpness_acum ?? "n/a";
+        const bal = m.channel_balance_db ?? "n/a";
+        const layout = m.stereo_layout_hint ?? "n/a";
+        const pleas = m.pleasantness_score ?? "n/a";
         const recipeText = takeObj.recipe
           ? JSON.stringify(takeObj.recipe.steps, null, 2)
           : "(Recipe hidden in Blind Mode until verdict submission)";
@@ -799,6 +810,7 @@
           <div class="meta-box">
             <h3>${title}: ${takeObj.label}</h3>
             <div>LUFS: <strong>${lufs}</strong> | A/B Trim: <strong>${gainDb} dB</strong> | Stereo Corr: <strong>${corr}</strong></div>
+            <div style="font-size:0.8rem;color:var(--muted);margin-top:0.2rem;">NDSI: <strong>${ndsi}</strong> | Sharpness: <strong>${sharp}</strong> acum | L/R Bal: <strong>${bal}</strong> dB | Layout: <strong>${layout}</strong> | Pleasantness: <strong>${pleas}</strong></div>
             <pre>${recipeText}</pre>
           </div>
         `;

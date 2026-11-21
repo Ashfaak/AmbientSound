@@ -8,9 +8,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Planned
-- Phase 2: CPU ONNX audio tagging / sound event detection (`YAMNet`, `PANNs`, `Silero VAD`) for semantic distraction classification.
+- Phase 2: CPU ONNX audio tagging / sound event detection (`YAMNet`, `PANNs`, `Silero VAD`) behind optional extra/license gates (`AMBIENTSOUND_ALLOW_NONCOMMERCIAL=1`).
 - Phase 3: Text-queried target distraction separation (`AudioSep` / `CLAPSep`) behind license-aware model opt-in controls.
 - Phase 4: Multi-take history DAG visualizer and optional external `ferraus` CLI backend adapter.
+
+## [0.5.2] - 2026-11-21
+
+### Fixed
+- **Gain-Normalized Bird Retention & Parent Event Offsets (`engines.py`, `mcp_server.py`):**
+  - Normalized `compute_comparison_guardrails` (`bird_retention_db`) against overall RMS gain difference (`gain_offset_db`, plus unnormalized `bird_retention_raw_db`) so `+37 dB` master boost never masks real bird-energy loss below the `-1.5 dB` warning threshold.
+  - Added `source_offset_s` on `analyze_take` / `analyze_region` payloads and `parent_start_s` / `parent_end_s` on serialized events whenever analyzing trimmed child takes (`source_offset_s > 0`).
+- **File-Local Minute Snapping Across All Clean Tiers & Sub-Second Precision (`analysis.py`):**
+  - Fixed `round_to_file_local_minutes=True` tie-breaking in `compute_clean_sections` so file-local whole minutes strictly outrank global minutes across `untouched`, `minimal_edits`, and `moderate_edits` tiers alike.
+  - Preserved millisecond precision (`start_s`, `end_s`, `start_local_s`, `end_local_s`, `edited_s`, `residual_distraction_s`) instead of `0.1 s` rounding, eliminating `~30 ms` local offset drift; added `eligible` and `violations[]` reasons on `asmr_targets`.
+- **Clean-Section Provenance, Prefix Naming & Non-Overlapping Selection (`session.py`, `io_audio.py`):**
+  - Applied explicit `filename_prefix` consistently to full masters (`{prefix}_{stem}_master.{ext}`, tracking `"prefix_applied": bool`) in both `compile_clean_sections` and `process_sequence`.
+  - Populated `source_slices[]` with real `source_file`, `session_id`, `take_id`, `segment_index`, `local_start_sample`, `local_end_sample`, and `global_start_s`/`global_end_s` (never generic `"audio.wav"`).
+  - Added `distinct_regions=True` (via `compute_clean_sections(..., exclude_spans=...)`) so multi-target compilations never emit overlapping stretches when separate gaps exist.
+  - Added `bed_shape` headroom warning in `process_take` telemetry/notes whenever post-shaping `true_peak_dbtp > -1.05` without a trailing limiter.
+
+### Changed & Added
+- **Single-Pass Atomic Exports, Progress Heartbeats & `wait_for_job` (`io_audio.py`, `jobs.py`, `mcp_server.py`, `models.py`):**
+  - Added `copy_file_with_sha256` with atomic `.partial` sibling writes and reused cached `TakeRecord` LUFS/peak metrics when exporting unmodified WAV takes (`metrics_source="cached_take_metrics"`), cutting multi-GB master export I/O in half.
+  - Added intra-item byte/frame progress heartbeats (`item_progress_pct`, `phase`, `bytes_written`, `bytes_total`, `elapsed_s`, `eta_s`), structured `items_summary` (`{label, kind, state, detail, session_id, take_id, output_path, size_bytes}`), startup `reconcile_stale_jobs`, and active `output_dir` job collision locks.
+  - Added `wait_for_job` MCP tool (`26` tools total, reported by `health_check.tool_count`), defaulted `list_jobs(..., include_result=False)` / optional `get_job_status(..., include_result=False)` with `has_result` + `manifest_path`, and enriched `clean_sections_manifest.json` with `tool_version`, `created_at`, `parameters`, `sequence`, `masters_count`, `total_bytes`, `warnings`, `seams`, and `events`.
+
+## [0.5.1] - 2026-11-21
+
+### Added
+- **Clean ASMR Section Compilation & Unified Output Folder:**
+  - Added streaming `compile_audio_span(...)` in `io_audio.py` with frame-accurate single-file slicing and seamless cross-seam multi-file stitching, configurable cosine/linear global fade-in/out, single-pass `on_block` callback, SHA-256 verification, and `source_slices` provenance.
+  - Added automatic `RF64` WAV container switching in `export_audio` and `compile_audio_span` whenever estimated WAV output size reaches `3.8 GB` (`>= 3_800_000_000` bytes), preventing 4 GiB RIFF header wraparound on multi-hour masters and combined ASMR exports.
+  - Added `SessionManager.compile_clean_sections(...)` and MCP tools `compile_clean_sections` + async `start_compile_clean_sections_job` (raising total MCP tools from 23 to 25), writing clean section renders under `<output_dir>/clean_sections/`, optional full masters (`<output_dir>/<stem>_master.<ext>`) and stitched `<output_dir>/<prefix>_full_combined.<ext>`, and atomic `<output_dir>/clean_sections_manifest.json` with strict `allowed_roots`, `sessions_root`, and overwrite guards.
+  - Upgraded `SessionManager.process_sequence(...)`, `JobManager.start_sequence_job(...)`, and MCP `process_sequence` / `start_sequence_job` with optional `output_dir`, `compile_clean_targets`, `compile_clean_tiers`, `include_combined_full`, `clean_fade_in_s`, `clean_fade_out_s`, and `filename_prefix`.
+
+## [0.5.0] - 2026-11-21
+
+### Added
+- **Shared Pure-NumPy/SciPy Engine Layer (`src/ambient_sound/engines.py`):**
+  - Unified channel-layout detection (`detect_channel_layout`, `detect_channel_layout_from_stats`), GCC-PHAT sub-sample lag estimation (`estimate_gcc_phat_lag`), windowed-sinc fractional delay (`fractional_shift_channel`), masked least-squares FIR matching (`fit_least_squares_fir`), clipping mask detection, and bidirectional Autoregressive gap interpolation (`ar_interpolate_gap`).
+  - Content-defined bird protection (`compute_bird_protect_mask`) across `300 Hz – 11.5 kHz` that preserves FM birdsong syllables/trills while rejecting zero-drift synthetic piezo beeps via sub-bin parabolic frequency flatness.
+  - Variable-RPM harmonic comb tracker (`track_harmonic_comb`, `build_harmonic_comb_mask`) and unified excess-capped, context-gapped (`context_gap_s`), bird-protected STFT transform engine (`apply_masked_stft_transform`).
+- **New Outdoor & Nature Distraction Detectors (`analysis.py`):**
+  - Added 8 new `DistractionEvent.kind` categories: `synthetic_beep` (zero-drift piezo/watch tones with cross-block fingerprinting), `click_train` (rapid mechanical zips/cable ties), `crackle_burst` (plastic bags/foliage rustle), `human_voice` (syllable-modulated harmonic formants), `dog_bark` (percussive broadband-harmonic barks), `variable_rpm_engine` (sweeping leafblowers/trimmers), `channel_biased_noise` (one-sided machinery/vehicles), and `wind_noise` (uncorrelated `<160 Hz` turbulence), plus confidence scores and approach/tail `+1.5 dB` hysteresis.
+- **Psychoacoustic Pleasantness, Hardware Layout & Band Telemetry (`AudioMetrics`):**
+  - Added `sharpness_acum`, `roughness_index`, `ndsi`, `spectral_slope_db_per_oct`, `channel_balance_db`, `stereo_layout_hint` (`mono`, `dual_mono`, `raw_ms`, `directional_plus_surround`, `stereo_lr`, `ambiguous`), `stereo_layout_confidence`, `pleasantness_score`, `band_metrics` (full/P10/peak-excess across standard + custom bands), `compare_takes` deltas (`bird_retention_db`, `musical_noise_index`, `guardrail_warnings`), and `assess_do_no_harm` (`cleanliness_assessment`).
+- **5 New Restoration & Polishing Filters (`21` Total, In-Memory & Streaming):**
+  - `declip_from_backup`: Repairs clipped peaks from a safety `-12 dB` WAV (`backup_audio_path` validated via `ensure_path_allowed`) using GCC-PHAT sub-sample alignment, LS-FIR calibration, raised-cosine splicing, and AR fallback when both tracks clip.
+  - `spatial_mix`: Auto/explicit handling for `ms_decode` (Zoom SSH-6 Mid/Side), `dual_mic_blend` (directional SGH-6 + surround with GCC-PHAT delay alignment & crossover), `dual_mono_to_stereo` (mono->stereo decorrelation in both in-memory & streaming), and `lr_adjust` (`auto_balance`, `low_mono_hz`, `side_hpf_hz`).
+  - `harmonic_track_suppress`: Sweeping `f0(t)` comb suppression for variable-RPM engines/leafblowers with optional L/R bias focus and FM bird protection.
+  - `distance_soften`: Pushes intrusive `dog_bark` (`bark_distance`) or `human_voice` (`voice_muffle`, formant blur + HF air absorption + attack smearing) into the far distance instead of carving hollow gaps.
+  - `bed_shape`: Slow-bed comfort shaper (4 s sliding floor, warmth tilt, dynamic 2–5 kHz de-harsh, floor preservation, optional gentle bed width boost) leaving FM birdsong & transients untouched.
+  - Upgraded `declick_impulse` (`spans`, `method="pchip"|"ar"`, `min_flatness`), `spectral_match_suppress` (`protect_birds`, `spatial_mode="channel_excess"`, `narrowband_mode`, `context_gap_s`), and `ambience_patch` v3 (`min_donor_distance_s`, `max_donor_crest` knock screening, `loop_count`, `donor_chunks`).
+- **Background Job Manager & 4 Async Sequence MCP Tools (`23` Tools Total):**
+  - Added `src/ambient_sound/jobs.py` (`JobManager`) and `start_sequence_job`, `get_job_status`, `cancel_job`, `list_jobs` so multi-hour split sequences run cooperatively in background threads without MCP timeouts.
+  - Added `GET /api/jobs`, 5 nature/outdoor quality tag chips, and NDSI/Sharpness/Balance/Layout/Pleasantness displays in the A/B Studio (`web_ui.py` / `static/index.html`), plus palette colors for all new event kinds in `visuals.py`.
+
+### Fixed
+- **Seam Slew-Normalized Step Gate & Clean Sections:** Added `max_sample_step_excess_db=18.0` to `verify_seams` so normal loud broadband `-16 LUFS` splits pass while true step discontinuities fail; added `round_to_file_local_minutes` in `find_clean_sections`.
+- **Short-Clip Tonal Persistence & Macro Event Budgeting:** Lowered multi-segment Welch tonal persistence gating from `15 s` down to `>= 2.0 s` (`analysis.py`) to eliminate false `machine_drone` labels from brief bird chirps; added `include_clicks` auto-hiding (`> 25` clicks hidden from macro event lists unless explicitly requested) and `compact_takes` / `take_ids` on `get_session_summary`.
+- **Thread-Safe Session Locking & Verified Rich Exports:** Added per-session `threading.RLock` + atomic `session.json` replacements, `seam_padding` provenance tracking, and `export_take(..., discard_take_audio=...)` returning size, duration, loudness/TP, and SHA-256 while protecting immutable `take_000`.
 
 ## [0.4.0] - 2026-11-21
 

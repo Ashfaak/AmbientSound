@@ -22,23 +22,25 @@ flowchart LR
     E --> H[Export Winning Take\nWAV / FLAC / MP3 / OGG]
 ```
 
-## Key Features (v0.4.0)
+## Key Features (v0.5.2)
 
-- **16 Ambient-First CPU DSP Filters (Streaming & In-Memory, Permissive Stack):**
+- **21 Ambient-First CPU DSP Filters (Streaming & In-Memory, Zero Extra Deps):**
   - `highpass_rumble`: Zero-phase Butterworth high-pass for wind/traffic rumble.
   - `dehum_notch` & `drone_notch`: Zero-phase cascaded notches for 50/60 Hz mains hum and persistent machine-drone frequencies (`30–8000 Hz`).
-  - `declick_impulse`: MAD spike detection + PCHIP sample interpolation for mic clicks/pops (with `texture_tick_rate_per_min` organic tick telemetry so insect/bee micro-ticks aren't stripped inadvertently).
+  - `declick_impulse`: MAD spike detection + PCHIP or Autoregressive (`method="ar"`) gap interpolation, with `spans`, `min_flatness`, and `texture_tick_rate_per_min` guardrails.
+  - `declip_from_backup`: Repairs digital/analog clipping from a safety `-12 dB` WAV using GCC-PHAT sub-sample delay alignment, least-squares FIR matching, raised-cosine splices, and AR fallback.
+  - `spatial_mix`: Auto/explicit decoding for raw Mid/Side (`ms_decode`, Zoom SSH-6), directional + surround (`dual_mic_blend`, Zoom SGH-6 with GCC-PHAT alignment), mono->stereo decorrelation (`dual_mono_to_stereo`), and L/R tilt/bass-mono balancing (`lr_adjust`).
   - `spectral_denoise`: Linked-stereo soft STFT spectral gate/Wiener denoiser.
-  - `spectral_match_suppress`: Per-bin `n_fft=4096` STFT adaptive excess suppression against clean surrounding bed percentiles with optional clean-context texture fill — attenuates passing cars, exhaust harmonics, and temporary overlapping tones without carving hollow gaps into nearby bee/nature frequencies.
-  - `band_attenuate`: Feathered time-frequency attenuation supporting `"adaptive"`, `"swell"`, `"flat"`, up to `5 s` fades, and batched multi-span lists (`spans`).
-  - `ambience_patch`: Replaces one or many distracted spans with non-repeating, event-screened clean donor audio using RMS + 2-band tilt matching, equal-power crossfades (`crossfade_ms` up to `5000 ms`), and `donor_quality` telemetry.
-  - `trim_range`, `cut_regions`, `fade_edges`, & `gain`: Extract ranges (with timeline tracking), cut bad stretches with equal-power crossfades, add smooth start/end fades, and apply clean linear dB gain staging before compression.
-  - `parametric_eq`, `soft_compress`, `loudness_normalize`, & `true_peak_limiter`: Tone shaping (`lowshelf` warmth / `highshelf` air), gentle RMS compression, peak-limited (`limit_peaks=True`) 2-pass streaming BS.1770 LUFS leveling (`-14 LUFS` YouTube/ASMR ready), and lookahead limiting.
-- **Large-File Streaming, Zero-Copy Sessions & Continuous Multi-File Splits (`> 120 s` / 2 GB+):** Supports `copy_source=False` in-place WAV referencing, `compact_metrics=True` transport, RF64 temp stages with immediate unlink, per-step `step_metrics`, `calibrate_sequence` shared gain solving, `process_sequence` seam-padded batch processing, and `verify_seams` / `find_clean_sections` QC.
-- **Bias-Free Local A/B Listening Studio (with Scrolling Playhead & A vs B Diff):**
-  - Time-locked synchronized Web Audio playback across timeline-aligned Original, Take A, Take B, and gain-matched Removed Residuals (`1`/`2`/`3`/`4` hotkeys, `12 ms` click-free crossfades).
-  - Live `#playheadLine` cursor tracking over spectrograms and waveforms with click-to-seek, interactive `A Diff` / `B Diff` / `A vs B Diff` spectrogram views, and automatic `<= 90 s` Windowed Audition Mode.
-- **Path-Sandboxed MCP Server (`stdio`, 19 Tools):** Includes `health_check`, `analyze_region`, `verify_seams`, `calibrate_sequence`, `process_sequence`, `find_clean_sections`, `delete_take`, `delete_session`, windowed `render_spectrogram`, compact event filtering, and strict path allowlisting.
+  - `spectral_match_suppress`: Excess-capped `n_fft=4096` STFT suppression with `context_gap_s`, `protect_birds` (FM chirp ridges across `300 Hz – 11.5 kHz`), `narrowband_mode` (pinpoint Garmin/watch piezo tones), and `spatial_mode="channel_excess"` (one-sided machinery).
+  - `harmonic_track_suppress`: Sweeping `f0(t)` comb tracking for variable-RPM engines and leafblowers, preserving FM birdsong and spatial bed width.
+  - `distance_soften`: Attenuates, low-pass airs, smears attacks, or blurs formants (`voice_muffle`, `bark_distance`) so intrusive speech and dogs recede naturally.
+  - `bed_shape`: Whole-clip slow-bed comfort polisher (4 s floor warmth tilt, dynamic `2–5 kHz` de-harsh, floor preservation, optional gentle bed width boost) leaving transients & birds untouched.
+  - `band_attenuate`: Feathered time-frequency attenuation supporting `"adaptive"`, `"swell"`, `"flat"`, up to `5 s` fades, and multi-span `spans`.
+  - `ambience_patch` v3: Non-repeating, event-screened clean donor splicing with `min_donor_distance_s`, `max_donor_crest` knock screening, `loop_count`, `donor_chunks`, and `donor_quality` telemetry.
+  - `trim_range`, `cut_regions`, `fade_edges`, `gain`, `parametric_eq`, `soft_compress`, `loudness_normalize`, & `true_peak_limiter`.
+- **Outdoor Detection, Pleasantness Telemetry & Do-No-Harm Gate (`analysis.py` / `engines.py`):** Detects `synthetic_beep`, `click_train`, `crackle_burst`, `human_voice`, `dog_bark`, `variable_rpm_engine`, `channel_biased_noise`, and `wind_noise`; scores `sharpness_acum`, `roughness_index`, `ndsi`, `pleasantness_score`, `stereo_layout_hint`, per-band stats (`band_metrics`), `compare_takes` bird retention, and `cleanliness_assessment`.
+- **Large-File Streaming, Async Sequence Jobs & A/B Listening Studio (`> 120 s` / 2 GB+):** Background `JobManager` (`start_sequence_job`, `get_job_status`, `cancel_job`, `list_jobs`), slew-normalized `verify_seams`, scrolling `#playheadLine` cursor, `A vs B Diff` spectrograms, `GET /api/jobs`, and nature quality tags.
+- **Path-Sandboxed MCP Server (`stdio`, 26 Tools):** Full lifecycle management, compact macro event views (`include_clicks`, `compact_takes`, `take_ids`, parent offsets), gain-normalized `compare_to_take_id` guardrails, single-pass WAV master export + `wait_for_job`, non-overlapping clean ASMR compilation into unified `output_dir`, and strict path allowlisting.
 
 ---
 
@@ -92,29 +94,36 @@ Configure your MCP host (Claude Desktop, Cursor, Antigravity, etc.) to launch `a
 
 ---
 
-## Built-In MCP Tools (19 Tools)
+## Built-In MCP Tools (26 Tools)
 
 | Tool | Purpose |
 | :--- | :--- |
 | `health_check` | Verifies MCP connectivity, allowed roots, `ffmpeg`/`ffprobe`, and workspace free space. |
-| `list_filters` | Returns machine-readable schemas, defaults, and tuning hints for all 16 DSP filters. |
-| `create_session` | Ingests (or links in-place via `copy_source=False`) a recording into `take_000` in bounded RAM, archives `events.json`, renders `n_fft=8192` overview PNG, returns compact event/metric summary. |
+| `list_filters` | Returns `filter_count`, `step_schema`, `spans_precedence`, and schemas/defaults for all 21 DSP filters. |
+| `create_session` | Ingests (or links in-place via `copy_source=False`) a recording into `take_000` in bounded RAM, archives `events.json`, renders overview PNG, returns compact macro events (`include_clicks`). |
 | `list_sessions` | Lists active restoration sessions in the workspace. |
-| `get_session_summary` | Returns take DAG, metrics (LRA, noise floor, tick rate, short-term LUFS), bounded events (`max_events`, `event_kinds`, `compact_metrics`), and A/B test history. |
-| `analyze_take` | Streaming analysis with configurable sensitivity, duration filters, frequency band gating (`freq_range_hz`), temporary localized tone discovery, and `event_kinds`/`max_events` filtering. |
-| `analyze_region` | Analyzes a specific `[start_s, end_s]` window with custom sensitivity, frequency band, and event filtering. |
-| `render_spectrogram` | Generates overview or zoomed `[start_s, end_s]` spectrogram (`n_fft=8192`) and timeline-aligned 3-panel diff PNG (`Patched` spans shaded). |
-| `process_take` | Applies an ordered filter recipe to a parent take, producing an immutable child take with `step_metrics`, `donor_quality`, and residual. |
+| `get_session_summary` | Returns take DAG, psychoacoustic & pleasantness metrics, bounded macro events (`include_clicks`), `compact_takes`/`take_ids` filtering, and A/B tests. |
+| `analyze_take` | Streaming analysis with configurable sensitivity, frequency band gating (`freq_range_hz`), `cleanliness_assessment`, and optional `compare_to_take_id` delta/bird guardrails. |
+| `analyze_region` | Analyzes a specific `[start_s, end_s]` window with `cleanliness_assessment`, `band_metrics`, and optional `compare_to_take_id` guardrails. |
+| `render_spectrogram` | Generates overview or zoomed `[start_s, end_s]` spectrogram (`n_fft=8192`) and timeline-aligned 3-panel diff PNG. |
+| `process_take` | Applies an ordered filter recipe to a parent take, producing an immutable child take with `step_metrics`, `donor_quality`, `seam_padding`, and residual. |
 | `create_ab_test` | Registers a timeline-aware, candidate-first (`match_original=False` default) A/B test and returns `ui_url`. |
 | `list_ab_tests` | Lists all A/B tests and verdicts in a session. |
 | `get_ab_feedback` | Retrieves user verdict, artifact tags, and comments so the AI model can refine the recipe. |
-| `delete_take` | Deletes an abandoned non-root take (with optional `cascade=True`) and orphaned A/B tests to reclaim disk space. |
-| `delete_session` | Permanently removes a session folder and all its takes and A/B tests (preserving external `copy_source=False` raw audio). |
-| `export_take` | Exports a chosen take to WAV, FLAC, MP3, or OGG inside allowed roots. |
-| `find_clean_sections` | Ranks largest untouched and minimal-edit stretches in round YouTube ASMR durations (`15 min`–`10 hr`), separating edits from residual distractions. |
-| `verify_seams` | Measures LUFS delta, `2 s` RMS delta, sample step, `40–8000 Hz` spectral diff, and renders stitched `[-10 s, +10 s]` seam spectrograms across file splits. |
+| `delete_take` | Deletes an abandoned non-root take (with optional `cascade=True`) and orphaned A/B tests. |
+| `delete_session` | Permanently removes a session folder and all its takes and A/B tests. |
+| `export_take` | Exports a chosen take and returns verified size, duration, loudness/true peak, SHA-256, and optional internal audio cleanup (`discard_take_audio=True`). |
+| `find_clean_sections` | Ranks largest untouched and minimal-edit stretches in round YouTube ASMR durations (`15 min`–`10 hr`), with optional `round_to_file_local_minutes=True`. |
+| `verify_seams` | Measures LUFS delta, `2 s` RMS delta, slew-normalized `sample_step_excess_db`, and `40–8000 Hz` spectral diff across file splits. |
 | `calibrate_sequence` | Solves one shared master gain across a continuous split sequence on clean interior slices. |
-| `process_sequence` | Single-call seam-padded batch processor for split recordings with outer edge fades, export, QC, and optional internal WAV dedup (`discard_take_audio_after_export`). |
+| `process_sequence` | Single-call seam-padded batch processor for split recordings with outer edge fades, unified `output_dir` master export, optional `compile_clean_targets`, QC, and temp dedup. |
+| `start_sequence_job` | Launches `process_sequence` asynchronously in a persistent background worker without client timeouts. |
+| `compile_clean_sections` | Splits/stitches ranked clean YouTube ASMR stretches (with optional `distinct_regions=True`, full masters/combined output) into `output_dir` with full manifest metadata and auto-RF64 > 3.8 GB. |
+| `start_compile_clean_sections_job` | Launches `compile_clean_sections` asynchronously in the background with byte/frame progress heartbeats and `output_dir` locking. |
+| `get_job_status` | Polls progress (`progress_pct`, `item_progress_pct`, `phase`, `eta_s`), `items_summary`, or final result of a background job. |
+| `wait_for_job` | Blocks server-side up to `55 s` for a background job to progress or finish without requiring client shell sleeps. |
+| `cancel_job` | Requests cooperative cancellation of a queued or running background sequence job. |
+| `list_jobs` | Lists recent background jobs persisted under `<workspace>/jobs` (compact summaries by default). |
 
 ---
 

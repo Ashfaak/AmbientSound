@@ -33,8 +33,17 @@ class DistractionEvent(BaseModel):
         "transient_distraction",
         "slow_pass",
         "clipping",
+        "synthetic_beep",
+        "click_train",
+        "crackle_burst",
+        "human_voice",
+        "dog_bark",
+        "variable_rpm_engine",
+        "channel_biased_noise",
+        "wind_noise",
     ]
     severity: Literal["low", "medium", "high"]
+    confidence: float | None = None
     freq_band_hz: tuple[float, float] | None = None
     peak_db: float | None = None
     notes: str = ""
@@ -68,6 +77,15 @@ class AudioMetrics(BaseModel):
     texture_tick_rate_per_min: float | None = None
     short_term_lufs_stats: dict[str, float] | None = None
     short_term_lufs_timeline: list[dict[str, float]] = Field(default_factory=list)
+    sharpness_acum: float | None = None
+    roughness_index: float | None = None
+    ndsi: float | None = None
+    spectral_slope_db_per_oct: float | None = None
+    channel_balance_db: float | None = None
+    stereo_layout_hint: str | None = None
+    stereo_layout_confidence: float | None = None
+    pleasantness_score: float | None = None
+    band_metrics: dict[str, dict[str, float | None]] = Field(default_factory=dict)
 
 
 class StepTelemetry(BaseModel):
@@ -98,6 +116,7 @@ class ProcessingRecipe(BaseModel):
     parent_take_id: str
     steps: list[FilterStep]
     notes: str = ""
+    seam_padding: dict[str, Any] | None = None
 
 
 class TakeRecord(BaseModel):
@@ -116,11 +135,39 @@ class TakeRecord(BaseModel):
     sha256: str
     source_offset_s: float = 0.0
     timeline_modified: bool = False
+    seam_padding: dict[str, Any] | None = None
     recipe: ProcessingRecipe | None = None
     metrics: AudioMetrics
     event_counts: dict[str, int] = Field(default_factory=dict)
     events: list[DistractionEvent] = Field(default_factory=list)
     step_metrics: list[StepTelemetry] = Field(default_factory=list)
+
+
+class JobRecord(BaseModel):
+    """Persisted background sequence-processing job state."""
+
+    job_id: str
+    kind: str = "process_sequence"
+    status: Literal["queued", "running", "completed", "failed", "cancelled"]
+    owner_pid: int | None = None
+    created_at: str
+    updated_at: str
+    total_items: int = 0
+    completed_items: int = 0
+    current_item_index: int | None = None
+    current_stage: str = ""
+    progress_pct: float = 0.0
+    item_progress_pct: float = 0.0
+    phase: str = ""
+    bytes_written: int = 0
+    bytes_total: int = 0
+    elapsed_s: float = 0.0
+    eta_s: float | None = None
+    output_dir: str | None = None
+    cancel_requested: bool = False
+    items_summary: list[dict[str, Any]] = Field(default_factory=list)
+    result: dict[str, Any] | None = None
+    error: str | None = None
 
 
 class ABVerdict(BaseModel):

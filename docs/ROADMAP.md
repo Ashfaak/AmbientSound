@@ -22,13 +22,25 @@
 - [x] Per-take `events.json` archival, compact MCP payloads (`max_events`, `event_kinds`, `include_events`), `n_fft=8192` spectrograms, `delete_take` / `delete_session`
 - [x] Timeline-aware `original_take_id` LCA auto-resolution, candidate-first A/B matching (`match_original=False`), and gain-matched dynamic residual auditioning
 
-## v0.4.0 — Semantic Distraction Detection (CPU ONNX)
+## v0.4.0 — Spectral Excess Suppression, Non-Repeating Donors & Playhead Studio
+- [x] Adaptive STFT spectral excess suppression (`spectral_match_suppress`), event-screened non-repeating `ambience_patch` v2, zero-copy `copy_source=False` ingestion
+- [x] `verify_seams`, `calibrate_sequence`, and `process_sequence` continuous split workflows
+- [x] Scrolling spectrogram playhead (`X-Plot-*` / `X-Time-*` headers) and `A vs B Diff` view in A/B Studio
+
+## v0.5.0 — Outdoor/Nature Restoration, Hardware Spatial/Backup & Async Jobs (Current)
+- [x] Shared pure-NumPy/SciPy engines (`engines.py`) with content-defined FM bird protection (`300 Hz – 11.5 kHz`, zero-drift piezo beep rejection)
+- [x] 8 new outdoor detectors (`synthetic_beep`, `click_train`, `crackle_burst`, `human_voice`, `dog_bark`, `variable_rpm_engine`, `channel_biased_noise`, `wind_noise`)
+- [x] 5 new filters (`declip_from_backup`, `spatial_mix`, `harmonic_track_suppress`, `distance_soften`, `bed_shape` -> 21 total) + `declick_impulse` AR mode & `ambience_patch` v3 knock screening
+- [x] Psychoacoustic pleasantness metrics (`sharpness_acum`, `roughness_index`, `ndsi`, `pleasantness_score`, `band_metrics`), `compare_takes` bird guardrails, and `assess_do_no_harm`
+- [x] Persistent async `JobManager` (`start_sequence_job`, `get_job_status`, `cancel_job`, `list_jobs` -> 23 MCP tools) + per-session locking + `/api/jobs` + Nature A/B tags
+
+## v0.6.0 — Semantic Distraction Detection (Optional CPU ONNX)
 - [ ] Optional `ambient-sound[ml-cpu]` extra (`onnxruntime`, Apache-2.0 / MIT compatible)
-- [ ] Silero VAD (`MIT`) integration to label speech vs non-speech distractions
+- [ ] Silero VAD (`MIT`) integration feeding `DistractionEvent.confidence` to separate speech vs bird calls
 - [ ] YAMNet (`Apache-2.0`) or PANNs (`MIT`) window tagging to classify events (`Speech`, `Siren`, `Dog`, `Traffic`, `Rain`, `Wind`)
 - [ ] Interactive waveform/spectrogram clicking in Web UI to mark manual distraction spans & send directly to MCP context
 
-## v0.5.0 — Neural Separation & Ecosystem Bridges
+## v0.7.0 — Neural Separation & Ecosystem Bridges
 - [ ] Inverted speech subtraction via open-source speech extraction (`DeepFilterNet`, MIT/Apache-2.0)
 - [ ] Text-queried sound extraction (`AudioSep` / `CLAPSep`, MIT) as optional GPU/high-RAM backend
 - [ ] Strict license opt-in guard (`AMBIENTSOUND_ALLOW_NONCOMMERCIAL=1`) for any non-commercial or restricted community weights
