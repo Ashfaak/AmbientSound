@@ -12,11 +12,13 @@ from ambient_sound.analysis import (
     StreamingLUFS,
     analyze_audio,
     analyze_file,
+    compute_clean_sections,
+    extract_localized_edit_spans,
     summarize_events,
 )
 from ambient_sound.dsp import apply_recipe
 from ambient_sound.io_audio import save_wav
-from ambient_sound.models import DistractionEvent
+from ambient_sound.models import DistractionEvent, ProcessingRecipe
 
 
 def _make_pink_bed(n_samples: int, channels: int, seed: int = 7) -> np.ndarray:
@@ -274,3 +276,76 @@ def test_constant_q_tonal_median_and_slow_pass_hysteresis() -> None:
     clicks_6 = [e for e in ev_6 if e.kind == "impulsive_click"]
     assert len(clicks_0) == 2
     assert len(clicks_0) == len(clicks_6)
+
+
+def test_clean_sections_single_and_multi_file_sequence() -> None:
+    # Single 75-min file with one localized edit at [120, 130] s (2:00 - 2:10)
+    single = compute_clean_sections(
+        [
+            {
+                "label": "single.wav",
+                "duration_s": 4500.0,
+                "edit_spans": [(120.0, 130.0)],
+                "distraction_spans": [],
+            }
+        ]
+    )
+    assert single["largest_untouched_raw_min"] == 72
+    assert single["largest_untouched_asmr_target"]["duration_label"] == "1 hr"
+    assert single["largest_untouched_asmr_target"]["tier"] == "untouched"
+    assert single["largest_untouched_asmr_target"]["start_hms"] == "00:03:00"
+    assert single["largest_untouched_asmr_target"]["end_hms"] == "01:03:00"
+
+    # Continuous 3 x 2 hr split sequence (6 hr = 21600 s) with untouched span across 0004..0006
+    seq = compute_clean_sections(
+        [
+            {
+                "label": "ZOOM0004.WAV",
+                "duration_s": 7200.0,
+                "edit_spans": [(300.0, 315.0)],
+                "distraction_spans": [(3900.0, 3910.0)],
+            },
+            {
+                "label": "ZOOM0005.WAV",
+                "duration_s": 7200.0,
+                "edit_spans": [],
+                "distraction_spans": [],
+            },
+            {
+                "label": "ZOOM0006.WAV",
+                "duration_s": 7200.0,
+                "edit_spans": [(5000.0, 5012.0)],
+                "distraction_spans": [],
+            },
+        ]
+    )
+    assert seq["total_duration_hms"] == "06:00:00"
+    # Clean stretch: 3910 s .. 19400 s = 15490 s (258 min -> 4 hr untouched!)
+    assert seq["largest_untouched_raw_min"] == 258
+    top_unt = seq["largest_untouched_asmr_target"]
+    assert top_unt is not None
+    assert top_unt["duration_label"] == "4 hr"
+    assert top_unt["tier"] == "untouched"
+    assert top_unt["start_file"] == "ZOOM0004.WAV"
+    assert top_unt["end_file"] == "ZOOM0006.WAV"
+
+    top_min = seq["largest_minimal_edit_asmr_target"]
+    assert top_min is not None
+    assert top_min["duration_label"] == "6 hr"
+    assert top_min["tier"] == "minimal_edits"
+
+    # Localized edit extraction respects trim_range placement while ignoring global mastering steps
+    recipe_trim_last = ProcessingRecipe(
+        parent_take_id="take_000",
+        steps=[
+            {"filter_name": "highpass_rumble", "params": {"cutoff_hz": 50.0}},
+            {
+                "filter_name": "band_attenuate",
+                "params": {"spans": [{"start_s": 50.0, "end_s": 60.0}]},
+            },
+            {"filter_name": "trim_range", "params": {"start_s": 10.0, "end_s": 500.0}},
+            {"filter_name": "ambience_patch", "params": {"start_s": 100.0, "end_s": 105.0}},
+            {"filter_name": "loudness_normalize", "params": {"target_lufs": -14.0}},
+        ],
+    )
+    assert extract_localized_edit_spans(recipe_trim_last) == [(40.0, 50.0), (100.0, 105.0)]

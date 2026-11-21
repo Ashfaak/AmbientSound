@@ -50,6 +50,7 @@ def test_mcp_tool_workflow_and_sandboxing(tmp_path: Path) -> None:
         "delete_take",
         "delete_session",
         "export_take",
+        "find_clean_sections",
     }.issubset(tool_names)
 
     health = _call_tool_json(mcp, "health_check", {})
@@ -69,12 +70,14 @@ def test_mcp_tool_workflow_and_sandboxing(tmp_path: Path) -> None:
     session = _call_tool_json(mcp, "create_session", {"audio_path": str(src), "name": "Creek"})
     sid = session["session_id"]
     assert session["takes"][0]["take_id"] == "take_000"
+    assert "clean_sections" in session["takes"][0]
 
     sessions_res = _call_tool_json(mcp, "list_sessions", {})
     assert any(s["session_id"] == sid for s in sessions_res["sessions"])
 
     analyzed = _call_tool_json(mcp, "analyze_take", {"session_id": sid, "take_id": "take_000"})
     assert analyzed["metrics"]["sample_rate"] == sr
+    assert "clean_sections" in analyzed
 
     reg_analyzed = _call_tool_json(
         mcp,
@@ -165,6 +168,44 @@ def test_mcp_tool_workflow_and_sandboxing(tmp_path: Path) -> None:
     assert "event_counts" in summary["takes"][0]
     assert "events_total" in summary["takes"][0]
     assert "step_metrics" in take1 and len(take1["step_metrics"]) == 1
+    assert "clean_sections" in take1
+    assert "clean_sections" in summary["takes"][0]
+
+    clean_single = _call_tool_json(
+        mcp, "find_clean_sections", {"session_id": sid, "take_id": take1["take_id"]}
+    )
+    assert clean_single["segment_count"] == 1
+    assert clean_single["total_duration_s"] == summary["takes"][1]["metrics"]["duration_s"]
+
+    src2 = save_wav(tmp_path / "ambience_part2.wav", audio, sr)
+    sess2 = _call_tool_json(mcp, "create_session", {"audio_path": str(src2), "name": "Creek 2"})
+    sid2 = sess2["session_id"]
+    take_seam = _call_tool_json(
+        mcp,
+        "process_take",
+        {
+            "session_id": sid,
+            "parent_take_id": "take_000",
+            "steps": [{"filter_name": "highpass_rumble", "params": {"cutoff_hz": 55.0}}],
+            "label": "Seam Padded",
+            "next_audio_path": str(src2),
+            "seam_context_s": 1.0,
+        },
+    )
+    assert take_seam["metrics"]["sample_rate"] == sr
+    clean_seq = _call_tool_json(
+        mcp,
+        "find_clean_sections",
+        {
+            "sequence": [
+                {"session_id": sid, "take_id": take_seam["take_id"]},
+                {"session_id": sid2, "take_id": "take_000"},
+            ]
+        },
+    )
+    assert clean_seq["segment_count"] == 2
+    assert abs(clean_seq["total_duration_s"] - 4.0) < 0.05
+    _call_tool_json(mcp, "delete_session", {"session_id": sid2})
 
     analyzed_filtered = _call_tool_json(
         mcp,

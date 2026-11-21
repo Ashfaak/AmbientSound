@@ -8,6 +8,7 @@ import shutil
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
@@ -16,7 +17,10 @@ from mcp.server.mcpserver.exceptions import ToolError
 from ambient_sound import __version__
 from ambient_sound.analysis import (
     SensitivityLevel,
+    compute_clean_sections,
     event_kind_counts,
+    extract_localized_distraction_spans,
+    extract_localized_edit_spans,
     summarize_events,
 )
 from ambient_sound.config import Settings
@@ -85,15 +89,35 @@ def _compact_events_payload(
     }
 
 
+def _clean_sections_for_take(
+    take: TakeRecord,
+    source_label: str,
+    full_events: list[DistractionEvent],
+) -> dict[str, Any]:
+    return compute_clean_sections(
+        [
+            {
+                "label": source_label,
+                "session_id": take.session_id,
+                "take_id": take.take_id,
+                "duration_s": take.metrics.duration_s,
+                "edit_spans": extract_localized_edit_spans(take.recipe),
+                "distraction_spans": extract_localized_distraction_spans(full_events),
+            }
+        ]
+    )
+
+
 def _format_take_payload(
     manager: SessionManager,
     take: TakeRecord,
     event_kinds: list[str] | None = None,
     max_events: int = 50,
     include_events: bool = True,
+    source_label: str = "",
 ) -> dict[str, Any]:
     data = take.model_dump()
-    if include_events and (event_kinds is not None or take.events_path):
+    if take.events_path:
         full_events = manager.load_take_events(take.session_id, take.take_id)
     else:
         full_events = list(take.events)
@@ -105,6 +129,9 @@ def _format_take_payload(
         stored_counts=take.event_counts or None,
     )
     data.update(compact)
+    data["clean_sections"] = _clean_sections_for_take(
+        take, source_label or take.take_id, full_events
+    )
     return data
 
 
@@ -151,6 +178,7 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
         """Ingest audio into a non-destructive session (take_000) in bounded RAM."""
         with _mcp_errors():
             summary = manager.create_session(audio_path, name=name)
+            src_label = Path(summary.source_path).name if summary.source_path else summary.name
             payload = summary.model_dump()
             payload["takes"] = [
                 _format_take_payload(
@@ -159,6 +187,7 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
                     event_kinds=event_kinds,
                     max_events=max_events,
                     include_events=include_events,
+                    source_label=src_label,
                 )
                 for t in summary.takes
             ]
@@ -191,6 +220,7 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
         """Return session metadata, takes, metrics, bounded events, and A/B tests."""
         with _mcp_errors():
             summary = manager.get_session(session_id)
+            src_label = Path(summary.source_path).name if summary.source_path else summary.name
             payload = summary.model_dump()
             payload["takes"] = [
                 _format_take_payload(
@@ -199,6 +229,7 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
                     event_kinds=event_kinds,
                     max_events=max_events,
                     include_events=include_events,
+                    source_label=src_label,
                 )
                 for t in summary.takes
             ]
@@ -218,6 +249,9 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
     ) -> dict[str, Any]:
         """Compute psychoacoustic metrics and configurable distraction events for a full take."""
         with _mcp_errors():
+            summary = manager.get_session(session_id)
+            take = manager.get_take(session_id, take_id)
+            src_label = Path(summary.source_path).name if summary.source_path else summary.name
             metrics, events = manager.analyze_take(
                 session_id,
                 take_id,
@@ -232,6 +266,7 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
                 "take_id": take_id,
                 "metrics": metrics.model_dump(),
                 **_compact_events_payload(events, event_kinds, max_events, include_events),
+                "clean_sections": _clean_sections_for_take(take, src_label, events),
             }
 
     @mcp.tool()
@@ -297,15 +332,23 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
         event_kinds: list[str] | None = None,
         max_events: int = 50,
         include_events: bool = True,
+        prev_audio_path: str | None = None,
+        next_audio_path: str | None = None,
+        seam_context_s: float = 8.0,
     ) -> dict[str, Any]:
         """Apply an ordered DSP filter recipe to parent_take_id as a new immutable take."""
         with _mcp_errors():
+            summary = manager.get_session(session_id)
+            src_label = Path(summary.source_path).name if summary.source_path else summary.name
             record = manager.process_take(
                 session_id=session_id,
                 parent_take_id=parent_take_id,
                 steps=steps,
                 label=label,
                 notes=notes,
+                prev_audio_path=prev_audio_path,
+                next_audio_path=next_audio_path,
+                seam_context_s=seam_context_s,
             )
             return _format_take_payload(
                 manager,
@@ -313,6 +356,7 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
                 event_kinds=event_kinds,
                 max_events=max_events,
                 include_events=include_events,
+                source_label=src_label,
             )
 
     @mcp.tool()
@@ -403,6 +447,38 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer:
                 "format": format.lower(),
                 "output_path": str(out),
             }
+
+    @mcp.tool()
+    def find_clean_sections(
+        session_id: str = "",
+        take_id: str = "",
+        sequence: list[dict[str, str]] | None = None,
+        max_edits_per_hour: float = 2.0,
+        max_edited_pct: float = 1.0,
+    ) -> dict[str, Any]:
+        """Report largest untouched and minimal-edit YouTube ASMR stretches in round numbers."""
+        with _mcp_errors():
+            pairs: list[tuple[str, str]] = []
+            if sequence:
+                for item in sequence:
+                    sid = str(item.get("session_id", "")).strip()
+                    tid = str(item.get("take_id", "")).strip()
+                    if not sid or not tid:
+                        raise ValueError(
+                            "Each sequence entry must provide non-empty 'session_id' and 'take_id'."
+                        )
+                    pairs.append((sid, tid))
+            elif session_id.strip():
+                summary = manager.get_session(session_id.strip())
+                resolved_tid = take_id.strip() or (
+                    summary.takes[-1].take_id if summary.takes else "take_000"
+                )
+                pairs.append((session_id.strip(), resolved_tid))
+            return manager.find_clean_sections(
+                pairs,
+                max_edits_per_hour=max_edits_per_hour,
+                max_edited_pct=max_edited_pct,
+            )
 
     return mcp
 

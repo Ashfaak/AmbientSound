@@ -11,6 +11,7 @@ from ambient_sound.analysis import analyze_audio, chunked_true_peak_linear
 from ambient_sound.dsp import (
     apply_recipe,
     apply_recipe_streaming,
+    apply_recipe_with_seam_padding,
     apply_recipe_with_telemetry,
     compute_residual,
     list_filter_specs,
@@ -516,3 +517,105 @@ def test_adaptive_band_attenuate_and_telemetry(tmp_path: Path) -> None:
     assert tele_str[1].input_lufs is not None
     assert tele_str[1].output_lufs is not None
     assert tele_str[1].details["patched_spans"][0]["crossfade_ms"] == 55.0
+
+
+def test_split_file_seam_continuity_and_validation(tmp_path: Path) -> None:
+    import pytest
+
+    sr = 16000
+    n_half = sr * 6
+    n_full = n_half * 2
+    t = np.arange(n_full, dtype=np.float64) / sr
+    rng = np.random.default_rng(202)
+    bed = rng.normal(0.0, 0.015, size=(n_full, 2))
+    # Continuous bee-like buzz + transient across the split point at t = 6.0 s
+    buzz = (0.04 * np.sin(2.0 * np.pi * 240.0 * t) + 0.02 * np.sin(2.0 * np.pi * 35.0 * t))[:, None]
+    full = bed + buzz
+    full[int(5.9 * sr) : int(6.1 * sr), :] += 0.25
+
+    part1_wav = save_wav(tmp_path / "part1.wav", full[:n_half], sr, subtype="PCM_24")
+    part2_wav = save_wav(tmp_path / "part2.wav", full[n_half:], sr, subtype="PCM_24")
+
+    chain = [
+        {"filter_name": "highpass_rumble", "params": {"cutoff_hz": 55.0, "order": 4}},
+        {
+            "filter_name": "parametric_eq",
+            "params": {"freq_hz": 160.0, "gain_db": 2.0, "filter_type": "lowshelf"},
+        },
+        {
+            "filter_name": "soft_compress",
+            "params": {"threshold_db": -28.0, "ratio": 2.0, "release_ms": 250.0},
+        },
+        {"filter_name": "gain", "params": {"gain_db": 10.0}},
+        {"filter_name": "true_peak_limiter", "params": {"ceiling_dbtp": -1.5, "release_ms": 60.0}},
+    ]
+    ref_full = apply_recipe(full, sr, chain)
+
+    # In-memory seam padding parity
+    p1_mem, _ = apply_recipe_with_seam_padding(
+        full[:n_half], sr, chain, next_audio_path=part2_wav, seam_context_s=3.0
+    )
+    p2_mem, _ = apply_recipe_with_seam_padding(
+        full[n_half:], sr, chain, prev_audio_path=part1_wav, seam_context_s=3.0
+    )
+    seam_slice_ref = ref_full[n_half - 1000 : n_half + 1000]
+    seam_slice_mem = np.vstack([p1_mem[-1000:], p2_mem[:1000]])
+    assert float(np.max(np.abs(seam_slice_mem - seam_slice_ref))) < 1e-3
+
+    # Streaming seam padding parity + PCM_24 WAV verification + telemetry check
+    out1_wav = tmp_path / "out1.wav"
+    out2_wav = tmp_path / "out2.wav"
+    patch_chain = [
+        *chain,
+        {
+            "filter_name": "ambience_patch",
+            "params": {"start_s": 1.0, "end_s": 1.6, "source_start_s": 2.5, "crossfade_ms": 40.0},
+        },
+    ]
+    tele2: list = []
+    info1 = apply_recipe_streaming(
+        part1_wav,
+        out1_wav,
+        chain,
+        subtype="PCM_24",
+        block_seconds=3.0,
+        next_audio_path=part2_wav,
+        seam_context_s=3.0,
+    )
+    info2 = apply_recipe_streaming(
+        part2_wav,
+        out2_wav,
+        patch_chain,
+        subtype="PCM_24",
+        block_seconds=3.0,
+        telemetry_out=tele2,
+        prev_audio_path=part1_wav,
+        seam_context_s=3.0,
+    )
+    assert info1.frames == n_half and info1.format_name.upper() == "WAV"
+    assert info2.frames == n_half and info2.format_name.upper() == "WAV"
+    out1_arr, _ = load_audio(out1_wav)
+    out2_arr, _ = load_audio(out2_wav)
+    seam_jump = float(np.max(np.abs(out2_arr[0] - out1_arr[-1])))
+    ref_jump = float(np.max(np.abs(ref_full[n_half] - ref_full[n_half - 1])))
+    assert abs(seam_jump - ref_jump) < 5e-4
+    # Patch telemetry must remain in file-local [0, 6 s] coordinates
+    span_info = tele2[-1].details["patched_spans"][0]
+    assert abs(span_info["target_start_s"] - 0.98) < 0.05
+    assert abs(span_info["donor_start_s"] - 2.5) < 0.05
+
+    # Seam padding + trim_range must fail explicitly
+    with pytest.raises(ValueError, match="trim_range"):
+        apply_recipe_with_seam_padding(
+            full[:n_half],
+            sr,
+            [{"filter_name": "trim_range", "params": {"start_s": 0.5, "end_s": 2.0}}],
+            next_audio_path=part2_wav,
+        )
+    with pytest.raises(ValueError, match="trim_range"):
+        apply_recipe_streaming(
+            part1_wav,
+            tmp_path / "invalid.wav",
+            [{"filter_name": "trim_range", "params": {"start_s": 0.5, "end_s": 2.0}}],
+            next_audio_path=part2_wav,
+        )

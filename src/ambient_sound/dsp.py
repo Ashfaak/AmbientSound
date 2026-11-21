@@ -26,6 +26,8 @@ from ambient_sound.io_audio import (
 )
 from ambient_sound.models import AudioInfo, FilterStep, StepTelemetry
 
+_STREAM_TEMP_FORMAT = "RF64"
+
 FILTER_SPECS: list[dict[str, Any]] = [
     {
         "name": "highpass_rumble",
@@ -1443,21 +1445,160 @@ def apply_recipe_with_telemetry(
 def _shift_step_times(step: FilterStep, offset_s: float) -> FilterStep:
     """Shift time-based parameters on streamable steps relative to a chunk buffer start."""
     params = copy.deepcopy(step.params)
-    if step.filter_name == "band_attenuate":
-        if params.get("start_s") is not None:
-            params["start_s"] = float(params["start_s"]) - offset_s
-        if params.get("end_s") is not None:
-            params["end_s"] = float(params["end_s"]) - offset_s
+    if step.filter_name in {"band_attenuate", "ambience_patch"}:
+        for key in ("start_s", "end_s", "source_start_s"):
+            if params.get(key) is not None:
+                params[key] = float(params[key]) - offset_s
         if params.get("spans"):
             for sp in params["spans"]:
-                sp["start_s"] = float(sp["start_s"]) - offset_s
-                sp["end_s"] = float(sp["end_s"]) - offset_s
+                for key in ("start_s", "end_s", "source_start_s"):
+                    if sp.get(key) is not None:
+                        sp[key] = float(sp[key]) - offset_s
     elif step.filter_name == "spectral_denoise":
         if params.get("noise_start_s") is not None:
             params["noise_start_s"] = float(params["noise_start_s"]) - offset_s
         if params.get("noise_end_s") is not None:
             params["noise_end_s"] = float(params["noise_end_s"]) - offset_s
     return FilterStep(filter_name=step.filter_name, params=params)
+
+
+def _adjust_patched_spans(
+    patch_log: list[dict[str, Any]], head_pad_s: float
+) -> list[dict[str, Any]]:
+    """Shift patched_spans telemetry back from padded buffer coordinates to file-local seconds."""
+    if head_pad_s <= 0.0:
+        return patch_log
+    adjusted: list[dict[str, Any]] = []
+    for item in patch_log:
+        entry = dict(item)
+        for key in ("target_start_s", "target_end_s", "donor_start_s", "donor_end_s"):
+            if entry.get(key) is not None:
+                entry[key] = round(max(0.0, float(entry[key]) - head_pad_s), 3)
+        adjusted.append(entry)
+    return adjusted
+
+
+def _prepare_seam_context(
+    sr: int,
+    ch: int,
+    parsed: list[FilterStep],
+    prev_audio_path: str | Path | None,
+    next_audio_path: str | Path | None,
+    seam_context_s: float,
+) -> tuple[Path | None, int, float, Path | None, int, float]:
+    """Validate seam-padding neighbor files and compute exact sample counts."""
+    if prev_audio_path is None and next_audio_path is None:
+        return None, 0, 0.0, None, 0, 0.0
+    for st in parsed:
+        if st.filter_name in {"trim_range", "cut_regions"}:
+            raise ValueError(
+                "Boundary seam padding (prev_audio_path / next_audio_path) cannot be combined "
+                f"with '{st.filter_name}'."
+            )
+    ctx_s = max(0.5, min(30.0, float(seam_context_s)))
+
+    prev_p: Path | None = None
+    head_frames = 0
+    prev_dur_s = 0.0
+    if prev_audio_path is not None:
+        prev_p = Path(prev_audio_path)
+        p_info = probe_audio(prev_p)
+        if p_info.sample_rate != sr or p_info.channels != ch:
+            raise ValueError(
+                f"prev_audio_path format mismatch ({p_info.sample_rate}Hz/{p_info.channels}ch) "
+                f"vs source ({sr}Hz/{ch}ch)."
+            )
+        prev_dur_s = p_info.duration_s
+        head_frames = min(p_info.frames, max(0, int(round(min(ctx_s, p_info.duration_s) * sr))))
+
+    next_p: Path | None = None
+    tail_frames = 0
+    next_dur_s = 0.0
+    if next_audio_path is not None:
+        next_p = Path(next_audio_path)
+        n_info = probe_audio(next_p)
+        if n_info.sample_rate != sr or n_info.channels != ch:
+            raise ValueError(
+                f"next_audio_path format mismatch ({n_info.sample_rate}Hz/{n_info.channels}ch) "
+                f"vs source ({sr}Hz/{ch}ch)."
+            )
+        next_dur_s = n_info.duration_s
+        tail_frames = min(n_info.frames, max(0, int(round(min(ctx_s, n_info.duration_s) * sr))))
+
+    return prev_p, head_frames, prev_dur_s, next_p, tail_frames, next_dur_s
+
+
+def _read_exact_edge_frames(
+    path: Path, n_frames: int, from_end: bool, fallback_dur_s: float, sr: int
+) -> np.ndarray:
+    """Read exact frame count from the start or end of a neighbor audio file."""
+    if n_frames <= 0:
+        return np.zeros((0, 1), dtype=np.float64)
+    try:
+        with sf.SoundFile(str(path), mode="r") as f:
+            avail = int(f.frames)
+            take = min(avail, n_frames)
+            f.seek(max(0, avail - take) if from_end else 0)
+            data = f.read(take, always_2d=True, dtype="float64")
+            return ensure_2d_audio(data, dtype="float64")
+    except sf.LibsndfileError:
+        s0 = max(0.0, fallback_dur_s - n_frames / float(sr)) if from_end else 0.0
+        s1 = fallback_dur_s if from_end else min(fallback_dur_s, n_frames / float(sr))
+        arr, _ = load_audio_slice(path, start_s=s0, end_s=s1, dtype="float64")
+        return arr[-n_frames:] if from_end else arr[:n_frames]
+
+
+def apply_recipe_with_seam_padding(
+    audio: np.ndarray,
+    sample_rate: int,
+    steps: list[FilterStep] | list[dict[str, Any]],
+    prev_audio_path: str | Path | None = None,
+    next_audio_path: str | Path | None = None,
+    seam_context_s: float = 8.0,
+) -> tuple[np.ndarray, list[StepTelemetry]]:
+    """Apply an in-memory recipe with neighbor seam padding and return telemetry."""
+    sr = int(sample_rate)
+    src_arr = ensure_2d_audio(audio)
+    parsed = [s if isinstance(s, FilterStep) else FilterStep.model_validate(s) for s in steps]
+    prev_p, head_req, prev_dur, next_p, tail_req, next_dur = _prepare_seam_context(
+        sr, src_arr.shape[1], parsed, prev_audio_path, next_audio_path, seam_context_s
+    )
+    if (prev_p is None and next_p is None) or not parsed or (head_req == 0 and tail_req == 0):
+        return apply_recipe_with_telemetry(src_arr, sr, parsed)
+
+    head_pad = (
+        _read_exact_edge_frames(prev_p, head_req, from_end=True, fallback_dur_s=prev_dur, sr=sr)
+        if prev_p is not None and head_req > 0
+        else np.zeros((0, src_arr.shape[1]), dtype=np.float64)
+    )
+    tail_pad = (
+        _read_exact_edge_frames(next_p, tail_req, from_end=False, fallback_dur_s=next_dur, sr=sr)
+        if next_p is not None and tail_req > 0
+        else np.zeros((0, src_arr.shape[1]), dtype=np.float64)
+    )
+    head_frames = head_pad.shape[0]
+    head_pad_s = head_frames / float(sr)
+    orig_frames = src_arr.shape[0]
+    parts = [p for p in (head_pad, src_arr, tail_pad) if p.shape[0] > 0]
+    padded = np.vstack(parts) if parts else src_arr
+
+    working_steps = (
+        [_shift_step_times(st, -head_pad_s) for st in parsed] if head_pad_s > 0.0 else parsed
+    )
+    processed, telemetry = apply_recipe_with_telemetry(padded, sr, working_steps)
+    sliced = processed[head_frames : head_frames + orig_frames].copy()
+
+    for idx, st_orig in enumerate(parsed):
+        if idx < len(telemetry):
+            telemetry[idx].params = copy.deepcopy(st_orig.params)
+            if (
+                st_orig.filter_name == "ambience_patch"
+                and "patched_spans" in telemetry[idx].details
+            ):
+                telemetry[idx].details["patched_spans"] = _adjust_patched_spans(
+                    telemetry[idx].details["patched_spans"], head_pad_s
+                )
+    return sliced, telemetry
 
 
 def _stats_from_accum(
@@ -1527,7 +1668,7 @@ def _stream_local_batch(
         samplerate=sr,
         channels=ch,
         subtype="FLOAT",
-        format="WAV",
+        format=_STREAM_TEMP_FORMAT,
     ) as fout:
         pos = 0
         while pos < total:
@@ -1602,7 +1743,7 @@ def _stream_fade_edges(src_wav: Path, dst_wav: Path, params: dict[str, Any]) -> 
         samplerate=sr,
         channels=ch,
         subtype="FLOAT",
-        format="WAV",
+        format=_STREAM_TEMP_FORMAT,
     ) as fout:
         for start_frame, block in iter_audio_blocks(src_wav, block_seconds=30.0, dtype="float64"):
             n_b = block.shape[0]
@@ -1636,7 +1777,7 @@ def _stream_trim_range(src_wav: Path, dst_wav: Path, params: dict[str, Any]) -> 
         samplerate=info.sample_rate,
         channels=info.channels,
         subtype="FLOAT",
-        format="WAV",
+        format=_STREAM_TEMP_FORMAT,
     ) as fout:
         if s1 > s0:
             for _, block in iter_audio_blocks(
@@ -1658,7 +1799,12 @@ def _stream_cut_regions(src_wav: Path, dst_wav: Path, params: dict[str, Any]) ->
     with (
         sf.SoundFile(str(src_wav), mode="r") as fin,
         sf.SoundFile(
-            str(dst_wav), mode="w", samplerate=sr, channels=ch, subtype="FLOAT", format="WAV"
+            str(dst_wav),
+            mode="w",
+            samplerate=sr,
+            channels=ch,
+            subtype="FLOAT",
+            format=_STREAM_TEMP_FORMAT,
         ) as fout,
     ):
         tail = np.zeros((0, ch), dtype=np.float64)
@@ -1883,7 +2029,12 @@ def _stream_ambience_patch(
     with (
         sf.SoundFile(str(src_wav), mode="r") as fin,
         sf.SoundFile(
-            str(dst_wav), mode="w", samplerate=sr, channels=ch, subtype="FLOAT", format="WAV"
+            str(dst_wav),
+            mode="w",
+            samplerate=sr,
+            channels=ch,
+            subtype="FLOAT",
+            format=_STREAM_TEMP_FORMAT,
         ) as fout,
     ):
         cursor = 0
@@ -1960,7 +2111,12 @@ def _stream_loudness_normalize(
         applied_db = min(desired_db, ceiling_dbtp - tp_db)
         gain_lin = 10.0 ** (applied_db / 20.0)
         with sf.SoundFile(
-            str(dst_wav), mode="w", samplerate=sr, channels=ch, subtype="FLOAT", format="WAV"
+            str(dst_wav),
+            mode="w",
+            samplerate=sr,
+            channels=ch,
+            subtype="FLOAT",
+            format=_STREAM_TEMP_FORMAT,
         ) as fout:
             for _, block in iter_audio_blocks(src_wav, block_seconds=30.0, dtype="float64"):
                 fout.write(block * gain_lin if gain_lin != 1.0 else block)
@@ -2015,7 +2171,9 @@ def _stream_loudness_normalize(
                 ],
                 block_seconds=30.0,
             )
+            prev_pass = cur_wav
             cur_wav = next_pass_wav
+            prev_pass.unlink(missing_ok=True)
             total_gain_db += topup_db
             lufs_1, tp_1 = _probe_stream_lufs_tp(cur_wav)
 
@@ -2027,7 +2185,12 @@ def _stream_loudness_normalize(
             if lufs_1 is not None:
                 lufs_1 += trim_db
             with sf.SoundFile(
-                str(dst_wav), mode="w", samplerate=sr, channels=ch, subtype="FLOAT", format="WAV"
+                str(dst_wav),
+                mode="w",
+                samplerate=sr,
+                channels=ch,
+                subtype="FLOAT",
+                format=_STREAM_TEMP_FORMAT,
             ) as fout:
                 for _, block in iter_audio_blocks(cur_wav, block_seconds=30.0, dtype="float64"):
                     fout.write(block * trim_lin)
@@ -2054,6 +2217,9 @@ def apply_recipe_streaming(
     subtype: str = "PCM_24",
     block_seconds: float = 60.0,
     telemetry_out: list[StepTelemetry] | None = None,
+    prev_audio_path: str | Path | None = None,
+    next_audio_path: str | Path | None = None,
+    seam_context_s: float = 8.0,
 ) -> AudioInfo:
     """Apply an ordered DSP chain file-to-file in bounded RAM for long recordings."""
     src = Path(src_path)
@@ -2065,6 +2231,13 @@ def apply_recipe_streaming(
             known = ", ".join(sorted(_FILTER_HANDLERS))
             raise ValueError(f"Unknown filter '{st.filter_name}'. Available: {known}")
 
+    orig_info = probe_audio(src)
+    sr = orig_info.sample_rate
+    ch = orig_info.channels
+    prev_p, head_req, prev_dur, next_p, tail_req, next_dur = _prepare_seam_context(
+        sr, ch, parsed, prev_audio_path, next_audio_path, seam_context_s
+    )
+
     if not parsed:
         shutil.copy2(src, dst)
         return probe_audio(dst)
@@ -2072,16 +2245,63 @@ def apply_recipe_streaming(
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         cur_wav = src
+        prev_temp: Path | None = None
+        head_frames = 0
+        tail_frames = 0
+        head_pad_s = 0.0
+        working_steps = parsed
+
+        if (prev_p is not None and head_req > 0) or (next_p is not None and tail_req > 0):
+            padded_wav = tmp / "stage_padded.wav"
+            head_pad = (
+                _read_exact_edge_frames(
+                    prev_p, head_req, from_end=True, fallback_dur_s=prev_dur, sr=sr
+                )
+                if prev_p is not None and head_req > 0
+                else np.zeros((0, ch), dtype=np.float64)
+            )
+            tail_pad = (
+                _read_exact_edge_frames(
+                    next_p, tail_req, from_end=False, fallback_dur_s=next_dur, sr=sr
+                )
+                if next_p is not None and tail_req > 0
+                else np.zeros((0, ch), dtype=np.float64)
+            )
+            head_frames = head_pad.shape[0]
+            tail_frames = tail_pad.shape[0]
+            head_pad_s = head_frames / float(sr)
+            with sf.SoundFile(
+                str(padded_wav),
+                mode="w",
+                samplerate=sr,
+                channels=ch,
+                subtype="FLOAT",
+                format=_STREAM_TEMP_FORMAT,
+            ) as fp:
+                if head_frames > 0:
+                    fp.write(head_pad)
+                for _, block in iter_audio_blocks(src, block_seconds=30.0, dtype="float64"):
+                    fp.write(block)
+                if tail_frames > 0:
+                    fp.write(tail_pad)
+            cur_wav = padded_wav
+            prev_temp = padded_wav
+            if head_pad_s > 0.0:
+                working_steps = [_shift_step_times(st, -head_pad_s) for st in parsed]
+
         stage_idx = 0
         i = 0
         prev_levels: tuple[float | None, float | None, float | None] | None = None
-        while i < len(parsed):
-            st = parsed[i]
+        while i < len(working_steps):
+            st = working_steps[i]
             if st.filter_name in _LOCAL_STREAMABLE_FILTERS:
                 batch_base = i
                 batch: list[FilterStep] = []
-                while i < len(parsed) and parsed[i].filter_name in _LOCAL_STREAMABLE_FILTERS:
-                    batch.append(parsed[i])
+                while (
+                    i < len(working_steps)
+                    and working_steps[i].filter_name in _LOCAL_STREAMABLE_FILTERS
+                ):
+                    batch.append(working_steps[i])
                     i += 1
                 next_wav = tmp / f"stage_{stage_idx:03d}.wav"
                 batch_tele: list[StepTelemetry] | None = [] if telemetry_out is not None else None
@@ -2094,6 +2314,8 @@ def apply_recipe_streaming(
                     base_step_index=batch_base,
                 )
                 if telemetry_out is not None and batch_tele:
+                    for k, bt in enumerate(batch_tele):
+                        bt.params = copy.deepcopy(parsed[batch_base + k].params)
                     telemetry_out.extend(batch_tele)
                     prev_levels = (
                         batch_tele[-1].output_rms_dbfs,
@@ -2101,6 +2323,9 @@ def apply_recipe_streaming(
                         batch_tele[-1].output_lufs,
                     )
                 cur_wav = next_wav
+                if prev_temp is not None and prev_temp != src:
+                    prev_temp.unlink(missing_ok=True)
+                prev_temp = next_wav
                 stage_idx += 1
                 continue
 
@@ -2119,7 +2344,7 @@ def apply_recipe_streaming(
             elif st.filter_name == "ambience_patch":
                 patch_log: list[dict[str, Any]] = []
                 _stream_ambience_patch(cur_wav, next_wav, st.params, patch_log_out=patch_log)
-                step_details = {"patched_spans": patch_log}
+                step_details = {"patched_spans": _adjust_patched_spans(patch_log, head_pad_s)}
             elif st.filter_name == "loudness_normalize":
                 norm_info: dict[str, Any] = {}
                 _stream_loudness_normalize(cur_wav, next_wav, st.params, info_out=norm_info)
@@ -2136,7 +2361,7 @@ def apply_recipe_streaming(
                     StepTelemetry(
                         step_index=i,
                         filter_name=st.filter_name,
-                        params=copy.deepcopy(st.params),
+                        params=copy.deepcopy(parsed[i].params),
                         input_rms_dbfs=in_rms,
                         output_rms_dbfs=out_rms,
                         input_peak_dbfs=in_pk,
@@ -2149,26 +2374,54 @@ def apply_recipe_streaming(
                 prev_levels = (out_rms, out_pk, eff_out_lufs)
 
             cur_wav = next_wav
+            if prev_temp is not None and prev_temp != src:
+                prev_temp.unlink(missing_ok=True)
+            prev_temp = next_wav
             stage_idx += 1
             i += 1
 
-        # Materialize final output in requested subtype
+        # Materialize final output in requested subtype (slicing off any boundary padding)
         info = probe_audio(cur_wav)
-        if cur_wav.suffix.lower() == ".wav" and info.subtype == subtype:
+        padded_run = head_frames > 0 or tail_frames > 0
+        out_frames = (
+            min(orig_info.frames, max(0, info.frames - head_frames)) if padded_run else info.frames
+        )
+        bytes_per_sample = 4 if subtype == "FLOAT" else 3
+        est_bytes = out_frames * ch * bytes_per_sample + 4096
+        out_format = "RF64" if est_bytes >= 3_800_000_000 else "WAV"
+
+        if (
+            not padded_run
+            and cur_wav.suffix.lower() == ".wav"
+            and info.subtype == subtype
+            and info.format_name.upper() == out_format
+        ):
             shutil.copy2(cur_wav, dst)
         else:
-            with sf.SoundFile(
-                str(dst),
-                mode="w",
-                samplerate=info.sample_rate,
-                channels=info.channels,
-                subtype=subtype,
-                format="WAV",
-            ) as fout:
-                for _, block in iter_audio_blocks(cur_wav, block_seconds=30.0, dtype="float64"):
-                    if subtype != "FLOAT" and block.size:
-                        block = np.clip(block, -1.0, 0.999999)
-                    fout.write(block)
+            block_frames = max(4096, sr * 30)
+            rem = out_frames
+            with (
+                sf.SoundFile(str(cur_wav), mode="r") as fin,
+                sf.SoundFile(
+                    str(dst),
+                    mode="w",
+                    samplerate=sr,
+                    channels=ch,
+                    subtype=subtype,
+                    format=out_format,
+                ) as fout,
+            ):
+                if head_frames > 0:
+                    fin.seek(head_frames)
+                while rem > 0:
+                    to_read = min(block_frames, rem)
+                    blk = fin.read(to_read, always_2d=True, dtype="float64")
+                    if blk.size == 0:
+                        break
+                    if subtype != "FLOAT":
+                        blk = np.clip(blk, -1.0, 0.999999)
+                    fout.write(blk)
+                    rem -= blk.shape[0]
 
     return probe_audio(dst)
 

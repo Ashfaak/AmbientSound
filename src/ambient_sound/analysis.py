@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
+from bisect import bisect_left, bisect_right
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import pyloudnorm as pyln
@@ -16,7 +17,7 @@ from ambient_sound.io_audio import (
     load_audio_slice,
     probe_audio,
 )
-from ambient_sound.models import AudioMetrics, DistractionEvent
+from ambient_sound.models import AudioMetrics, DistractionEvent, ProcessingRecipe
 
 SensitivityLevel = Literal["low", "medium", "high"]
 
@@ -1533,3 +1534,398 @@ def analyze_file(
         short_term_lufs_timeline=short_term_lufs_timeline,
     )
     return metrics, events
+
+
+YOUTUBE_ASMR_DURATIONS_MIN: tuple[int, ...] = (
+    10,
+    15,
+    20,
+    30,
+    45,
+    60,
+    90,
+    120,
+    180,
+    240,
+    300,
+    360,
+    480,
+    600,
+)
+
+_LOCALIZED_DISTRACTION_KINDS = frozenset(
+    {"low_freq_rumble", "transient_distraction", "slow_pass", "clipping"}
+)
+
+
+def _format_hms(seconds: float) -> str:
+    total_s = max(0, int(round(float(seconds))))
+    hours, rem = divmod(total_s, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _format_round_duration(minutes: int) -> str:
+    if minutes < 60:
+        return f"{minutes} min"
+    if minutes % 60 == 0:
+        return f"{minutes // 60} hr"
+    if minutes % 30 == 0:
+        return f"{minutes / 60.0:.1f} hr"
+    return f"{minutes} min"
+
+
+def _merge_span_list(spans: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    if not spans:
+        return []
+    ordered = sorted((float(s), float(e)) for s, e in spans if float(e) > float(s))
+    if not ordered:
+        return []
+    merged: list[tuple[float, float]] = [ordered[0]]
+    for s, e in ordered[1:]:
+        if s <= merged[-1][1] + 1e-6:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def _apply_cut_transform(
+    spans: list[tuple[float, float]], regions: list[dict[str, Any]]
+) -> list[tuple[float, float]]:
+    """Remap prior spans past cut_regions and insert brief splice markers at cut joins."""
+    cuts = _merge_span_list(
+        [
+            (float(r["start_s"]), float(r["end_s"]))
+            for r in regions
+            if "start_s" in r and "end_s" in r
+        ]
+    )
+    if not cuts:
+        return spans
+
+    def _removed_before(t: float) -> float:
+        removed = 0.0
+        for cs, ce in cuts:
+            if t <= cs:
+                break
+            removed += min(t, ce) - cs
+        return removed
+
+    remapped: list[tuple[float, float]] = []
+    for s, e in spans:
+        cur_s = s
+        for cs, ce in cuts:
+            if ce <= cur_s:
+                continue
+            if cs >= e:
+                break
+            if cur_s < cs:
+                off = _removed_before(cur_s)
+                remapped.append((cur_s - off, cs - off))
+            cur_s = max(cur_s, ce)
+        if cur_s < e:
+            off = _removed_before(cur_s)
+            remapped.append((cur_s - off, e - off))
+
+    # Mark each kept-segment splice boundary so crossfaded cuts split untouched spans.
+    removed_so_far = 0.0
+    for cs, ce in cuts:
+        join_t = max(0.0, cs - removed_so_far)
+        remapped.append((max(0.0, join_t - 0.25), join_t + 0.25))
+        removed_so_far += ce - cs
+    return remapped
+
+
+def extract_localized_edit_spans(
+    recipe: ProcessingRecipe | dict[str, Any] | None,
+) -> list[tuple[float, float]]:
+    """Extract finalized spans where localized edits (band_attenuate/ambience_patch) ran."""
+    if recipe is None:
+        return []
+    steps = recipe.get("steps") or [] if isinstance(recipe, dict) else list(recipe.steps)
+    cur_spans: list[tuple[float, float]] = []
+
+    for st in steps:
+        fname = st.get("filter_name") if isinstance(st, dict) else st.filter_name
+        params = st.get("params") or {} if isinstance(st, dict) else dict(st.params)
+        if fname in {"band_attenuate", "ambience_patch"}:
+            if params.get("spans"):
+                for sp in params["spans"]:
+                    s = sp.get("start_s")
+                    e = sp.get("end_s")
+                    if s is not None and e is not None and float(e) > float(s):
+                        cur_spans.append((max(0.0, float(s)), float(e)))
+            else:
+                s = params.get("start_s")
+                e = params.get("end_s")
+                if s is not None and e is not None and float(e) > float(s):
+                    cur_spans.append((max(0.0, float(s)), float(e)))
+        elif fname == "trim_range":
+            t0 = max(0.0, float(params.get("start_s", 0.0)))
+            t1_raw = params.get("end_s")
+            t1 = float("inf") if t1_raw is None else float(t1_raw)
+            shifted: list[tuple[float, float]] = []
+            for s, e in cur_spans:
+                cs = max(t0, s)
+                ce = min(t1, e)
+                if ce > cs:
+                    shifted.append((cs - t0, ce - t0))
+            cur_spans = shifted
+        elif fname == "cut_regions":
+            cur_spans = _apply_cut_transform(cur_spans, params.get("regions") or [])
+
+    return _merge_span_list(cur_spans)
+
+
+def extract_localized_distraction_spans(
+    events: list[DistractionEvent],
+) -> list[tuple[float, float]]:
+    """Extract residual localized distraction spans (excluding clicks and steady global drones)."""
+    raw = [
+        (max(0.0, float(ev.start_s)), float(ev.end_s))
+        for ev in events
+        if ev.kind in _LOCALIZED_DISTRACTION_KINDS and float(ev.end_s) > float(ev.start_s)
+    ]
+    return _merge_span_list(raw)
+
+
+def _count_and_overlap(
+    intervals: list[tuple[float, float]],
+    starts: list[float],
+    ends: list[float],
+    w0: float,
+    w1: float,
+    prefix_dur: list[float] | None = None,
+) -> tuple[int, float]:
+    """Count intervals intersecting (w0, w1) and optionally sum their overlap in O(log N)."""
+    if not intervals:
+        return 0, 0.0
+    lo = bisect_right(ends, w0 + 1e-9)
+    hi = bisect_left(starts, w1 - 1e-9)
+    count = max(0, hi - lo)
+    if prefix_dur is None or count == 0:
+        return count, 0.0
+    if count == 1:
+        s, e = intervals[lo]
+        return 1, max(0.0, min(e, w1) - max(s, w0))
+    total = 0.0
+    s_first, e_first = intervals[lo]
+    total += max(0.0, min(e_first, w1) - max(s_first, w0))
+    if hi - lo > 2:
+        total += prefix_dur[hi - 1] - prefix_dur[lo + 1]
+    s_last, e_last = intervals[hi - 1]
+    total += max(0.0, min(e_last, w1) - max(s_last, w0))
+    return count, total
+
+
+def compute_clean_sections(
+    segments: list[dict[str, Any]],
+    max_edits_per_hour: float = 2.0,
+    max_edited_pct: float = 1.0,
+) -> dict[str, Any]:
+    """Find largest untouched and minimal-edit stretches sized for YouTube ASMR videos."""
+    if not segments:
+        return {
+            "total_duration_s": 0.0,
+            "total_duration_hms": "00:00:00",
+            "segment_count": 0,
+            "total_localized_edits": 0,
+            "total_localized_distractions": 0,
+            "largest_untouched_raw_min": 0,
+            "largest_untouched_asmr_target": None,
+            "largest_minimal_edit_asmr_target": None,
+            "top_untouched_gaps": [],
+            "asmr_targets": [],
+        }
+
+    seg_bounds: list[tuple[float, float, str]] = []
+    all_edits: list[tuple[float, float]] = []
+    all_distractions: list[tuple[float, float]] = []
+    cum_t = 0.0
+
+    for seg in segments:
+        dur = max(0.0, float(seg.get("duration_s", 0.0)))
+        label = str(seg.get("label") or f"segment_{len(seg_bounds) + 1}")
+        seg_start = cum_t
+        seg_end = cum_t + dur
+        seg_bounds.append((seg_start, seg_end, label))
+
+        for s, e in seg.get("edit_spans") or []:
+            cs = max(0.0, min(dur, float(s)))
+            ce = max(0.0, min(dur, float(e)))
+            if ce > cs:
+                all_edits.append((seg_start + cs, seg_start + ce))
+        for s, e in seg.get("distraction_spans") or []:
+            cs = max(0.0, min(dur, float(s)))
+            ce = max(0.0, min(dur, float(e)))
+            if ce > cs:
+                all_distractions.append((seg_start + cs, seg_start + ce))
+        cum_t = seg_end
+
+    total_dur = cum_t
+    if total_dur <= 0.0:
+        return {
+            "total_duration_s": 0.0,
+            "total_duration_hms": "00:00:00",
+            "segment_count": len(segments),
+            "total_localized_edits": 0,
+            "total_localized_distractions": 0,
+            "largest_untouched_raw_min": 0,
+            "largest_untouched_asmr_target": None,
+            "largest_minimal_edit_asmr_target": None,
+            "top_untouched_gaps": [],
+            "asmr_targets": [],
+        }
+
+    seg_ends = [b[1] for b in seg_bounds]
+
+    def _map_cum_time(t: float) -> tuple[str, float, str]:
+        clamped = max(0.0, min(total_dur, float(t)))
+        idx = min(len(seg_bounds) - 1, bisect_right(seg_ends, clamped))
+        if idx > 0 and abs(clamped - seg_bounds[idx - 1][1]) < 1e-6:
+            idx -= 1
+        b_s, _, b_label = seg_bounds[idx]
+        local_s = max(0.0, clamped - b_s)
+        return b_label, round(local_s, 1), _format_hms(local_s)
+
+    merged_edits = _merge_span_list(all_edits)
+    merged_distractions = _merge_span_list(all_distractions)
+    merged_issues = _merge_span_list([*merged_edits, *merged_distractions])
+
+    edit_starts = [s for s, _ in merged_edits]
+    edit_ends = [e for _, e in merged_edits]
+    dist_starts = [s for s, _ in merged_distractions]
+    dist_ends = [e for _, e in merged_distractions]
+    issue_starts = [s for s, _ in merged_issues]
+    issue_ends = [e for _, e in merged_issues]
+    issue_prefix = [0.0]
+    for s, e in merged_issues:
+        issue_prefix.append(issue_prefix[-1] + (e - s))
+
+    untouched_gaps: list[tuple[float, float]] = []
+    cur = 0.0
+    for is_s, is_e in merged_issues:
+        if is_s > cur + 1e-6:
+            untouched_gaps.append((cur, is_s))
+        cur = max(cur, is_e)
+    if total_dur > cur + 1e-6:
+        untouched_gaps.append((cur, total_dur))
+    untouched_gaps.sort(key=lambda g: (-(g[1] - g[0]), g[0]))
+
+    longest_gap_s = (untouched_gaps[0][1] - untouched_gaps[0][0]) if untouched_gaps else 0.0
+    largest_untouched_raw_min = int(longest_gap_s // 60.0)
+
+    cand_durations = [
+        d
+        for d in YOUTUBE_ASMR_DURATIONS_MIN
+        if d * 60.0 <= total_dur + 1e-6 and (d > 10 or total_dur < 1800.0)
+    ]
+
+    top_gaps_src = [g for g in untouched_gaps if (g[1] - g[0]) >= 60.0] or untouched_gaps
+    top_untouched_gaps: list[dict[str, Any]] = []
+    for g0, g1 in top_gaps_src[:5]:
+        raw_dur = g1 - g0
+        r_start = float(math.ceil(g0))
+        r_end = float(math.floor(g1))
+        if r_end <= r_start:
+            r_start, r_end = round(g0, 1), round(g1, 1)
+        fit_min = max((d for d in cand_durations if d * 60.0 <= raw_dur + 1e-6), default=None)
+        sf_name, _, s_loc_hms = _map_cum_time(r_start)
+        ef_name, _, e_loc_hms = _map_cum_time(r_end)
+        top_untouched_gaps.append(
+            {
+                "duration_s": round(raw_dur, 1),
+                "duration_min": int(raw_dur // 60.0),
+                "round_asmr_label": _format_round_duration(fit_min) if fit_min else None,
+                "start_s": r_start,
+                "end_s": r_end,
+                "start_hms": _format_hms(r_start),
+                "end_hms": _format_hms(r_end),
+                "start_file": sf_name,
+                "start_local_hms": s_loc_hms,
+                "end_file": ef_name,
+                "end_local_hms": e_loc_hms,
+            }
+        )
+
+    asmr_targets: list[dict[str, Any]] = []
+    for d_min in cand_durations:
+        win_s = float(d_min * 60)
+        max_start = max(0.0, total_dur - win_s)
+        cand_starts: set[float] = {0.0, round(max_start, 2)}
+        for m in range(int(max_start // 60.0) + 1):
+            cand_starts.add(float(m * 60))
+        for g0, g1 in untouched_gaps:
+            s_ceil = float(math.ceil(g0))
+            if s_ceil <= max_start + 1e-6:
+                cand_starts.add(min(max_start, s_ceil))
+            s_tail = float(math.floor(g1)) - win_s
+            if 0.0 <= s_tail <= max_start + 1e-6:
+                cand_starts.add(min(max_start, max(0.0, s_tail)))
+
+        best_key: tuple[int, float, int, float] | None = None
+        best_info: tuple[float, float, int, int, float] | None = None
+        for s_cand in sorted(cand_starts):
+            w0 = max(0.0, min(max_start, s_cand))
+            w1 = w0 + win_s
+            n_ed, _ = _count_and_overlap(merged_edits, edit_starts, edit_ends, w0, w1)
+            n_dist, _ = _count_and_overlap(merged_distractions, dist_starts, dist_ends, w0, w1)
+            _, edited_s = _count_and_overlap(
+                merged_issues, issue_starts, issue_ends, w0, w1, prefix_dur=issue_prefix
+            )
+            round_pref = 0 if abs(w0 % 60.0) < 1e-6 else 1
+            score_key = (n_ed + n_dist, round(edited_s, 3), round_pref, w0)
+            if best_key is None or score_key < best_key:
+                best_key = score_key
+                best_info = (w0, w1, n_ed, n_dist, edited_s)
+
+        if best_info is None:
+            continue
+        w0, w1, n_ed, n_dist, edited_s = best_info
+        edited_pct = round(100.0 * edited_s / max(win_s, 1e-6), 3)
+        max_allowed = max(1, int(round(float(max_edits_per_hour) * (d_min / 60.0))))
+        if n_ed == 0 and n_dist == 0:
+            tier = "untouched"
+        elif (n_ed + n_dist) <= max_allowed and edited_pct <= float(max_edited_pct):
+            tier = "minimal_edits"
+        else:
+            tier = "moderate_edits"
+
+        sf_name, _, s_loc_hms = _map_cum_time(w0)
+        ef_name, _, e_loc_hms = _map_cum_time(w1)
+        asmr_targets.append(
+            {
+                "duration_label": _format_round_duration(d_min),
+                "duration_min": int(d_min),
+                "tier": tier,
+                "start_s": round(w0, 1),
+                "end_s": round(w1, 1),
+                "start_hms": _format_hms(w0),
+                "end_hms": _format_hms(w1),
+                "start_file": sf_name,
+                "start_local_hms": s_loc_hms,
+                "end_file": ef_name,
+                "end_local_hms": e_loc_hms,
+                "edit_count": int(n_ed),
+                "distraction_count": int(n_dist),
+                "edited_s": round(edited_s, 1),
+                "edited_pct": edited_pct,
+            }
+        )
+
+    untouched_targets = [t for t in asmr_targets if t["tier"] == "untouched"]
+    minimal_targets = [t for t in asmr_targets if t["tier"] in {"untouched", "minimal_edits"}]
+
+    return {
+        "total_duration_s": round(total_dur, 1),
+        "total_duration_hms": _format_hms(total_dur),
+        "segment_count": len(segments),
+        "total_localized_edits": len(merged_edits),
+        "total_localized_distractions": len(merged_distractions),
+        "largest_untouched_raw_min": largest_untouched_raw_min,
+        "largest_untouched_asmr_target": untouched_targets[-1] if untouched_targets else None,
+        "largest_minimal_edit_asmr_target": minimal_targets[-1] if minimal_targets else None,
+        "top_untouched_gaps": top_untouched_gaps,
+        "asmr_targets": asmr_targets,
+    }

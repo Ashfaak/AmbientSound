@@ -1,7 +1,7 @@
-# AmbientSound MCP — Agent Operational Instructions (`v0.3.1`)
+# AmbientSound MCP — Agent Operational Instructions (`v0.3.2`)
 
 > **Handover Guide for Any AI Model / MCP Agent**
-> Use this document as your complete operational manual for the **AmbientSound** MCP server—covering preflight verification, short and multi-hour (672 MB+) field recordings, wildlife/hive + traffic/machine cleanup, loudness-matched A/B listening feedback, and YouTube/ASMR mastering.
+> Use this document as your complete operational manual for the **AmbientSound** MCP server—covering preflight verification, short, multi-hour (672 MB+), and multi-file split continuous (Zoom H5 2 GB+) field recordings, wildlife/hive + traffic/machine cleanup, loudness-matched A/B listening feedback, clean YouTube ASMR section discovery, and mastering.
 
 ---
 
@@ -66,27 +66,28 @@ Core rules:
 
 ---
 
-## 3. MCP Tool Reference (15 Tools)
+## 3. MCP Tool Reference (16 Tools)
 
-All tools return JSON objects (`dict`). Unmeasurable metrics (e.g., LUFS on `<0.45 s` or silence) return `null` instead of `NaN`/`±inf`. Analysis/take tools archive complete detections to `events.json` per take, include full per-kind totals (`event_counts`, `events_total`, `events_truncated`), and default to `max_events=50` (prioritizing sustained events ahead of `impulsive_click`s) so responses stay compact on long files.
+All tools return JSON objects (`dict`). Unmeasurable metrics (e.g., LUFS on `<0.45 s` or silence) return `null` instead of `NaN`/`±inf`. Analysis/take tools archive complete detections to `events.json` per take, include full per-kind totals (`event_counts`, `events_total`, `events_truncated`), include a `clean_sections` YouTube ASMR summary by default on takes and full-take analyses, and default to `max_events=50` (prioritizing sustained events ahead of `impulsive_click`s) so responses stay compact on long files.
 
 | Tool | Arguments | Purpose & Return |
 | :--- | :--- | :--- |
 | `health_check` | `()` | Confirms `status`, `version`, `allowed_roots`, `ffmpeg_available`, `workspace_free_gb`, `streaming_threshold_s` (`120.0 s`), and `filter_count` (`15`). |
 | `list_filters` | `()` | Returns `{"filters": [...]}` with exact parameter schemas, bounds, and defaults. |
-| `create_session` | `(audio_path, name="", event_kinds=None, max_events=50, include_events=True)` | Ingests audio into `take_000` in bounded RAM (`shutil.copy2` for WAV; streaming `PCM_24` otherwise), runs streaming analysis (`loudness_range_lu`, `ambient_bed_dbfs`, `noise_floor_dbfs`, `high_freq_floor_dbfs`, `short_term_lufs_stats`, `short_term_lufs_timeline`), writes `events.json`, renders overview PNG (`n_fft=8192`). |
+| `create_session` | `(audio_path, name="", event_kinds=None, max_events=50, include_events=True)` | Ingests audio into `take_000` in bounded RAM (`shutil.copy2` for WAV; streaming `PCM_24` otherwise), runs streaming analysis (`loudness_range_lu`, `ambient_bed_dbfs`, `noise_floor_dbfs`, `high_freq_floor_dbfs`, `short_term_lufs_stats`, `short_term_lufs_timeline`), writes `events.json`, renders overview PNG (`n_fft=8192`), and includes `clean_sections`. |
 | `list_sessions` | `()` | Returns `{"sessions": [...]}` summary list. |
-| `get_session_summary` | `(session_id, event_kinds=None, max_events=50, include_events=True)` | Returns `SessionSummary` (`takes`, `metrics`, `event_counts`, `step_metrics`, bounded `events`, `ab_tests`). |
-| `analyze_take` | `(session_id, take_id, sensitivity="medium", min_event_s=0.12, max_event_s=45.0, freq_range_hz=None, event_kinds=None, max_events=50, include_events=True)` | Full-file streaming analysis with `30–8000 Hz` median-PSD persistent tonal detection and dual-timescale `1.0 s` slow-pass hysteresis. Pass `min_event_s > 0.15` or `event_kinds=[...]` to skip short clicks. |
+| `get_session_summary` | `(session_id, event_kinds=None, max_events=50, include_events=True)` | Returns `SessionSummary` (`takes` with `clean_sections`, `metrics`, `event_counts`, `step_metrics`, bounded `events`, `ab_tests`). |
+| `analyze_take` | `(session_id, take_id, sensitivity="medium", min_event_s=0.12, max_event_s=45.0, freq_range_hz=None, event_kinds=None, max_events=50, include_events=True)` | Full-file streaming analysis with `30–8000 Hz` median-PSD persistent tonal detection and dual-timescale `1.0 s` slow-pass hysteresis, plus `clean_sections`. Pass `min_event_s > 0.15` or `event_kinds=[...]` to skip short clicks. |
 | `analyze_region` | `(session_id, take_id, start_s=0.0, end_s=None, sensitivity="medium", min_event_s=0.12, max_event_s=45.0, freq_range_hz=None, event_kinds=None, max_events=50, include_events=True)` | Analyzes `[start_s, end_s]` with `-92.0 dBFS` gate floor and returns absolute recording timestamps (`+ start_s`). |
 | `render_spectrogram` | `(session_id, take_id, compare_to_take_id="", start_s=None, end_s=None)` | Renders full overview (`>60 s` sampled) or zoomed (`<=60 s`) `n_fft=8192` PNG (suppressing `>40` click markers on waveform) and gain-matched Before/After/Diff PNGs with `Patched` spans shaded. |
-| `process_take` | `(session_id, parent_take_id, steps, label="", notes="", event_kinds=None, max_events=50, include_events=True)` | Runs DSP recipe sequentially (`>120 s` streams file-to-file), writes immutable `take_NNN`, tracks `source_offset_s`/`timeline_modified`, records per-step `step_metrics` (including RMS, peak & LUFS) & donor provenance, and renders visuals. |
+| `process_take` | `(session_id, parent_take_id, steps, label="", notes="", event_kinds=None, max_events=50, include_events=True, prev_audio_path=None, next_audio_path=None, seam_context_s=8.0)` | Runs DSP recipe sequentially (`>120 s` streams file-to-file via RF64 stages with immediate temp cleanup), optionally pads boundaries from adjacent split files (`seam_context_s=8.0`) for sample-continuous seams, writes immutable `take_NNN`, tracks `source_offset_s`/`timeline_modified`, records `step_metrics` & `clean_sections`, and renders visuals. |
 | `create_ab_test` | `(session_id, take_a_id, take_b_id, focus_start_s=None, focus_end_s=None, blind=False, notes="", original_take_id=None, match_original=False)` | Creates attenuation-only A/B test. `original_take_id=None` auto-selects the shared common ancestor (`take_a`/`take_b` lineage intersection) and computes `original_offset_s` so trimmed previews align automatically. `match_original=False` matches LUFS between A and B. |
 | `list_ab_tests` | `(session_id)` | Returns `{"ab_tests": [...]}` with verdicts and `ui_url`s. |
 | `get_ab_feedback` | `(session_id, ab_id)` | Retrieves `verdict` (`winner`, `artifact_tags`, `comment`, `submitted_at`). |
 | `delete_take` | `(session_id, take_id, cascade=False)` | Deletes an abandoned non-root take (`take_000` protected) and orphaned A/B tests; returns an explicit `ToolError` naming child takes and `cascade=True` if children exist. |
 | `delete_session` | `(session_id)` | Permanently deletes an entire session directory and its takes. |
 | `export_take` | `(session_id, take_id, output_path, format="wav")` | Stream-exports take to `wav` (24-bit), `flac` (24-bit), `mp3` (320k), or `ogg`. |
+| `find_clean_sections` | `(session_id="", take_id="", sequence=None, max_edits_per_hour=2.0, max_edited_pct=1.0)` | Computes largest **untouched** and **minimal-edit** stretches in round YouTube ASMR durations (`15 min`, `30 min`, `45 min`, `1 hr`, `1.5 hr`, `2 hr`, `3 hr`, `4 hr`, `6 hr`, `8 hr`, `10 hr`) for one take or an ordered multi-file `sequence=[{"session_id": ..., "take_id": ...}]`. |
 
 ---
 
@@ -124,6 +125,13 @@ When `duration_s > 120.0` (e.g., an hour-long `48 kHz / 24-bit` WAV), AmbientSou
   4. **Prototype on a `trim_range` preview slice first:** Create `take_001 = trim_range(start_s=..., end_s=...)`, branch Candidate A (`band_attenuate(envelope_mode="adaptive")`) vs Candidate B (`ambience_patch`), and run `create_ab_test(session, take_a, take_b)` — AmbientSound automatically uses `take_001` as the time-aligned Original reference and matches loudness between A and B (`match_original=False`).
   5. Apply the winning full-file chain cleanly from `take_000` using batched `spans` (`band_attenuate` `adaptive` / `ambience_patch` with per-span `crossfade_ms`) and mastering (`gain` -> `parametric_eq` -> `soft_compress` -> `loudness_normalize(..., limit_peaks=True)` -> `fade_edges`).
   6. **A/B Studio on Long Files:** Always pass `focus_start_s` and `focus_end_s` when calling `create_ab_test` on takes `> 90 s` so the Web Studio loads fast `<= 90 s` windows and computes loudness-matched dynamic residuals on hotkey `4`.
+
+### 5b. Split Multi-File Continuous Recordings (Zoom H5 / 2 GB+ Splits)
+When a field recorder splits one continuous night recording across consecutive files (e.g. `ZOOM0004.WAV` -> `ZOOM0005.WAV` -> `...`), adjacent outputs must play seamlessly without level steps or filter clicks at the join:
+1. **Pass neighbor seam padding on `process_take`:** Set `prev_audio_path` (for file `N > 1`, pointing to raw file `N-1`) and `next_audio_path` (for file `N < last`, pointing to raw file `N+1`) with `seam_context_s=8.0`. This primes IIR filters (`highpass_rumble`, `drone_notch`, `parametric_eq`), `soft_compress` RMS envelopes, and `true_peak_limiter` lookahead smoothly across every boundary before slicing back exact original sample boundaries.
+2. **Use ONE unified fixed mastering gain across all segments (never independent per-file `loudness_normalize`):** Per-file normalization assigns different gains when one split segment happens to have fewer vehicles or quieter insects than its neighbor, causing an audible jump at the split seam. Instead, calibrate the shared tone chain + a single fixed post-compression `gain` + `true_peak_limiter(ceiling_dbtp=-1.0, release_ms=60.0)` on a representative preview so the combined sequence centers around `-14 LUFS`, then apply that exact chain uniformly to every file.
+3. **Outer edges & continuous seams only:** Apply `fade_edges(fade_in_s=3.0, fade_out_s=0.0)` only on the first file, omit `fade_edges` on interior files, and apply `fade_edges(fade_in_s=0.0, fade_out_s=5.0)` only on the final file. Do **not** call `trim_range` or `cut_regions` across split boundaries.
+4. **Always include the Clean Sections Report:** On both single finalized takes and multi-file continuous sequences, read `clean_sections` (or call `find_clean_sections(sequence=[...])`) and report by default the largest **untouched** (`0` localized edits or residual distractions) and **minimal-edit** stretches formatted in round YouTube ASMR durations (`15 min`, `30 min`, `45 min`, `1 hr`, `1.5 hr`, `2 hr`, `3 hr`, `4 hr`, `6 hr`, `8 hr`, ...) with cumulative and per-file local `HH:MM:SS` start/end times.
 
 ---
 

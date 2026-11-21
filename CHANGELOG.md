@@ -12,6 +12,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Phase 3: Text-queried target distraction separation (`AudioSep` / `CLAPSep`) behind license-aware model opt-in controls.
 - Phase 4: Multi-take history DAG visualizer and optional external `ferraus` CLI backend adapter.
 
+## [0.3.2] - 2026-11-21
+
+### Added
+- **Split-File Boundary Seam Continuity (`process_take` / `dsp.py`):** Added optional `prev_audio_path`, `next_audio_path`, and `seam_context_s=8.0` to `process_take`, `apply_recipe_streaming`, and `apply_recipe_with_seam_padding`. Neighbor boundary context primes IIR filters, dynamic envelopes, and lookahead limiting seamlessly across recorder file splits (such as Zoom H5 2 GB chunks) before trimming back to exact original sample boundaries (`trim_range`/`cut_regions` explicitly rejected when seam padding is set).
+- **Default Round-Number YouTube ASMR `clean_sections` Reporting & `find_clean_sections` MCP Tool:** Added `compute_clean_sections`, `extract_localized_edit_spans`, and `extract_localized_distraction_spans` in `analysis.py`, surfaced `clean_sections` by default in `create_session`, `get_session_summary`, `process_take`, and `analyze_take`, and added `find_clean_sections` to rank untouched and minimal-edit stretches in round YouTube ASMR durations (`15 min`, `30 min`, `45 min`, `1 hr`, `1.5 hr`, `2 hr`, `3 hr`, `4 hr`, `6 hr`, `8 hr`, `10 hr`) across single takes or ordered multi-file sequences.
+- Updated `instructions.md` (`v0.3.2`) with Section 5b documenting multi-file continuous split workflow, unified fixed mastering gain, outer-edge-only fades, and default clean-section reporting.
+
+### Fixed
+- **Streaming 4 GiB RIFF Safety & Immediate Temp Cleanup:** Switched all internal 32-bit float streaming temp stages in `dsp.py` (`_STREAM_TEMP_FORMAT = "RF64"`, plus `RF64` final output when `>= 3.8 GB`) to avoid the 4 GiB RIFF WAV header cap on 2–3+ hour files, and unlinked superseded temporary stage files immediately after each stage (including intermediate `loudness_normalize` limiter passes) to halve transient disk footprint.
+
 ## [0.3.1] - 2026-11-20
 
 ### Fixed

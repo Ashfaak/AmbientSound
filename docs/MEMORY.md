@@ -5,7 +5,7 @@ Persistent architecture decisions, verified environment facts, invariants, and a
 ---
 
 ## 1. Confirmed Decisions
-- **Date:** 2026-11-20 (`v0.3.1` field calibration: median-PSD tonal detection, `1.0 s` slow-pass hysteresis, strict LCA `original_offset_s`, streaming LUFS telemetry, and actionable `ToolError`s)
+- **Date:** 2026-11-21 (`v0.3.2` multi-file continuity, RF64 temp streaming cleanup, and default YouTube ASMR clean-section reporting)
 - **Repository:** `Ashfaak/AmbientSound` (Public GitHub repo, `main` branch, `git@github.com:Ashfaak/AmbientSound.git`).
 - **License:** `Apache-2.0` (`LICENSE` + `NOTICE`). Strictly permissive runtime/dev dependencies only (no GPL/AGPL Python imports).
 - **Primary Stack:** Python 3.12 (`uv` environment), `mcp>=2.0.0` (`MCPServer`, `stdio`), `numpy`, `scipy`, `soundfile`, `pyloudnorm`, `matplotlib`, `fastapi`, `uvicorn`, `pydantic`.

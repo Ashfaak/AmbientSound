@@ -17,13 +17,16 @@ from ambient_sound.analysis import (
     SensitivityLevel,
     analyze_audio,
     analyze_file,
+    compute_clean_sections,
     event_kind_counts,
+    extract_localized_distraction_spans,
+    extract_localized_edit_spans,
     summarize_events,
 )
 from ambient_sound.config import Settings, ensure_path_allowed
 from ambient_sound.dsp import (
     apply_recipe_streaming,
-    apply_recipe_with_telemetry,
+    apply_recipe_with_seam_padding,
     compute_residual,
 )
 from ambient_sound.io_audio import (
@@ -328,6 +331,9 @@ class SessionManager:
         steps: list[FilterStep] | list[dict[str, Any]],
         label: str = "",
         notes: str = "",
+        prev_audio_path: str | Path | None = None,
+        next_audio_path: str | Path | None = None,
+        seam_context_s: float = 8.0,
     ) -> TakeRecord:
         """Apply an ordered filter chain to a parent take, producing a new immutable child take."""
         summary = self.get_session(session_id)
@@ -335,9 +341,24 @@ class SessionManager:
         parsed_steps = [
             s if isinstance(s, FilterStep) else FilterStep.model_validate(s) for s in steps
         ]
+        prev_p = (
+            ensure_path_allowed(prev_audio_path, self.settings)
+            if prev_audio_path is not None and str(prev_audio_path).strip()
+            else None
+        )
+        next_p = (
+            ensure_path_allowed(next_audio_path, self.settings)
+            if next_audio_path is not None and str(next_audio_path).strip()
+            else None
+        )
         changes_length = any(
             st.filter_name in {"trim_range", "cut_regions"} for st in parsed_steps
         )
+        if changes_length and (prev_p is not None or next_p is not None):
+            raise ValueError(
+                "Boundary seam padding (prev_audio_path / next_audio_path) cannot be combined "
+                "with trim_range or cut_regions."
+            )
         cur_offset = parent.source_offset_s
         timeline_mod = parent.timeline_modified
         for st in parsed_steps:
@@ -367,8 +388,13 @@ class SessionManager:
 
         if parent_info.duration_s <= STREAMING_THRESHOLD_S:
             parent_audio, sr = load_audio(parent.audio_path)
-            processed, step_metrics = apply_recipe_with_telemetry(
-                parent_audio, sr, parsed_steps
+            processed, step_metrics = apply_recipe_with_seam_padding(
+                parent_audio,
+                sr,
+                parsed_steps,
+                prev_audio_path=prev_p,
+                next_audio_path=next_p,
+                seam_context_s=seam_context_s,
             )
             save_wav(audio_path, processed, sr, subtype="FLOAT")
 
@@ -399,6 +425,9 @@ class SessionManager:
                 parsed_steps,
                 subtype="PCM_24",
                 telemetry_out=step_metrics,
+                prev_audio_path=prev_p,
+                next_audio_path=next_p,
+                seam_context_s=seam_context_s,
             )
             metrics, events = analyze_file(audio_path)
             spec_png = render_file_spectrogram_png(
@@ -805,6 +834,39 @@ class SessionManager:
         sdir = self._session_dir(session_id)
         shutil.rmtree(sdir)
         return {"session_id": session_id, "deleted": True}
+
+    def find_clean_sections(
+        self,
+        sequence: list[tuple[str, str]],
+        max_edits_per_hour: float = 2.0,
+        max_edited_pct: float = 1.0,
+    ) -> dict[str, Any]:
+        """Find largest untouched and minimal-edit ASMR stretches across one or more takes."""
+        if not sequence:
+            raise ValueError("Pass either (session_id, take_id) or a non-empty sequence.")
+        segments: list[dict[str, Any]] = []
+        for sid, tid in sequence:
+            summary = self.get_session(sid)
+            take = self.get_take(sid, tid)
+            events = self.load_take_events(sid, tid)
+            edit_spans = extract_localized_edit_spans(take.recipe)
+            distraction_spans = extract_localized_distraction_spans(events)
+            src_name = Path(summary.source_path).name if summary.source_path else summary.name
+            segments.append(
+                {
+                    "label": src_name,
+                    "session_id": sid,
+                    "take_id": tid,
+                    "duration_s": take.metrics.duration_s,
+                    "edit_spans": edit_spans,
+                    "distraction_spans": distraction_spans,
+                }
+            )
+        return compute_clean_sections(
+            segments,
+            max_edits_per_hour=max_edits_per_hour,
+            max_edited_pct=max_edited_pct,
+        )
 
 
 def read_take_recipe(take: TakeRecord) -> dict[str, Any] | None:
