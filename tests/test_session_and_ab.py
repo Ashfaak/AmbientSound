@@ -337,3 +337,79 @@ def test_cross_branch_trimmed_ab_resolves_shared_ancestor_and_offset(tmp_path: P
     ab = manager.create_ab_test(summary.session_id, b1.take_id, b2.take_id)
     assert ab.original_take_id == "take_000"
     assert abs(ab.original_offset_s - 0.5) < 1e-3
+
+
+def test_v040_copy_source_false_and_sequence_pipeline(tmp_path: Path) -> None:
+    settings = Settings(workspace_dir=tmp_path / ".ambientsound", allowed_roots=[tmp_path])
+    manager = SessionManager(settings)
+
+    sr = 16000
+    n = sr * 3
+    t = np.arange(n * 2, dtype=np.float64) / sr
+    rng = np.random.default_rng(404)
+    bed = rng.normal(0.0, 0.012, size=(n * 2, 2))
+    buzz = (0.025 * np.sin(2.0 * np.pi * 240.0 * t))[:, None]
+    full = bed + buzz
+
+    raw_dir = tmp_path / "raw_files"
+    p1 = save_wav(raw_dir / "ZOOM0004.WAV", full[:n], sr, subtype="PCM_24")
+    p2 = save_wav(raw_dir / "ZOOM0005.WAV", full[n:], sr, subtype="PCM_24")
+
+    s1 = manager.create_session(p1, name="Split 1", copy_source=False)
+    s2 = manager.create_session(p2, name="Split 2", copy_source=False)
+    assert Path(s1.takes[0].audio_path) == p1
+    assert not (
+        settings.workspace_dir / "sessions" / s1.session_id / "takes" / "take_000" / "audio.wav"
+    ).exists()
+
+    vis = manager.render_take_visuals(s1.session_id, "take_000", start_s=0.2, end_s=1.2)
+    assert Path(vis["spectrogram_path"]).parent != raw_dir
+
+    seq = [(s1.session_id, "take_000"), (s2.session_id, "take_000")]
+    cal = manager.calibrate_sequence(
+        seq,
+        shared_steps_before_gain=[
+            {"filter_name": "highpass_rumble", "params": {"cutoff_hz": 50.0}}
+        ],
+        target_lufs=-16.0,
+        ceiling_dbtp=-1.0,
+        sample_windows_per_file=2,
+        window_s=1.0,
+        shared_steps_after_gain=[
+            {"filter_name": "true_peak_limiter", "params": {"ceiling_dbtp": -1.0}}
+        ],
+    )
+    gain_db = cal["recommended_gain_db"]
+    assert abs(cal["projected_sequence_lufs"] - (-16.0)) < 1.2
+
+    out_dir = tmp_path / "masters"
+    proc = manager.process_sequence(
+        items=[
+            {"session_id": s1.session_id, "export_path": str(out_dir / "ZOOM0004_master.wav")},
+            {"session_id": s2.session_id, "export_path": str(out_dir / "ZOOM0005_master.wav")},
+        ],
+        shared_prefix_steps=[{"filter_name": "highpass_rumble", "params": {"cutoff_hz": 50.0}}],
+        shared_suffix_steps=[
+            {"filter_name": "gain", "params": {"gain_db": gain_db}},
+            {"filter_name": "true_peak_limiter", "params": {"ceiling_dbtp": -1.0}},
+        ],
+        outer_fade_in_s=0.2,
+        outer_fade_out_s=0.2,
+        seam_context_s=0.8,
+        discard_take_audio_after_export=True,
+    )
+    assert proc["count"] == 2
+    assert proc["seams"]["all_passed"] is True
+    assert Path(proc["seams"]["seams"][0]["spectrogram_path"]).exists()
+    assert (out_dir / "ZOOM0004_master.wav").exists()
+    assert (out_dir / "ZOOM0005_master.wav").exists()
+    # Internal take_001/audio.wav discarded while session take still points to exported WAV
+    assert not (
+        settings.workspace_dir / "sessions" / s1.session_id / "takes" / "take_001" / "audio.wav"
+    ).exists()
+    sl, _ = manager.load_take_audio_slice(s1.session_id, "take_001", start_s=0.1, end_s=0.6)
+    assert sl.shape[0] > 0
+
+    # Deleting session with copy_source=False must NEVER delete the external raw WAV
+    manager.delete_session(s1.session_id)
+    assert p1.exists()

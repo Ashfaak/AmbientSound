@@ -13,6 +13,7 @@ from ambient_sound.analysis import (
     analyze_audio,
     analyze_file,
     compute_clean_sections,
+    extract_localized_distraction_spans,
     extract_localized_edit_spans,
     summarize_events,
 )
@@ -349,3 +350,80 @@ def test_clean_sections_single_and_multi_file_sequence() -> None:
         ],
     )
     assert extract_localized_edit_spans(recipe_trim_last) == [(40.0, 50.0), (100.0, 105.0)]
+
+
+def test_v040_hum_gating_tick_rate_and_clean_sections() -> None:
+    sr = 16000
+    dur = 20.0
+    n = int(sr * dur)
+    t = np.arange(n, dtype=np.float64) / sr
+    bed = _make_pink_bed(n, 2, seed=401)
+
+    # 1. Moderate 49.8 Hz + 99.6 Hz mains hum must classify in hum_peaks_hz (not tonal_peaks_hz)
+    hum_50 = (
+        0.015 * np.sin(2.0 * np.pi * 49.8 * t) + 0.008 * np.sin(2.0 * np.pi * 99.6 * t)
+    )[:, np.newaxis]
+    m_hum, _ = analyze_audio(bed + hum_50, sr)
+    assert 50.0 in m_hum.hum_peaks_hz
+    assert not any(abs(f - 50.0) <= 5.0 for f in m_hum.tonal_peaks_hz)
+
+    # 2. freq_range_hz=(120.0, 400.0) skips both <80 Hz rumble and >1500 Hz clicks
+    sig_mixed = bed.copy()
+    sig_mixed[int(3.0 * sr) : int(5.0 * sr), :] += (
+        0.12 * np.sin(2.0 * np.pi * 40.0 * t[int(3.0 * sr) : int(5.0 * sr)])
+    )[:, np.newaxis]
+    sig_mixed[int(8.0 * sr) : int(8.0 * sr) + 5, :] += 0.55
+    _, ev_mid = analyze_audio(sig_mixed, sr, freq_range_hz=(120.0, 400.0))
+    mid_kinds = {ev.kind for ev in ev_mid}
+    assert "low_freq_rumble" not in mid_kinds
+    assert "impulsive_click" not in mid_kinds
+
+    # 3. High-rate subtle organic ticks populate texture_tick_rate_per_min (>= 30/min)
+    ticks_audio = _make_pink_bed(sr * 12, 2, seed=402)
+    for k in range(12):
+        idx = int((0.5 + 0.9 * k) * sr)
+        ticks_audio[idx : idx + 3, :] += 0.065
+    m_ticks, _ = analyze_audio(ticks_audio, sr)
+    assert m_ticks.texture_tick_rate_per_min is not None
+    assert m_ticks.texture_tick_rate_per_min >= 30.0
+
+    # 4. spectral_match_suppress edit spans + include_low_severity filtering + clean_sections keys
+    recipe = ProcessingRecipe(
+        parent_take_id="take_000",
+        steps=[
+            {
+                "filter_name": "spectral_match_suppress",
+                "params": {"start_s": 50.0, "end_s": 70.0, "low_hz": 40.0, "high_hz": 2000.0},
+            }
+        ],
+    )
+    assert extract_localized_edit_spans(recipe) == [(50.0, 70.0)]
+
+    ev_list = [
+        DistractionEvent(
+            id="e1", start_s=100.0, end_s=105.0, kind="low_freq_rumble", severity="low"
+        ),
+        DistractionEvent(
+            id="e2", start_s=300.0, end_s=308.0, kind="slow_pass", severity="medium"
+        ),
+    ]
+    assert extract_localized_distraction_spans(ev_list, include_low_severity=False) == [
+        (300.0, 308.0)
+    ]
+    assert len(extract_localized_distraction_spans(ev_list, include_low_severity=True)) == 2
+
+    cs = compute_clean_sections(
+        [
+            {
+                "label": "test.wav",
+                "duration_s": 1200.0,
+                "edit_spans": [(50.0, 70.0)],
+                "distraction_spans": extract_localized_distraction_spans(ev_list),
+            }
+        ]
+    )
+    t_row = cs["asmr_targets"][0]
+    assert "raw_edit_span_count" in t_row
+    assert "residual_distraction_count" in t_row
+    assert "residual_distraction_s" in t_row
+    assert "residual_distraction_pct" in t_row

@@ -344,13 +344,29 @@ def _detect_hum_peaks(
     freqs: np.ndarray,
     psd: np.ndarray,
     sample_rate: int,
+    freqs_band: np.ndarray | None = None,
+    segment_psds_band: list[np.ndarray] | None = None,
 ) -> list[float]:
-    """Return 50 Hz or 60 Hz harmonic frequencies exhibiting > 10 dB bilateral prominence."""
+    """Return 50 Hz or 60 Hz harmonic frequencies exhibiting bilateral narrowband prominence."""
     nyquist = sample_rate * 0.5
-    if freqs.size < 16:
+    use_median = (
+        segment_psds_band is not None
+        and len(segment_psds_band) >= 3
+        and freqs_band is not None
+        and freqs_band.size >= 16
+    )
+    if use_median:
+        assert freqs_band is not None and segment_psds_band is not None
+        work_freqs = freqs_band
+        work_psd = np.median(np.asarray(segment_psds_band, dtype=np.float64), axis=0)
+    else:
+        work_freqs = freqs
+        work_psd = psd
+
+    if work_freqs.size < 16:
         return []
 
-    psd_db = 10.0 * np.log10(np.maximum(psd, 1e-24))
+    psd_db = 10.0 * np.log10(np.maximum(work_psd, 1e-24))
     detected: list[float] = []
 
     for base in (50.0, 60.0):
@@ -359,24 +375,28 @@ def _detect_hum_peaks(
             f_target = base * harmonic
             if f_target >= nyquist * 0.9:
                 break
-            peak_mask = (freqs >= f_target - 3.0) & (freqs <= f_target + 3.0)
+            peak_mask = (work_freqs >= f_target - 2.5) & (work_freqs <= f_target + 2.5)
             if not np.any(peak_mask):
                 continue
-            peak_val = float(np.max(psd_db[peak_mask]))
+            cand_idx = np.flatnonzero(peak_mask)
+            best_rel = int(np.argmax(psd_db[cand_idx]))
+            peak_idx = int(cand_idx[best_rel])
+            peak_val = float(psd_db[peak_idx])
+            f_center = float(work_freqs[peak_idx])
             prominence = _bilateral_prominence_db(
-                freqs,
+                work_freqs,
                 psd_db,
-                f_target,
+                f_center,
                 peak_val,
                 10.0,
                 nyquist,
-                inner_gap_hz=6.0,
-                outer_span_hz=20.0,
+                inner_gap_hz=5.5,
+                outer_span_hz=18.0,
             )
-            if prominence is not None and prominence > 10.0 and peak_val > -110.0:
+            if prominence is not None and prominence > 7.5 and peak_val > -112.0:
                 series_peaks.append((f_target, prominence))
         if series_peaks and (
-            any(f == base and p > 11.0 for f, p in series_peaks) or len(series_peaks) >= 2
+            any(f == base and p > 8.5 for f, p in series_peaks) or len(series_peaks) >= 2
         ):
             detected.extend(f for f, _ in series_peaks)
 
@@ -469,6 +489,116 @@ def _detect_tonal_peaks(
     return sorted(selected)
 
 
+def _detect_segment_local_tones(
+    freqs_band: np.ndarray,
+    segment_psds_band: list[np.ndarray],
+    segment_bounds_s: list[tuple[float, float]],
+    sample_rate: int,
+    global_exclude: list[float],
+    freq_range_hz: tuple[float, float] | None = None,
+) -> list[DistractionEvent]:
+    """Detect temporary localized narrowband tones active in subsets of a long recording."""
+    if (
+        len(segment_psds_band) < 3
+        or len(segment_bounds_s) != len(segment_psds_band)
+        or freqs_band.size < 32
+    ):
+        return []
+
+    nyquist = sample_rate * 0.5
+    f_min, f_max = 40.0, min(4000.0, nyquist * 0.85)
+    if freq_range_hz is not None:
+        f_min = max(f_min, float(freq_range_hz[0]) - 10.0)
+        f_max = min(f_max, float(freq_range_hz[1]) + 10.0)
+    if f_max <= f_min:
+        return []
+
+    seg_mat = np.asarray(segment_psds_band, dtype=np.float64)
+    med_db = 10.0 * np.log10(np.maximum(np.median(seg_mat, axis=0), 1e-24))
+    band_indices = np.flatnonzero((freqs_band >= f_min) & (freqs_band <= f_max))
+    raw_hits: list[tuple[int, float, float]] = []
+
+    for seg_i in range(len(segment_psds_band)):
+        seg_db = 10.0 * np.log10(np.maximum(seg_mat[seg_i], 1e-24))
+        cands: list[tuple[float, float]] = []
+        for idx in band_indices:
+            if idx <= 0 or idx >= freqs_band.size - 1:
+                continue
+            if seg_db[idx] < seg_db[idx - 1] or seg_db[idx] < seg_db[idx + 1]:
+                continue
+            if float(seg_db[idx] - med_db[idx]) < 12.0:
+                continue
+            f_cand = float(freqs_band[idx])
+            if any(abs(f_cand - ex) <= 6.0 for ex in global_exclude):
+                continue
+            inner = max(6.0, 0.03 * f_cand)
+            outer = max(22.0, 0.12 * f_cand)
+            prom = _bilateral_prominence_db(
+                freqs_band,
+                seg_db,
+                f_cand,
+                float(seg_db[idx]),
+                12.0,
+                nyquist,
+                inner_gap_hz=inner,
+                outer_span_hz=outer,
+            )
+            if prom is not None and prom >= 12.0 and float(seg_db[idx]) > -108.0:
+                cands.append((f_cand, prom))
+        cands.sort(key=lambda pair: pair[1], reverse=True)
+        picked: list[tuple[float, float]] = []
+        for f_cand, prom in cands:
+            min_sp = max(6.0, 0.04 * f_cand)
+            if any(abs(f_cand - pf) < min_sp for pf, _ in picked):
+                continue
+            picked.append((f_cand, prom))
+            raw_hits.append((seg_i, round(f_cand, 1), prom))
+            if len(picked) >= 2:
+                break
+
+    if not raw_hits:
+        return []
+
+    raw_hits.sort(key=lambda item: (item[0], item[1]))
+    grouped: list[list[tuple[int, float, float]]] = []
+    for seg_i, f_hz, prom in raw_hits:
+        matched = False
+        for grp in grouped:
+            last_seg, last_f, _ = grp[-1]
+            if seg_i - last_seg <= 1 and abs(f_hz - last_f) <= max(6.0, 0.03 * last_f):
+                grp.append((seg_i, f_hz, prom))
+                matched = True
+                break
+        if not matched:
+            grouped.append([(seg_i, f_hz, prom)])
+
+    total_span = max(1e-6, segment_bounds_s[-1][1] - segment_bounds_s[0][0])
+    events: list[DistractionEvent] = []
+    for grp in grouped:
+        s_t = segment_bounds_s[grp[0][0]][0]
+        e_t = segment_bounds_s[grp[-1][0]][1]
+        if (e_t - s_t) >= 0.70 * total_span:
+            continue
+        f_med = round(float(np.median([g[1] for g in grp])), 1)
+        max_prom = max(g[2] for g in grp)
+        events.append(
+            DistractionEvent(
+                id="pending",
+                start_s=round(s_t, 3),
+                end_s=round(e_t, 3),
+                kind="machine_drone",
+                severity="high" if max_prom >= 18.0 else "medium",
+                freq_band_hz=(round(max(10.0, f_med - 5.0), 1), round(f_med + 5.0, 1)),
+                peak_db=None,
+                notes=(
+                    f"Temporary localized tonal drone at {f_med:.1f} Hz "
+                    f"(+{max_prom:.1f} dB in block)."
+                ),
+            )
+        )
+    return events
+
+
 def _rumble_events_from_curve(
     times: np.ndarray,
     rms_db: np.ndarray,
@@ -478,6 +608,7 @@ def _rumble_events_from_curve(
     sensitivity: SensitivityLevel = "medium",
     min_event_s: float = 0.12,
     max_event_s: float = 45.0,
+    ambient_bed_dbfs: float | None = None,
 ) -> list[DistractionEvent]:
     if rms_db.size < 4:
         return []
@@ -487,7 +618,8 @@ def _rumble_events_from_curve(
     med = float(np.median(rms_db))
     mad = float(np.median(np.abs(rms_db - med))) * 1.4826
     threshold = max(med + excess_req, med + mad_mult * max(mad, 1.0))
-    mask = (rms_db > threshold) & (rms_db > -92.0)
+    floor_db = max(-92.0, float(ambient_bed_dbfs) - 22.0) if ambient_bed_dbfs is not None else -92.0
+    mask = (rms_db > threshold) & (rms_db > floor_db)
     spans = _merge_intervals(mask, times, win_dur_s, max_gap_s=0.40)
 
     min_dur = max(0.2, float(min_event_s))
@@ -565,6 +697,23 @@ def _click_events_from_hits(
             )
         )
     return events
+
+
+def _compute_texture_tick_rate(
+    click_events: list[DistractionEvent],
+    duration_s: float,
+    ref_bed_dbfs: float | None,
+) -> float | None:
+    """Detect high-rate organic texture ticks (e.g. insect/hive clicks >= 30/min)."""
+    if duration_s < 10.0 or not click_events:
+        return None
+    rate_per_min = len(click_events) / (duration_s / 60.0)
+    if rate_per_min < 30.0:
+        return None
+    peaks = [ev.peak_db for ev in click_events if ev.peak_db is not None]
+    if peaks and ref_bed_dbfs is not None and float(np.median(peaks)) >= ref_bed_dbfs + 14.0:
+        return None
+    return _finite_or_none(rate_per_min, digits=2)
 
 
 def _estimate_event_band(
@@ -776,7 +925,13 @@ def _finalize_spectral_summary(
     if body_energy > 1e-24 and low_energy > 0.0:
         rumble_ratio_db = _finite_or_none(10.0 * math.log10(low_energy / body_energy))
 
-    hum_peaks = _detect_hum_peaks(freqs, psd, sample_rate)
+    hum_peaks = _detect_hum_peaks(
+        freqs,
+        psd,
+        sample_rate,
+        freqs_band=freqs_band,
+        segment_psds_band=segment_psds_band,
+    )
     tonal_peaks = _detect_tonal_peaks(
         freqs,
         psd,
@@ -941,9 +1096,13 @@ def analyze_audio(
         freq_range_hz=freq_range_hz,
     )
 
+    skip_rumble = freq_range_hz is not None and float(freq_range_hz[0]) >= 80.0
+    skip_clicks = freq_range_hz is not None and float(freq_range_hz[1]) <= 1500.0
+
     # Rumble detector
     if (
-        (allowed_kinds is None or "low_freq_rumble" in allowed_kinds)
+        not skip_rumble
+        and (allowed_kinds is None or "low_freq_rumble" in allowed_kinds)
         and sample_rate > 220
         and mono.size >= int(sample_rate * 0.5)
     ):
@@ -975,11 +1134,17 @@ def analyze_audio(
                     sensitivity=sensitivity,
                     min_event_s=min_event_s,
                     max_event_s=max_event_s,
+                    ambient_bed_dbfs=ambient_bed_dbfs,
                 )
             )
 
     # Click detector
-    if (allowed_kinds is None or "impulsive_click" in allowed_kinds) and num_samples >= 64:
+    texture_tick_rate_per_min: float | None = None
+    if (
+        not skip_clicks
+        and (allowed_kinds is None or "impulsive_click" in allowed_kinds)
+        and num_samples >= 64
+    ):
         cutoff = min(1500.0, sample_rate * 0.35)
         sos_hp = signal.butter(4, cutoff, btype="highpass", fs=sample_rate, output="sos")
         hp = signal.sosfiltfilt(sos_hp, arr, axis=0)
@@ -992,15 +1157,19 @@ def analyze_audio(
             (int(i), float(np.max(np.abs(arr[i]))), float(z[i]))
             for i in hit_idx
         ]
-        events.extend(
-            _click_events_from_hits(
-                hits,
-                sample_rate,
-                duration_s,
-                cutoff,
-                time_offset_s,
-                min_event_s=min_event_s,
-            )
+        click_events = _click_events_from_hits(
+            hits,
+            sample_rate,
+            duration_s,
+            cutoff,
+            time_offset_s,
+            min_event_s=min_event_s,
+        )
+        events.extend(click_events)
+        texture_tick_rate_per_min = _compute_texture_tick_rate(
+            click_events,
+            duration_s,
+            ambient_bed_dbfs if ambient_bed_dbfs is not None else rms_dbfs,
         )
 
     # Foreground transient & slow_pass detector
@@ -1115,6 +1284,7 @@ def analyze_audio(
         noise_floor_dbfs=noise_floor_dbfs,
         ambient_bed_dbfs=ambient_bed_dbfs,
         high_freq_floor_dbfs=high_freq_floor_dbfs,
+        texture_tick_rate_per_min=texture_tick_rate_per_min,
         short_term_lufs_stats=short_term_lufs_stats,
         short_term_lufs_timeline=short_term_lufs_timeline,
     )
@@ -1185,6 +1355,9 @@ def analyze_file(
     band_mask = freqs_ref <= 8500.0
     freqs_band = freqs_ref[band_mask]
     segment_psds_band: list[np.ndarray] = []
+    segment_bounds_s: list[tuple[float, float]] = []
+    skip_rumble = freq_range_hz is not None and float(freq_range_hz[0]) >= 80.0
+    skip_clicks = freq_range_hz is not None and float(freq_range_hz[1]) <= 1500.0
 
     floor_hop = max(1, int(0.1 * sr))
     floor_tail = np.zeros(0, dtype=np.float64)
@@ -1292,9 +1465,12 @@ def analyze_file(
             psd_accum += p_b * n_b
             psd_weight += n_b
             segment_psds_band.append(p_b[band_mask].copy())
+            segment_bounds_s.append(
+                (s0 + rel_start_frame / float(sr), s0 + (rel_start_frame + n_b) / float(sr))
+            )
 
         # Rumble curve (125 ms frames)
-        if allowed_kinds is None or "low_freq_rumble" in allowed_kinds:
+        if not skip_rumble and (allowed_kinds is None or "low_freq_rumble" in allowed_kinds):
             low_b, zi_lp = signal.sosfilt(sos_lp, mono, zi=zi_lp)
             low_cat = np.concatenate([rumble_tail, low_b]) if rumble_tail.size else low_b
             n_r_frames = low_cat.size // hop_r
@@ -1307,7 +1483,11 @@ def analyze_file(
                 rumble_tail = low_cat
 
         # Click spikes per block
-        if (allowed_kinds is None or "impulsive_click" in allowed_kinds) and min_event_s <= 0.15:
+        if (
+            not skip_clicks
+            and (allowed_kinds is None or "impulsive_click" in allowed_kinds)
+            and min_event_s <= 0.15
+        ):
             hp_b, zi_hp = signal.sosfilt(sos_hp, block, axis=0, zi=zi_hp)
             env_b = np.max(np.abs(hp_b), axis=1)
             med_b = float(np.median(env_b))
@@ -1423,7 +1603,23 @@ def analyze_file(
         freq_range_hz=freq_range_hz,
     )
 
-    if rumble_db_list and (allowed_kinds is None or "low_freq_rumble" in allowed_kinds):
+    if len(segment_psds_band) >= 3 and (allowed_kinds is None or "machine_drone" in allowed_kinds):
+        events.extend(
+            _detect_segment_local_tones(
+                freqs_band,
+                segment_psds_band,
+                segment_bounds_s,
+                sr,
+                [*hum_peaks_hz, *tonal_peaks_hz],
+                freq_range_hz=freq_range_hz,
+            )
+        )
+
+    if (
+        not skip_rumble
+        and rumble_db_list
+        and (allowed_kinds is None or "low_freq_rumble" in allowed_kinds)
+    ):
         r_arr = np.asarray(rumble_db_list, dtype=np.float64)
         t_r = np.arange(r_arr.size) * (hop_r / sr)
         events.extend(
@@ -1436,14 +1632,24 @@ def analyze_file(
                 sensitivity=sensitivity,
                 min_event_s=min_event_s,
                 max_event_s=max_event_s,
+                ambient_bed_dbfs=ambient_bed_dbfs,
             )
         )
 
-    if click_hits and (allowed_kinds is None or "impulsive_click" in allowed_kinds):
-        events.extend(
-            _click_events_from_hits(
-                click_hits, sr, duration_s, cutoff_hp, s0, min_event_s=min_event_s
-            )
+    texture_tick_rate_per_min: float | None = None
+    if (
+        not skip_clicks
+        and click_hits
+        and (allowed_kinds is None or "impulsive_click" in allowed_kinds)
+    ):
+        click_events = _click_events_from_hits(
+            click_hits, sr, duration_s, cutoff_hp, s0, min_event_s=min_event_s
+        )
+        events.extend(click_events)
+        texture_tick_rate_per_min = _compute_texture_tick_rate(
+            click_events,
+            duration_s,
+            ambient_bed_dbfs if ambient_bed_dbfs is not None else rms_dbfs,
         )
 
     if fg_db_list and (
@@ -1530,6 +1736,7 @@ def analyze_file(
         noise_floor_dbfs=noise_floor_dbfs,
         ambient_bed_dbfs=ambient_bed_dbfs,
         high_freq_floor_dbfs=high_freq_floor_dbfs,
+        texture_tick_rate_per_min=texture_tick_rate_per_min,
         short_term_lufs_stats=short_term_lufs_stats,
         short_term_lufs_timeline=short_term_lufs_timeline,
     )
@@ -1640,7 +1847,7 @@ def _apply_cut_transform(
 def extract_localized_edit_spans(
     recipe: ProcessingRecipe | dict[str, Any] | None,
 ) -> list[tuple[float, float]]:
-    """Extract finalized spans where localized edits (band_attenuate/ambience_patch) ran."""
+    """Extract finalized spans where localized edits ran."""
     if recipe is None:
         return []
     steps = recipe.get("steps") or [] if isinstance(recipe, dict) else list(recipe.steps)
@@ -1649,7 +1856,7 @@ def extract_localized_edit_spans(
     for st in steps:
         fname = st.get("filter_name") if isinstance(st, dict) else st.filter_name
         params = st.get("params") or {} if isinstance(st, dict) else dict(st.params)
-        if fname in {"band_attenuate", "ambience_patch"}:
+        if fname in {"band_attenuate", "spectral_match_suppress", "ambience_patch"}:
             if params.get("spans"):
                 for sp in params["spans"]:
                     s = sp.get("start_s")
@@ -1680,12 +1887,15 @@ def extract_localized_edit_spans(
 
 def extract_localized_distraction_spans(
     events: list[DistractionEvent],
+    include_low_severity: bool = False,
 ) -> list[tuple[float, float]]:
     """Extract residual localized distraction spans (excluding clicks and steady global drones)."""
     raw = [
         (max(0.0, float(ev.start_s)), float(ev.end_s))
         for ev in events
-        if ev.kind in _LOCALIZED_DISTRACTION_KINDS and float(ev.end_s) > float(ev.start_s)
+        if ev.kind in _LOCALIZED_DISTRACTION_KINDS
+        and float(ev.end_s) > float(ev.start_s)
+        and (include_low_severity or ev.severity != "low")
     ]
     return _merge_span_list(raw)
 
@@ -1795,13 +2005,15 @@ def compute_clean_sections(
 
     edit_starts = [s for s, _ in merged_edits]
     edit_ends = [e for _, e in merged_edits]
+    edit_prefix = [0.0]
+    for s, e in merged_edits:
+        edit_prefix.append(edit_prefix[-1] + (e - s))
+
     dist_starts = [s for s, _ in merged_distractions]
     dist_ends = [e for _, e in merged_distractions]
-    issue_starts = [s for s, _ in merged_issues]
-    issue_ends = [e for _, e in merged_issues]
-    issue_prefix = [0.0]
-    for s, e in merged_issues:
-        issue_prefix.append(issue_prefix[-1] + (e - s))
+    dist_prefix = [0.0]
+    for s, e in merged_distractions:
+        dist_prefix.append(dist_prefix[-1] + (e - s))
 
     untouched_gaps: list[tuple[float, float]] = []
     cur = 0.0
@@ -1865,29 +2077,32 @@ def compute_clean_sections(
                 cand_starts.add(min(max_start, max(0.0, s_tail)))
 
         best_key: tuple[int, float, int, float] | None = None
-        best_info: tuple[float, float, int, int, float] | None = None
+        best_info: tuple[float, float, int, int, float, float] | None = None
         for s_cand in sorted(cand_starts):
             w0 = max(0.0, min(max_start, s_cand))
             w1 = w0 + win_s
-            n_ed, _ = _count_and_overlap(merged_edits, edit_starts, edit_ends, w0, w1)
-            n_dist, _ = _count_and_overlap(merged_distractions, dist_starts, dist_ends, w0, w1)
-            _, edited_s = _count_and_overlap(
-                merged_issues, issue_starts, issue_ends, w0, w1, prefix_dur=issue_prefix
+            n_ed, edited_s = _count_and_overlap(
+                merged_edits, edit_starts, edit_ends, w0, w1, prefix_dur=edit_prefix
+            )
+            n_dist, dist_s = _count_and_overlap(
+                merged_distractions, dist_starts, dist_ends, w0, w1, prefix_dur=dist_prefix
             )
             round_pref = 0 if abs(w0 % 60.0) < 1e-6 else 1
-            score_key = (n_ed + n_dist, round(edited_s, 3), round_pref, w0)
+            score_key = (n_ed + n_dist, round(edited_s + dist_s, 3), round_pref, w0)
             if best_key is None or score_key < best_key:
                 best_key = score_key
-                best_info = (w0, w1, n_ed, n_dist, edited_s)
+                best_info = (w0, w1, n_ed, n_dist, edited_s, dist_s)
 
         if best_info is None:
             continue
-        w0, w1, n_ed, n_dist, edited_s = best_info
+        w0, w1, n_ed, n_dist, edited_s, dist_s = best_info
+        raw_ed = sum(1 for es, ee in all_edits if ee > w0 + 1e-9 and es < w1 - 1e-9)
         edited_pct = round(100.0 * edited_s / max(win_s, 1e-6), 3)
+        dist_pct = round(100.0 * dist_s / max(win_s, 1e-6), 3)
         max_allowed = max(1, int(round(float(max_edits_per_hour) * (d_min / 60.0))))
         if n_ed == 0 and n_dist == 0:
             tier = "untouched"
-        elif (n_ed + n_dist) <= max_allowed and edited_pct <= float(max_edited_pct):
+        elif n_ed <= max_allowed and n_dist <= max_allowed and edited_pct <= float(max_edited_pct):
             tier = "minimal_edits"
         else:
             tier = "moderate_edits"
@@ -1908,9 +2123,13 @@ def compute_clean_sections(
                 "end_file": ef_name,
                 "end_local_hms": e_loc_hms,
                 "edit_count": int(n_ed),
+                "raw_edit_span_count": int(raw_ed),
                 "distraction_count": int(n_dist),
+                "residual_distraction_count": int(n_dist),
                 "edited_s": round(edited_s, 1),
                 "edited_pct": edited_pct,
+                "residual_distraction_s": round(dist_s, 1),
+                "residual_distraction_pct": dist_pct,
             }
         )
 

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
+from typing import Any
 
 import matplotlib
 
@@ -45,6 +47,30 @@ def _compute_spectrogram_db(
     return freqs, times, spec_db
 
 
+def _write_plot_meta(
+    fig: Any,
+    ax_top: Any,
+    ax_bot: Any,
+    x_start_s: float,
+    x_end_s: float,
+    out_path: Path,
+) -> None:
+    """Persist normalized figure plot bounds alongside PNG for Web UI playhead overlay."""
+    fig.canvas.draw()
+    p_top = ax_top.get_position()
+    p_bot = ax_bot.get_position()
+    meta = {
+        "x0": round(float(p_bot.x0), 5),
+        "x1": round(float(p_bot.x1), 5),
+        "top": round(1.0 - float(p_top.y1), 5),
+        "bottom": round(1.0 - float(p_bot.y0), 5),
+        "t_start": round(float(x_start_s), 4),
+        "t_end": round(float(max(x_start_s + 0.01, x_end_s)), 4),
+    }
+    meta_path = Path(f"{out_path}.meta.json")
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+
 def _plot_spectrogram_figure(
     t_wav: np.ndarray,
     wav_lo: np.ndarray,
@@ -58,6 +84,7 @@ def _plot_spectrogram_figure(
     out_path: str | Path,
     title: str,
     events: list[DistractionEvent] | None,
+    vlines: list[tuple[float, str, str]] | None = None,
 ) -> Path:
     max_db = float(np.max(spec_db)) if spec_db.size else 0.0
     vmin = max_db - 85.0
@@ -154,7 +181,24 @@ def _plot_spectrogram_figure(
         ax_spec.set_xlabel("Time (s)", color="#d8e2ec", fontsize=9)
         ax_spec.set_xlim(x_start_s, max(x_start_s + 0.01, x_end_s))
 
+        if vlines:
+            for vx, vcolor, vlabel in vlines:
+                if x_start_s <= vx <= x_end_s:
+                    ax_wav.axvline(vx, color=vcolor, linestyle="--", linewidth=1.2, alpha=0.9)
+                    ax_spec.axvline(vx, color=vcolor, linestyle="--", linewidth=1.2, alpha=0.9)
+                    if vlabel:
+                        ax_wav.text(
+                            vx,
+                            ax_wav.get_ylim()[1] * 0.88,
+                            f" {vlabel}",
+                            color=vcolor,
+                            fontsize=8,
+                            va="top",
+                            ha="left",
+                        )
+
         fig.savefig(str(out), facecolor=fig.get_facecolor())
+        _write_plot_meta(fig, ax_wav, ax_spec, x_start_s, x_end_s, out)
     finally:
         plt.close(fig)
     return out
@@ -252,6 +296,7 @@ def _plot_diff_figure(
             cbar.set_label("dB", color="#d8e2ec", fontsize=9)
 
         fig.savefig(str(out), facecolor=fig.get_facecolor())
+        _write_plot_meta(fig, axes[0], axes[-1], x_start_s, x_end_s, out)
     finally:
         plt.close(fig)
     return out
@@ -264,6 +309,7 @@ def render_spectrogram_png(
     title: str = "",
     events: list[DistractionEvent] | None = None,
     time_offset_s: float = 0.0,
+    vlines: list[tuple[float, str, str]] | None = None,
 ) -> Path:
     """Render a dark-themed waveform + log-frequency spectrogram PNG from an array."""
     arr = ensure_2d_audio(audio)
@@ -292,6 +338,7 @@ def render_spectrogram_png(
         out_path=out_path,
         title=title,
         events=events,
+        vlines=vlines,
     )
 
 
@@ -419,17 +466,21 @@ def render_file_diff_spectrogram_png(
     end_s: float | None = None,
     loudness_match_residual: bool = True,
     patched_spans: list[tuple[float, float]] | None = None,
+    before_offset_s: float = 0.0,
 ) -> Path:
     """Render a 3-panel diff PNG in bounded RAM (full <= 60s, overview > 60s)."""
     info_b = probe_audio(before_path)
     info_a = probe_audio(after_path)
-    dur = min(info_b.duration_s, info_a.duration_s)
+    b_off = max(0.0, float(before_offset_s))
+    dur = min(max(0.0, info_b.duration_s - b_off), info_a.duration_s)
     s0 = max(0.0, float(start_s)) if start_s is not None else 0.0
     s1 = min(dur, float(end_s)) if end_s is not None else dur
     span = max(0.0, s1 - s0)
 
     if span <= 60.0:
-        arr_b, sr = load_audio_slice(before_path, start_s=s0, end_s=s1, dtype="float64")
+        arr_b, sr = load_audio_slice(
+            before_path, start_s=b_off + s0, end_s=b_off + s1, dtype="float64"
+        )
         arr_a, _ = load_audio_slice(after_path, start_s=s0, end_s=s1, dtype="float64")
         return render_diff_spectrogram_png(
             arr_b,
@@ -460,7 +511,9 @@ def render_file_diff_spectrogram_png(
     n_tot = 0
     for _i, t_c in enumerate(col_times):
         t_end = min(s1, float(t_c) + probe_dur)
-        cb, _ = load_audio_slice(before_path, start_s=float(t_c), end_s=t_end, dtype="float32")
+        cb, _ = load_audio_slice(
+            before_path, start_s=b_off + float(t_c), end_s=b_off + t_end, dtype="float32"
+        )
         ca, _ = load_audio_slice(after_path, start_s=float(t_c), end_s=t_end, dtype="float32")
         n = min(cb.shape[0], ca.shape[0])
         if n == 0:
@@ -506,4 +559,36 @@ def render_file_diff_spectrogram_png(
         title=title,
         residual_label=residual_label,
         patched_spans=patched_spans,
+    )
+
+
+def render_seam_spectrogram_png(
+    prev_path: str | Path,
+    next_path: str | Path,
+    out_path: str | Path,
+    window_s: float = 10.0,
+    title: str = "",
+) -> Path:
+    """Render [-window_s, +window_s] stitched across a split boundary with SEAM marker at t=0."""
+    win_s = max(1.0, min(30.0, float(window_s)))
+    info_prev = probe_audio(prev_path)
+    info_next = probe_audio(next_path)
+    p0 = max(0.0, info_prev.duration_s - win_s)
+    prev_arr, sr = load_audio_slice(
+        prev_path, start_s=p0, end_s=info_prev.duration_s, dtype="float64"
+    )
+    next_arr, _ = load_audio_slice(
+        next_path, start_s=0.0, end_s=min(win_s, info_next.duration_s), dtype="float64"
+    )
+    stitched = np.vstack([prev_arr, next_arr]) if prev_arr.size and next_arr.size else (
+        prev_arr if prev_arr.size else next_arr
+    )
+    prev_dur_s = prev_arr.shape[0] / float(max(sr, 1))
+    return render_spectrogram_png(
+        stitched,
+        sr,
+        out_path,
+        title=title or "Split Seam Verification (-window..+window s)",
+        time_offset_s=-prev_dur_s,
+        vlines=[(0.0, "#38bdf8", "Seam")],
     )

@@ -51,25 +51,40 @@ def test_mcp_tool_workflow_and_sandboxing(tmp_path: Path) -> None:
         "delete_session",
         "export_take",
         "find_clean_sections",
+        "verify_seams",
+        "calibrate_sequence",
+        "process_sequence",
     }.issubset(tool_names)
 
     health = _call_tool_json(mcp, "health_check", {})
     assert health["status"] == "ok"
-    assert health["filter_count"] == 15
+    assert health["filter_count"] == 16
 
     filters_res = _call_tool_json(mcp, "list_filters", {})
     filters = filters_res["filters"]
     assert isinstance(filters, list)
     assert any(f["name"] == "ambience_patch" for f in filters)
+    assert any(f["name"] == "spectral_match_suppress" for f in filters)
 
     sr = 44100
     rng = np.random.default_rng(21)
     audio = rng.normal(0.0, 0.03, size=(sr * 2, 2))
     src = save_wav(tmp_path / "ambience.wav", audio, sr)
 
-    session = _call_tool_json(mcp, "create_session", {"audio_path": str(src), "name": "Creek"})
+    session = _call_tool_json(
+        mcp,
+        "create_session",
+        {
+            "audio_path": str(src),
+            "name": "Creek",
+            "copy_source": False,
+            "compact_metrics": True,
+        },
+    )
     sid = session["session_id"]
     assert session["takes"][0]["take_id"] == "take_000"
+    assert session["takes"][0]["metrics"]["short_term_lufs_timeline"] == []
+    assert Path(session["takes"][0]["audio_path"]) == src
     assert "clean_sections" in session["takes"][0]
 
     sessions_res = _call_tool_json(mcp, "list_sessions", {})
@@ -205,6 +220,54 @@ def test_mcp_tool_workflow_and_sandboxing(tmp_path: Path) -> None:
     )
     assert clean_seq["segment_count"] == 2
     assert abs(clean_seq["total_duration_s"] - 4.0) < 0.05
+
+    cal = _call_tool_json(
+        mcp,
+        "calibrate_sequence",
+        {
+            "sequence": [
+                {"session_id": sid, "take_id": "take_000"},
+                {"session_id": sid2, "take_id": "take_000"},
+            ],
+            "shared_steps_before_gain": [
+                {"filter_name": "highpass_rumble", "params": {"cutoff_hz": 50.0}}
+            ],
+            "target_lufs": -16.0,
+            "sample_windows_per_file": 2,
+            "window_s": 1.0,
+        },
+    )
+    assert isinstance(cal["recommended_gain_db"], float)
+    seq_proc = _call_tool_json(
+        mcp,
+        "process_sequence",
+        {
+            "items": [
+                {"session_id": sid, "export_path": str(tmp_path / "seq_1.wav")},
+                {"session_id": sid2, "export_path": str(tmp_path / "seq_2.wav")},
+            ],
+            "shared_prefix_steps": [
+                {"filter_name": "highpass_rumble", "params": {"cutoff_hz": 50.0}}
+            ],
+            "outer_fade_in_s": 0.1,
+            "outer_fade_out_s": 0.1,
+            "seam_context_s": 0.5,
+        },
+    )
+    assert seq_proc["count"] == 2
+    assert seq_proc["seams"]["pair_count"] == 1
+    seam_chk = _call_tool_json(
+        mcp,
+        "verify_seams",
+        {
+            "sequence": [
+                {"session_id": sid, "take_id": seq_proc["items"][0]["take_id"]},
+                {"session_id": sid2, "take_id": seq_proc["items"][1]["take_id"]},
+            ],
+            "window_s": 1.0,
+        },
+    )
+    assert seam_chk["pair_count"] == 1
     _call_tool_json(mcp, "delete_session", {"session_id": sid2})
 
     analyzed_filtered = _call_tool_json(

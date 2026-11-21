@@ -12,6 +12,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Phase 3: Text-queried target distraction separation (`AudioSep` / `CLAPSep`) behind license-aware model opt-in controls.
 - Phase 4: Multi-take history DAG visualizer and optional external `ferraus` CLI backend adapter.
 
+## [0.4.0] - 2026-11-21
+
+### Added
+- **A/B Listening Studio Scrolling Playhead & A vs B Diff (`web_ui.py` / `visuals.py` / `static/index.html`):**
+  - `_plot_spectrogram_figure` and `_plot_diff_figure` emit sidecar plot-bounds metadata (`.meta.json`: `x0, x1, top, bottom, t_start, t_end`), exposed via HTTP `X-Plot-*` and `X-Time-*` headers so the live synchronized `#playheadLine` cursor scrolls smoothly across waveforms and spectrograms, supports click/drag seeking, and renders loop highlight regions directly over the active figure.
+  - Added `/api/sessions/{session_id}/ab-tests/{ab_id}/diff-spectrogram?side=a|b|ab` with timeline-aligned Before/After/Removed and direct **A vs B Diff** inspection, fixing 404s on `trim_range` previews whose `diff_spectrogram_path` was `None`.
+- **`spectral_match_suppress` (#16 DSP Filter, In-Memory & Streaming):**
+  - STFT (`n_fft=4096`) per-bin adaptive spectral excess suppression against clean surrounding (or manual `ref_start_s`/`ref_end_s`) bed percentiles with smooth normalized 2D Gaussian attenuation and subtle clean-context texture fill (`texture_fill`, `strength`, `max_attenuation_db`), attenuating moving vehicle exhaust harmonics and temporary overlap tones while leaving non-excess hive/nature frequencies intact.
+- **`ambience_patch` v2 Non-Repeating Event-Screened Donors:**
+  - Single-pass `O(N)` streaming stats scan scoring full contiguous `[p0, p1]` windows by RMS match, variance CV, crest factor, sub-120 Hz rumble ratio, and proximity; tracks `used_spans` so multi-span patches never repeat the same donor segment; avoids detected `exclude_events` (`±5.0 s`); applies RMS + 2-band (`<250 Hz` / `>250 Hz`) spectral tilt match; and logs `donor_quality` (`crest_factor`, `rms_diff_db`, `overlaps_event`).
+- **Continuous Sequence Workflow Tools (`19` MCP Tools Total):**
+  - Added `verify_seams` (LUFS delta, `2 s` RMS delta, sample step dBFS, `40–8000 Hz` Welch spectral diff, pass/fail threshold, and stitched `[-10 s, +10 s]` seam spectrogram PNG), `calibrate_sequence` (clean-interior slice solver computing one shared master `recommended_gain_db`), and `process_sequence` (single-call seam-padded batch processor with outer edge fades, exports, `verify_seams`, `find_clean_sections`, and `discard_take_audio_after_export`).
+  - Added `copy_source=False` on `create_session` (referencing WAVs in-place with zero duplicate copy), `compact_metrics=True` across read/analyze/process tools (stripping verbose `short_term_lufs_timeline`), and `texture_tick_rate_per_min` on `AudioMetrics` to warn against running global `declick_impulse` on organic ASMR texture.
+
+### Fixed
+- **A/B Playback Hang on `0 s`-Start Previews:** Fixed missing `?` in `loadAudioWindow()` windowed query strings and ensured `Original` always requests a sliced `<= 90 s` window even when `original_offset_s == 0.0` (preventing multi-GB full-file fetch hangs on start-of-file previews).
+- **Detection Accuracy & `freq_range_hz` Gating (`analysis.py`):**
+  - Switched `_detect_hum_peaks` to use segment-median PSD when available with `±2.5 Hz` peak bin centering and `> 7.5 dB` prominence (detecting `49.8 Hz` mains hum without false-triggering on `45 Hz` HPF slopes or misclassifying it in `tonal_peaks_hz`).
+  - Added `ambient_bed_dbfs`-relative floor gating on rumble curves, honored `freq_range_hz` bounds for rumble (`skip >= 80 Hz`) and clicks (`skip <= 1500 Hz`), and added temporary per-block narrowband tone detection (`>= 12 dB`) on long recordings.
+  - Updated `find_clean_sections` (`include_low_severity=False` default) to recognize `spectral_match_suppress`, separate edit coverage from low-severity residual distractions, and report `raw_edit_span_count`, `residual_distraction_count`, `residual_distraction_s`, and `residual_distraction_pct`.
+  - Recorded `attenuated_spans` telemetry in streaming `band_attenuate` batches and shifted all span telemetry accurately across seam-padded streaming runs.
+
 ## [0.3.2] - 2026-11-21
 
 ### Added

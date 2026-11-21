@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from typing import Any, Literal
 
@@ -68,7 +69,7 @@ def _serialize_take_for_ui(
         "recipe": take.recipe.model_dump() if take.recipe else None,
         "step_metrics": [s.model_dump() for s in take.step_metrics],
         "has_residual": has_res,
-        "has_diff_spectrogram": take.diff_spectrogram_path is not None,
+        "has_diff_spectrogram": bool(take.diff_spectrogram_path or take.parent_take_id),
     }
 
 
@@ -159,6 +160,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except (FileNotFoundError, ValueError) as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    def _png_response_with_meta(png_path: Path) -> FileResponse:
+        headers = {"Cache-Control": "no-store"}
+        meta_path = Path(f"{png_path}.meta.json")
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                headers["X-Plot-X0"] = str(meta["x0"])
+                headers["X-Plot-X1"] = str(meta["x1"])
+                headers["X-Plot-Top"] = str(meta["top"])
+                headers["X-Plot-Bottom"] = str(meta["bottom"])
+                headers["X-Time-Start"] = str(meta["t_start"])
+                headers["X-Time-End"] = str(meta["t_end"])
+            except Exception:
+                pass
+        return FileResponse(str(png_path), media_type="image/png", headers=headers)
+
     def _take_file_response(
         session_id: str,
         take_id: str,
@@ -175,7 +192,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         p = Path(raw_path)
         if not p.exists():
             raise HTTPException(status_code=404, detail=f"File missing on disk: {p.name}")
-        return FileResponse(str(p), media_type=media_type)
+        if media_type == "image/png":
+            return _png_response_with_meta(p)
+        resolved_type = media_type
+        if media_type == "audio/wav":
+            ext_types = {
+                ".wav": "audio/wav",
+                ".wave": "audio/wav",
+                ".flac": "audio/flac",
+                ".mp3": "audio/mpeg",
+                ".ogg": "audio/ogg",
+            }
+            resolved_type = ext_types.get(p.suffix.lower(), "audio/wav")
+        return FileResponse(str(p), media_type=resolved_type)
 
     @app.get("/api/sessions/{session_id}/takes/{take_id}/audio")
     def api_take_audio(
@@ -225,7 +254,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
             except (FileNotFoundError, ValueError) as exc:
                 raise HTTPException(status_code=404, detail=str(exc)) from exc
-            return FileResponse(vis["spectrogram_path"], media_type="image/png")
+            return _png_response_with_meta(Path(vis["spectrogram_path"]))
         return _take_file_response(session_id, take_id, "spectrogram_path", "image/png")
 
     @app.get("/api/sessions/{session_id}/takes/{take_id}/diff-spectrogram")
@@ -235,24 +264,52 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         start_s: float | None = None,
         end_s: float | None = None,
     ) -> FileResponse:
-        if start_s is not None or end_s is not None:
-            try:
-                take = manager.get_take(session_id, take_id)
-                if not take.parent_take_id:
-                    raise HTTPException(
-                        status_code=404, detail=f"diff_spectrogram not available for {take_id}."
-                    )
-                vis = manager.render_take_visuals(
-                    session_id,
-                    take_id,
-                    compare_to_take_id=take.parent_take_id,
-                    start_s=start_s,
-                    end_s=end_s,
-                )
-            except (FileNotFoundError, ValueError) as exc:
-                raise HTTPException(status_code=404, detail=str(exc)) from exc
-            return FileResponse(vis["diff_spectrogram_path"], media_type="image/png")
-        return _take_file_response(session_id, take_id, "diff_spectrogram_path", "image/png")
+        try:
+            take = manager.get_take(session_id, take_id)
+        except (FileNotFoundError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if (
+            start_s is None
+            and end_s is None
+            and take.diff_spectrogram_path
+            and Path(take.diff_spectrogram_path).exists()
+        ):
+            return _png_response_with_meta(Path(take.diff_spectrogram_path))
+        if not take.parent_take_id:
+            raise HTTPException(
+                status_code=404, detail=f"diff_spectrogram not available for {take_id}."
+            )
+        try:
+            vis = manager.render_take_visuals(
+                session_id,
+                take_id,
+                compare_to_take_id=take.parent_take_id,
+                start_s=start_s,
+                end_s=end_s,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return _png_response_with_meta(Path(vis["diff_spectrogram_path"]))
+
+    @app.get("/api/sessions/{session_id}/ab-tests/{ab_id}/diff-spectrogram")
+    def api_ab_diff_spectrogram(
+        session_id: str,
+        ab_id: str,
+        side: Literal["a", "b", "ab"] = "a",
+        start_s: float | None = None,
+        end_s: float | None = None,
+    ) -> FileResponse:
+        try:
+            png_path = manager.render_ab_diff_visual(
+                session_id,
+                ab_id,
+                side=side,
+                start_s=start_s,
+                end_s=end_s,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return _png_response_with_meta(png_path)
 
     return app
 

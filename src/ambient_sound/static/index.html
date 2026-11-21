@@ -213,12 +213,55 @@
       border-color: var(--accent);
       background: rgba(56, 189, 248, 0.14);
     }
-    .spec-img {
+    .spec-stage {
+      position: relative;
       width: 100%;
       border-radius: 8px;
       border: 1px solid var(--border);
       background: #0b0f16;
+      overflow: hidden;
+      cursor: crosshair;
+      user-select: none;
+    }
+    .spec-img {
+      width: 100%;
       display: block;
+      pointer-events: none;
+    }
+    .loop-overlay {
+      position: absolute;
+      display: none;
+      background: rgba(56, 189, 248, 0.14);
+      border-left: 1px dashed rgba(56, 189, 248, 0.65);
+      border-right: 1px dashed rgba(56, 189, 248, 0.65);
+      pointer-events: none;
+      z-index: 2;
+    }
+    .playhead-line {
+      position: absolute;
+      display: none;
+      width: 2px;
+      background: #38bdf8;
+      box-shadow: 0 0 8px rgba(56, 189, 248, 0.95), 0 0 2px #ffffff;
+      pointer-events: none;
+      transform: translateX(-1px);
+      z-index: 3;
+    }
+    .playhead-badge {
+      position: absolute;
+      display: none;
+      top: 4px;
+      transform: translateX(-50%);
+      background: rgba(6, 19, 31, 0.88);
+      color: #7dd3fc;
+      border: 1px solid rgba(56, 189, 248, 0.55);
+      border-radius: 4px;
+      padding: 1px 5px;
+      font-size: 0.7rem;
+      font-variant-numeric: tabular-nums;
+      pointer-events: none;
+      white-space: nowrap;
+      z-index: 4;
     }
     .meta-grid {
       display: grid;
@@ -382,11 +425,17 @@
         <div class="tabs" id="specTabs">
           <button class="tab-btn active" data-spec="a_diff" type="button">A Diff (Before/After/Removed)</button>
           <button class="tab-btn" data-spec="b_diff" type="button">B Diff (Before/After/Removed)</button>
+          <button class="tab-btn" data-spec="ab_diff" type="button">A vs B Diff</button>
           <button class="tab-btn" data-spec="a_spec" type="button">Take A Spectrogram</button>
           <button class="tab-btn" data-spec="b_spec" type="button">Take B Spectrogram</button>
           <button class="tab-btn" data-spec="orig_spec" type="button">Original Spectrogram</button>
         </div>
-        <img id="specImg" class="spec-img" alt="Spectrogram inspection" />
+        <div class="spec-stage" id="specStage">
+          <img id="specImg" class="spec-img" alt="Spectrogram inspection" />
+          <div id="loopOverlay" class="loop-overlay"></div>
+          <div id="playheadLine" class="playhead-line"></div>
+          <div id="playheadBadge" class="playhead-badge">0.00s</div>
+        </div>
         <div class="meta-grid" id="metaGrid"></div>
       </div>
     </section>
@@ -448,6 +497,11 @@
       winEnd: 0,
       rafId: null,
       specTab: "a_diff",
+      loadGen: 0,
+      specGen: 0,
+      specBlobUrl: null,
+      plotBounds: null,
+      scrubbingSpec: false,
     };
 
     const el = (id) => document.getElementById(id);
@@ -543,7 +597,58 @@
       if (loopOn && le > ls + 0.05 && raw >= ls) {
         return ls + ((raw - ls) % (le - ls));
       }
-      return Math.min(state.duration, raw);
+      return Math.max(0, Math.min(state.duration, raw));
+    }
+
+    function updatePlayheadOverlay(posSec) {
+      const line = el("playheadLine");
+      const badge = el("playheadBadge");
+      const loopBox = el("loopOverlay");
+      const pb = state.plotBounds;
+      const dur = state.duration || 0;
+      if (!pb || pb.tEnd <= pb.tStart || dur <= 0) {
+        line.style.display = "none";
+        badge.style.display = "none";
+        loopBox.style.display = "none";
+        return;
+      }
+      const origOff = Number(state.payload?.ab_test?.original_offset_s || 0);
+      const displayBase = state.specTab === "orig_spec" ? (state.winStart + origOff) : state.winStart;
+      const plotSpan = Math.max(0.001, pb.tEnd - pb.tStart);
+      const xSpan = pb.x1 - pb.x0;
+      const yTopPct = (pb.top * 100).toFixed(3) + "%";
+      const yHeightPct = (Math.max(0.05, pb.bottom - pb.top) * 100).toFixed(3) + "%";
+
+      const absPos = displayBase + Math.max(0, Math.min(dur, posSec));
+      const frac = Math.max(0, Math.min(1, (absPos - pb.tStart) / plotSpan));
+      const leftPct = ((pb.x0 + frac * xSpan) * 100).toFixed(3) + "%";
+
+      line.style.display = "block";
+      line.style.left = leftPct;
+      line.style.top = yTopPct;
+      line.style.height = yHeightPct;
+
+      badge.style.display = "block";
+      badge.style.left = leftPct;
+      badge.textContent = `${(state.winStart + posSec).toFixed(2)}s`;
+
+      const loopOn = el("loopToggle").checked;
+      const [ls, le] = getLocalLoopBounds();
+      if (loopOn && le > ls + 0.05) {
+        const f0 = Math.max(0, Math.min(1, (displayBase + ls - pb.tStart) / plotSpan));
+        const f1 = Math.max(0, Math.min(1, (displayBase + le - pb.tStart) / plotSpan));
+        if (f1 > f0) {
+          loopBox.style.display = "block";
+          loopBox.style.left = ((pb.x0 + f0 * xSpan) * 100).toFixed(3) + "%";
+          loopBox.style.width = (((f1 - f0) * xSpan) * 100).toFixed(3) + "%";
+          loopBox.style.top = yTopPct;
+          loopBox.style.height = yHeightPct;
+        } else {
+          loopBox.style.display = "none";
+        }
+      } else {
+        loopBox.style.display = "none";
+      }
     }
 
     function tickUi() {
@@ -551,10 +656,12 @@
       const pos = currentPlayhead();
       el("curTime").textContent = `${(state.winStart + pos).toFixed(2)}s`;
       el("scrubSlider").value = pos.toFixed(2);
+      updatePlayheadOverlay(pos);
       if (!el("loopToggle").checked && pos >= state.duration - 0.01) {
         stopPlayback(true);
         el("curTime").textContent = `${state.winStart.toFixed(2)}s`;
         el("scrubSlider").value = "0";
+        updatePlayheadOverlay(0);
         return;
       }
       state.rafId = requestAnimationFrame(tickUi);
@@ -573,6 +680,10 @@
       const loopOn = el("loopToggle").checked;
       const [ls, le] = getLocalLoopBounds();
       const validLoop = loopOn && le > ls + 0.05;
+
+      if (validLoop && startAt >= le) {
+        startAt = ls;
+      }
 
       const targets = getTargetGains();
       const nodes = {};
@@ -603,7 +714,7 @@
       state.rafId = requestAnimationFrame(tickUi);
     }
 
-    function updateSpectrogramView() {
+    async function updateSpectrogramView() {
       if (!state.payload) return;
       const ab = state.payload.ab_test;
       const sid = state.sessionId;
@@ -612,26 +723,64 @@
         state.payload.takes.a.metrics.duration_s || 0,
         state.payload.takes.b.metrics.duration_s || 0
       ) || state.payload.takes.original.metrics.duration_s || 0;
+      const origDur = state.payload.takes.original.metrics.duration_s || 0;
+      const winDur = state.windowed ? (state.winEnd - state.winStart) : candDur;
       const qs = state.windowed
         ? `start_s=${state.winStart.toFixed(2)}&end_s=${state.winEnd.toFixed(2)}&`
         : "";
       let origQs = qs;
-      if (state.windowed && origOff > 0) {
-        origQs = `start_s=${(state.winStart + origOff).toFixed(2)}&end_s=${(state.winEnd + origOff).toFixed(2)}&`;
-      } else if (!state.windowed && origOff > 0 && candDur > 0) {
-        origQs = `start_s=${origOff.toFixed(2)}&end_s=${(origOff + candDur).toFixed(2)}&`;
+      if (winDur > 0 && (state.windowed || origOff > 0 || origDur > winDur + 0.25)) {
+        const sOrig = state.winStart + origOff;
+        origQs = `start_s=${sOrig.toFixed(2)}&end_s=${(sOrig + winDur).toFixed(2)}&`;
       }
       const map = {
-        a_diff: `/api/sessions/${sid}/takes/${ab.take_a_id}/diff-spectrogram`,
-        b_diff: `/api/sessions/${sid}/takes/${ab.take_b_id}/diff-spectrogram`,
-        a_spec: `/api/sessions/${sid}/takes/${ab.take_a_id}/spectrogram`,
-        b_spec: `/api/sessions/${sid}/takes/${ab.take_b_id}/spectrogram`,
-        orig_spec: `/api/sessions/${sid}/takes/${ab.original_take_id}/spectrogram`,
+        a_diff: `/api/sessions/${sid}/ab-tests/${ab.ab_id}/diff-spectrogram?side=a&`,
+        b_diff: `/api/sessions/${sid}/ab-tests/${ab.ab_id}/diff-spectrogram?side=b&`,
+        ab_diff: `/api/sessions/${sid}/ab-tests/${ab.ab_id}/diff-spectrogram?side=ab&`,
+        a_spec: `/api/sessions/${sid}/takes/${ab.take_a_id}/spectrogram?`,
+        b_spec: `/api/sessions/${sid}/takes/${ab.take_b_id}/spectrogram?`,
+        orig_spec: `/api/sessions/${sid}/takes/${ab.original_take_id}/spectrogram?`,
       };
-      const useOrigQs = state.specTab === "orig_spec" ? origQs : qs;
-      el("specImg").src = `${map[state.specTab]}?${useOrigQs}t=${Date.now()}`;
       for (const btn of el("specTabs").querySelectorAll(".tab-btn")) {
         btn.classList.toggle("active", btn.dataset.spec === state.specTab);
+      }
+      const useOrigQs = state.specTab === "orig_spec" ? origQs : qs;
+      const url = `${map[state.specTab]}${useOrigQs}t=${Date.now()}`;
+      const mySpecGen = ++state.specGen;
+      try {
+        const res = await fetch(url);
+        if (mySpecGen !== state.specGen) return;
+        if (!res.ok) {
+          el("audioLoadStatus").textContent = `Spectrogram error: HTTP ${res.status}`;
+          return;
+        }
+        const x0 = parseFloat(res.headers.get("X-Plot-X0"));
+        const x1 = parseFloat(res.headers.get("X-Plot-X1"));
+        const top = parseFloat(res.headers.get("X-Plot-Top"));
+        const bottom = parseFloat(res.headers.get("X-Plot-Bottom"));
+        const tStart = parseFloat(res.headers.get("X-Time-Start"));
+        const tEnd = parseFloat(res.headers.get("X-Time-End"));
+        const hasBounds = [x0, x1, top, bottom, tStart, tEnd].every(Number.isFinite);
+        const blob = await res.blob();
+        if (mySpecGen !== state.specGen) return;
+        if (state.specBlobUrl) URL.revokeObjectURL(state.specBlobUrl);
+        state.specBlobUrl = URL.createObjectURL(blob);
+        state.plotBounds = hasBounds
+          ? { x0, x1, top, bottom, tStart, tEnd }
+          : {
+              x0: 0.055,
+              x1: 0.96,
+              top: 0.04,
+              bottom: 0.94,
+              tStart: state.specTab === "orig_spec" ? (state.winStart + origOff) : state.winStart,
+              tEnd: (state.specTab === "orig_spec" ? (state.winStart + origOff) : state.winStart) + Math.max(winDur, 0.01),
+            };
+        el("specImg").onload = () => updatePlayheadOverlay(currentPlayhead());
+        el("specImg").src = state.specBlobUrl;
+      } catch (err) {
+        if (mySpecGen === state.specGen) {
+          el("audioLoadStatus").textContent = `Spectrogram load error: ${err.message}`;
+        }
       }
     }
 
@@ -666,134 +815,154 @@
       return state.audioCtx.decodeAudioData(arr);
     }
 
-    async function loadAudioWindow() {
+    async function loadAudioWindow(expectedGen = null) {
       if (!state.payload) return;
+      const gen = expectedGen !== null ? expectedGen : ++state.loadGen;
       stopPlayback(true);
       const ab = state.payload.ab_test;
       const sid = state.sessionId;
       el("playBtn").disabled = true;
+      el("scrubSlider").disabled = true;
       el("audioLoadStatus").textContent = "Loading audio buffers...";
 
       const qs = state.windowed
-        ? `start_s=${state.winStart.toFixed(3)}&end_s=${state.winEnd.toFixed(3)}`
+        ? `?start_s=${state.winStart.toFixed(3)}&end_s=${state.winEnd.toFixed(3)}`
         : "";
       const origOff = Number(ab.original_offset_s || 0);
       const candDur = Math.min(
         state.payload.takes.a.metrics.duration_s || 0,
         state.payload.takes.b.metrics.duration_s || 0
       ) || state.payload.takes.original.metrics.duration_s || 0;
+      const origDur = state.payload.takes.original.metrics.duration_s || 0;
+      const winDur = state.windowed ? (state.winEnd - state.winStart) : candDur;
       let origQs = qs;
-      if (state.windowed && origOff > 0) {
-        origQs = `?start_s=${(state.winStart + origOff).toFixed(3)}&end_s=${(state.winEnd + origOff).toFixed(3)}`;
-      } else if (!state.windowed && origOff > 0 && candDur > 0) {
-        origQs = `?start_s=${origOff.toFixed(3)}&end_s=${(origOff + candDur).toFixed(3)}`;
+      if (winDur > 0 && (state.windowed || origOff > 0 || origDur > winDur + 0.25)) {
+        const sOrig = state.winStart + origOff;
+        origQs = `?start_s=${sOrig.toFixed(3)}&end_s=${(sOrig + winDur).toFixed(3)}`;
       }
 
-      const [bufA, bufB, bufOrig, bufResA, bufResB] = await Promise.all([
-        decodeWavBuffer(`/api/sessions/${sid}/takes/${ab.take_a_id}/audio${qs}`),
-        decodeWavBuffer(`/api/sessions/${sid}/takes/${ab.take_b_id}/audio${qs}`),
-        decodeWavBuffer(`/api/sessions/${sid}/takes/${ab.original_take_id}/audio${origQs}`),
-        state.payload.takes.a.has_residual
-          ? decodeWavBuffer(`/api/sessions/${sid}/takes/${ab.take_a_id}/residual${qs}`)
-          : Promise.resolve(null),
-        state.payload.takes.b.has_residual
-          ? decodeWavBuffer(`/api/sessions/${sid}/takes/${ab.take_b_id}/residual${qs}`)
-          : Promise.resolve(null),
-      ]);
+      try {
+        const [bufA, bufB, bufOrig, bufResA, bufResB] = await Promise.all([
+          decodeWavBuffer(`/api/sessions/${sid}/takes/${ab.take_a_id}/audio${qs}`),
+          decodeWavBuffer(`/api/sessions/${sid}/takes/${ab.take_b_id}/audio${qs}`),
+          decodeWavBuffer(`/api/sessions/${sid}/takes/${ab.original_take_id}/audio${origQs}`),
+          state.payload.takes.a.has_residual
+            ? decodeWavBuffer(`/api/sessions/${sid}/takes/${ab.take_a_id}/residual${qs}`)
+            : Promise.resolve(null),
+          state.payload.takes.b.has_residual
+            ? decodeWavBuffer(`/api/sessions/${sid}/takes/${ab.take_b_id}/residual${qs}`)
+            : Promise.resolve(null),
+        ]);
+        if (gen !== state.loadGen) return;
 
-      state.buffers = { a: bufA, b: bufB, original: bufOrig, res_a: bufResA, res_b: bufResB };
-      state.duration = bufA ? bufA.duration : (bufOrig ? bufOrig.duration : 0);
+        state.buffers = { a: bufA, b: bufB, original: bufOrig, res_a: bufResA, res_b: bufResB };
+        state.duration = bufA ? bufA.duration : (bufOrig ? bufOrig.duration : 0);
 
-      el("curTime").textContent = `${state.winStart.toFixed(2)}s`;
-      el("durTime").textContent = `${(state.winStart + state.duration).toFixed(2)}s`;
-      el("scrubSlider").max = state.duration.toFixed(2);
-      el("scrubSlider").value = "0";
-      el("scrubSlider").disabled = false;
-      el("playBtn").disabled = false;
-      el("audioLoadStatus").textContent = state.windowed
-        ? `Window ${state.winStart.toFixed(1)}s-${(state.winStart + state.duration).toFixed(1)}s ready`
-        : "Ready — press Space or click Play";
-
-      if (ab.focus_start_s !== null && ab.focus_end_s !== null) {
-        const fs = Math.max(state.winStart, ab.focus_start_s);
-        const fe = Math.min(state.winStart + state.duration, ab.focus_end_s);
-        if (fe > fs + 0.05) {
-          el("loopToggle").checked = true;
-          el("loopStart").value = fs.toFixed(2);
-          el("loopEnd").value = fe.toFixed(2);
-          state.playStartOffset = fs - state.winStart;
+        state.playStartOffset = 0;
+        let focusActive = false;
+        if (ab.focus_start_s !== null && ab.focus_end_s !== null) {
+          const fs = Math.max(state.winStart, ab.focus_start_s);
+          const fe = Math.min(state.winStart + state.duration, ab.focus_end_s);
+          if (fe > fs + 0.05) {
+            el("loopToggle").checked = true;
+            el("loopStart").value = fs.toFixed(2);
+            el("loopEnd").value = fe.toFixed(2);
+            state.playStartOffset = Math.max(0, Math.min(state.duration, fs - state.winStart));
+            focusActive = true;
+          }
         }
-      } else {
-        el("loopToggle").checked = false;
-        el("loopStart").value = state.winStart.toFixed(2);
-        el("loopEnd").value = (state.winStart + state.duration).toFixed(2);
-      }
+        if (!focusActive) {
+          el("loopToggle").checked = false;
+          el("loopStart").value = state.winStart.toFixed(2);
+          el("loopEnd").value = (state.winStart + state.duration).toFixed(2);
+        }
 
-      updateSwitchButtons();
-      updateSpectrogramView();
+        el("curTime").textContent = `${(state.winStart + state.playStartOffset).toFixed(2)}s`;
+        el("durTime").textContent = `${(state.winStart + state.duration).toFixed(2)}s`;
+        el("scrubSlider").max = state.duration.toFixed(2);
+        el("scrubSlider").value = state.playStartOffset.toFixed(2);
+        el("scrubSlider").disabled = state.duration <= 0;
+        el("playBtn").disabled = !(bufA && bufB && bufOrig);
+        el("audioLoadStatus").textContent = state.windowed
+          ? `Window ${state.winStart.toFixed(1)}s-${(state.winStart + state.duration).toFixed(1)}s ready`
+          : "Ready — press Space or click Play";
+
+        updateSwitchButtons();
+        await updateSpectrogramView();
+      } catch (err) {
+        if (gen === state.loadGen) {
+          el("audioLoadStatus").textContent = `Audio load failed: ${err.message}`;
+        }
+      }
     }
 
     async function loadAbTest(sessionId, abId) {
+      const gen = ++state.loadGen;
       stopPlayback(true);
       state.sessionId = sessionId;
       state.abId = abId;
+      state.plotBounds = null;
+      updatePlayheadOverlay(0);
       el("playBtn").disabled = true;
       el("submitBtn").disabled = true;
+      el("audioLoadStatus").textContent = "Loading A/B test...";
 
-      const payload = await fetchJson(`/api/sessions/${sessionId}/ab-tests/${abId}`);
-      state.payload = payload;
-      const ab = payload.ab_test;
+      try {
+        const payload = await fetchJson(`/api/sessions/${sessionId}/ab-tests/${abId}`);
+        if (gen !== state.loadGen) return;
+        state.payload = payload;
+        const ab = payload.ab_test;
 
-      el("blindBanner").style.display = payload.redacted ? "block" : "none";
-      el("testNotes").textContent = ab.notes || "";
+        el("blindBanner").style.display = payload.redacted ? "block" : "none";
+        el("testNotes").textContent = ab.notes || "";
 
-      const fullDur = Math.min(
-        payload.takes.a.metrics.duration_s || 0,
-        payload.takes.b.metrics.duration_s || 0
-      ) || payload.takes.original.metrics.duration_s || 0;
-      if (fullDur > 90.0) {
-        state.windowed = true;
-        let ws = 0.0;
-        let we = Math.min(fullDur, 30.0);
-        if (ab.focus_start_s !== null && ab.focus_end_s !== null) {
-          ws = Math.max(0.0, ab.focus_start_s - 5.0);
-          we = Math.min(fullDur, Math.max(ws + 15.0, ab.focus_end_s + 5.0));
-          if (we - ws > 90.0) we = ws + 90.0;
+        const fullDur = Math.min(
+          payload.takes.a.metrics.duration_s || 0,
+          payload.takes.b.metrics.duration_s || 0
+        ) || payload.takes.original.metrics.duration_s || 0;
+        if (fullDur > 90.0) {
+          state.windowed = true;
+          let ws = 0.0;
+          let we = Math.min(fullDur, 30.0);
+          if (ab.focus_start_s !== null && ab.focus_end_s !== null) {
+            ws = Math.max(0.0, ab.focus_start_s - 5.0);
+            we = Math.min(fullDur, Math.max(ws + 15.0, ab.focus_end_s + 5.0));
+            if (we - ws > 90.0) we = ws + 90.0;
+          }
+          state.winStart = ws;
+          state.winEnd = we;
+          el("windowBar").style.display = "flex";
+          el("winStart").value = ws.toFixed(1);
+          el("winEnd").value = we.toFixed(1);
+          el("winNote").textContent = `Full recording: ${fullDur.toFixed(1)}s (max 90s per browser load)`;
+        } else {
+          state.windowed = false;
+          state.winStart = 0.0;
+          state.winEnd = fullDur;
+          el("windowBar").style.display = "none";
         }
-        state.winStart = ws;
-        state.winEnd = we;
-        el("windowBar").style.display = "flex";
-        el("winStart").value = ws.toFixed(1);
-        el("winEnd").value = we.toFixed(1);
-        el("winNote").textContent = `Full recording: ${fullDur.toFixed(1)}s (max 90s per browser load)`;
-      } else {
-        state.windowed = false;
-        state.winStart = 0.0;
-        state.winEnd = fullDur;
-        el("windowBar").style.display = "none";
-      }
 
-      if (!payload.takes.a.has_diff_spectrogram && state.specTab === "a_diff") {
-        state.specTab = "a_spec";
-      }
+        el("submitBtn").disabled = false;
+        state.selectedWinner = ab.verdict ? ab.verdict.winner : null;
+        state.selectedTags = new Set(ab.verdict ? ab.verdict.artifact_tags : []);
+        el("commentBox").value = ab.verdict ? ab.verdict.comment : "";
+        for (const b of el("winnerRow").querySelectorAll(".winner-opt")) {
+          b.classList.toggle("selected", b.dataset.winner === state.selectedWinner);
+        }
+        for (const c of el("tagChips").querySelectorAll(".chip")) {
+          c.classList.toggle("selected", state.selectedTags.has(c.textContent));
+        }
+        el("verdictStatus").textContent = ab.verdict
+          ? `Recorded verdict: ${ab.verdict.winner.toUpperCase()} (${ab.verdict.submitted_at})`
+          : "No verdict recorded yet.";
 
-      await loadAudioWindow();
-
-      el("submitBtn").disabled = false;
-      state.selectedWinner = ab.verdict ? ab.verdict.winner : null;
-      state.selectedTags = new Set(ab.verdict ? ab.verdict.artifact_tags : []);
-      el("commentBox").value = ab.verdict ? ab.verdict.comment : "";
-      for (const b of el("winnerRow").querySelectorAll(".winner-opt")) {
-        b.classList.toggle("selected", b.dataset.winner === state.selectedWinner);
+        renderMetadataCards();
+        await loadAudioWindow(gen);
+      } catch (err) {
+        if (gen === state.loadGen) {
+          el("audioLoadStatus").textContent = `Error loading A/B test: ${err.message}`;
+        }
       }
-      for (const c of el("tagChips").querySelectorAll(".chip")) {
-        c.classList.toggle("selected", state.selectedTags.has(c.textContent));
-      }
-      el("verdictStatus").textContent = ab.verdict
-        ? `Recorded verdict: ${ab.verdict.winner.toUpperCase()} (${ab.verdict.submitted_at})`
-        : "No verdict recorded yet.";
-
-      renderMetadataCards();
     }
 
     async function loadSessions() {
@@ -863,10 +1032,14 @@
     el("sessionSelect").addEventListener("change", () => onSessionChange());
     el("abSelect").addEventListener("change", () => loadAbTest(el("sessionSelect").value, el("abSelect").value));
     el("loadWinBtn").addEventListener("click", async () => {
-      const fullDur = state.payload?.takes?.original?.metrics?.duration_s || 90.0;
-      let ws = Math.max(0.0, parseFloat(el("winStart").value) || 0.0);
-      let we = Math.min(fullDur, parseFloat(el("winEnd").value) || ws + 30.0);
-      if (we <= ws + 0.5) we = Math.min(fullDur, ws + 30.0);
+      const aDur = state.payload?.takes?.a?.metrics?.duration_s || Infinity;
+      const bDur = state.payload?.takes?.b?.metrics?.duration_s || Infinity;
+      const oDur = state.payload?.takes?.original?.metrics?.duration_s || 90.0;
+      const candDur = Math.min(aDur, bDur);
+      const maxDur = Number.isFinite(candDur) && candDur > 0 ? candDur : oDur;
+      let ws = Math.max(0.0, Math.min(Math.max(0.0, maxDur - 0.5), parseFloat(el("winStart").value) || 0.0));
+      let we = Math.min(maxDur, parseFloat(el("winEnd").value) || ws + 30.0);
+      if (we <= ws + 0.5) we = Math.min(maxDur, ws + 30.0);
       if (we - ws > 90.0) we = ws + 90.0;
       state.winStart = ws;
       state.winEnd = we;
@@ -893,12 +1066,47 @@
       const val = parseFloat(e.target.value) || 0;
       state.playStartOffset = val;
       el("curTime").textContent = `${(state.winStart + val).toFixed(2)}s`;
+      updatePlayheadOverlay(val);
       if (state.isPlaying) startPlayback(val);
     });
 
+    function seekFromSpecPointer(clientX) {
+      const pb = state.plotBounds;
+      if (!pb || state.duration <= 0) return;
+      const rect = el("specStage").getBoundingClientRect();
+      if (rect.width <= 0) return;
+      const normX = (clientX - rect.left) / rect.width;
+      const frac = Math.max(0, Math.min(1, (normX - pb.x0) / Math.max(0.01, pb.x1 - pb.x0)));
+      const origOff = Number(state.payload?.ab_test?.original_offset_s || 0);
+      const displayBase = state.specTab === "orig_spec" ? (state.winStart + origOff) : state.winStart;
+      const targetAbs = pb.tStart + frac * (pb.tEnd - pb.tStart);
+      const localPos = Math.max(0, Math.min(state.duration, targetAbs - displayBase));
+      state.playStartOffset = localPos;
+      el("curTime").textContent = `${(state.winStart + localPos).toFixed(2)}s`;
+      el("scrubSlider").value = localPos.toFixed(2);
+      updatePlayheadOverlay(localPos);
+      if (state.isPlaying) startPlayback(localPos);
+    }
+
+    el("specStage").addEventListener("pointerdown", (e) => {
+      if (!state.buffers.a) return;
+      state.scrubbingSpec = true;
+      el("specStage").setPointerCapture?.(e.pointerId);
+      seekFromSpecPointer(e.clientX);
+    });
+    el("specStage").addEventListener("pointermove", (e) => {
+      if (!state.scrubbingSpec) return;
+      seekFromSpecPointer(e.clientX);
+    });
+    el("specStage").addEventListener("pointerup", () => { state.scrubbingSpec = false; });
+    el("specStage").addEventListener("pointercancel", () => { state.scrubbingSpec = false; });
+
     el("loopToggle").addEventListener("change", () => {
+      updatePlayheadOverlay(currentPlayhead());
       if (state.isPlaying) startPlayback(currentPlayhead());
     });
+    el("loopStart").addEventListener("change", () => updatePlayheadOverlay(currentPlayhead()));
+    el("loopEnd").addEventListener("change", () => updatePlayheadOverlay(currentPlayhead()));
 
     el("specTabs").addEventListener("click", (e) => {
       const btn = e.target.closest(".tab-btn");

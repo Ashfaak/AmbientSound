@@ -42,6 +42,12 @@ def test_web_ui_endpoints_and_blind_redaction(tmp_path: Path) -> None:
     assert "AmbientSound A/B Listening Studio" in r_home.text
     assert "missingBanner" in r_home.text
     assert "/api/info" in r_home.text
+    assert "playheadLine" in r_home.text
+    assert "specStage" in r_home.text
+    assert "ab_diff" in r_home.text
+    # Regression guard: windowed URLs must include '?' and slice Original at offset 0
+    assert "?start_s=${state.winStart.toFixed(3)}" in r_home.text
+    assert "origDur > winDur + 0.25" in r_home.text
 
     r_info = client.get("/api/info")
     assert r_info.status_code == 200
@@ -128,3 +134,36 @@ def test_web_ui_endpoints_and_blind_redaction(tmp_path: Path) -> None:
     assert "event_counts" in revealed["takes"]["a"]
     assert "events_total" in revealed["takes"]["a"]
     assert revealed["ab_test"]["verdict"]["winner"] == "a"
+
+    # Trimmed A/B diffs + A vs B Diff + X-Plot metadata headers
+    t_trim_a = manager.process_take(
+        session.session_id,
+        t1.take_id,
+        [{"filter_name": "trim_range", "params": {"start_s": 0.0, "end_s": 0.6}}],
+        label="Trim A (0-0.6s)",
+    )
+    t_trim_b = manager.process_take(
+        session.session_id,
+        t2.take_id,
+        [{"filter_name": "trim_range", "params": {"start_s": 0.0, "end_s": 0.6}}],
+        label="Trim B (0-0.6s)",
+    )
+    ab_trim = manager.create_ab_test(session.session_id, t_trim_a.take_id, t_trim_b.take_id)
+    for side in ("a", "b", "ab"):
+        r_diff = client.get(
+            f"/api/sessions/{session.session_id}/ab-tests/{ab_trim.ab_id}/diff-spectrogram"
+            f"?side={side}"
+        )
+        assert r_diff.status_code == 200
+        assert len(r_diff.content) > 1000
+        assert "X-Plot-X0" in r_diff.headers
+        assert float(r_diff.headers["X-Plot-X1"]) > float(r_diff.headers["X-Plot-X0"])
+        assert float(r_diff.headers["X-Time-End"]) > float(r_diff.headers["X-Time-Start"])
+
+    # Trimmed take /diff-spectrogram fallback (diff_spectrogram_path=None) must still return 200
+    assert (
+        client.get(
+            f"/api/sessions/{session.session_id}/takes/{t_trim_a.take_id}/diff-spectrogram"
+        ).status_code
+        == 200
+    )

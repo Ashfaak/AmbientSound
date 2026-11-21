@@ -22,24 +22,23 @@ flowchart LR
     E --> H[Export Winning Take\nWAV / FLAC / MP3 / OGG]
 ```
 
-## Key Features (v0.3.0)
+## Key Features (v0.4.0)
 
-- **15 Ambient-First CPU DSP Filters (Streaming & In-Memory, Permissive Stack):**
+- **16 Ambient-First CPU DSP Filters (Streaming & In-Memory, Permissive Stack):**
   - `highpass_rumble`: Zero-phase Butterworth high-pass for wind/traffic rumble.
-  - `dehum_notch` & `drone_notch`: Zero-phase cascaded notches for 50/60 Hz mains hum and persistent machine-drone frequencies (`30–1000 Hz`).
-  - `declick_impulse`: MAD spike detection + PCHIP sample interpolation for mic clicks/pops.
+  - `dehum_notch` & `drone_notch`: Zero-phase cascaded notches for 50/60 Hz mains hum and persistent machine-drone frequencies (`30–8000 Hz`).
+  - `declick_impulse`: MAD spike detection + PCHIP sample interpolation for mic clicks/pops (with `texture_tick_rate_per_min` organic tick telemetry so insect/bee micro-ticks aren't stripped inadvertently).
   - `spectral_denoise`: Linked-stereo soft STFT spectral gate/Wiener denoiser.
-  - `band_attenuate`: Feathered time-frequency attenuation supporting `"adaptive"` (tracks real distraction excess without carving hollow edges), `"swell"`, `"flat"`, up to `5 s` fades, and batched multi-span lists (`spans`).
-  - `ambience_patch`: Replaces one or many distracted spans with clean matching texture via up to `5 s` equal-power crossfades, with per-span `crossfade_ms` / `source_start_s` and donor provenance.
+  - `spectral_match_suppress`: Per-bin `n_fft=4096` STFT adaptive excess suppression against clean surrounding bed percentiles with optional clean-context texture fill — attenuates passing cars, exhaust harmonics, and temporary overlapping tones without carving hollow gaps into nearby bee/nature frequencies.
+  - `band_attenuate`: Feathered time-frequency attenuation supporting `"adaptive"`, `"swell"`, `"flat"`, up to `5 s` fades, and batched multi-span lists (`spans`).
+  - `ambience_patch`: Replaces one or many distracted spans with non-repeating, event-screened clean donor audio using RMS + 2-band tilt matching, equal-power crossfades (`crossfade_ms` up to `5000 ms`), and `donor_quality` telemetry.
   - `trim_range`, `cut_regions`, `fade_edges`, & `gain`: Extract ranges (with timeline tracking), cut bad stretches with equal-power crossfades, add smooth start/end fades, and apply clean linear dB gain staging before compression.
   - `parametric_eq`, `soft_compress`, `loudness_normalize`, & `true_peak_limiter`: Tone shaping (`lowshelf` warmth / `highshelf` air), gentle RMS compression, peak-limited (`limit_peaks=True`) 2-pass streaming BS.1770 LUFS leveling (`-14 LUFS` YouTube/ASMR ready), and lookahead limiting.
-- **Large-File Bounded-RAM Streaming (`> 120 s` / 1-Hour+ Recordings):** Streams blocks with per-step `step_metrics` telemetry, LRA (`loudness_range_lu`), `noise_floor_dbfs`, short-term LUFS timeline, and persistent `events.json` archival alongside compact `max_events=50` MCP responses.
-- **Non-Destructive Take DAG + Disk Cleanup:** Every processing pass writes an immutable `take_NNN` (`audio.wav`, `recipe.json`, `events.json`, `spectrogram.png`, plus `residual.wav` / gain-matched dynamic residuals and `n_fft=8192` spectrograms), while `delete_take` / `delete_session` reclaim disk from abandoned experiments.
-- **Bias-Free Local A/B Listening Studio (with Windowed Audition Mode):**
+- **Large-File Streaming, Zero-Copy Sessions & Continuous Multi-File Splits (`> 120 s` / 2 GB+):** Supports `copy_source=False` in-place WAV referencing, `compact_metrics=True` transport, RF64 temp stages with immediate unlink, per-step `step_metrics`, `calibrate_sequence` shared gain solving, `process_sequence` seam-padded batch processing, and `verify_seams` / `find_clean_sections` QC.
+- **Bias-Free Local A/B Listening Studio (with Scrolling Playhead & A vs B Diff):**
   - Time-locked synchronized Web Audio playback across timeline-aligned Original, Take A, Take B, and gain-matched Removed Residuals (`1`/`2`/`3`/`4` hotkeys, `12 ms` click-free crossfades).
-  - Automatic `<= 90 s` Windowed Audition Mode on long recordings so multi-hour files audition effortlessly in the browser.
-  - Candidate-first attenuation-only LUFS matching (`match_original=False` default, `<= 0 dB` gain offsets), loop focus spans, Blind Mode, and structured feedback tags.
-- **Path-Sandboxed MCP Server (`stdio`, 15 Tools):** Includes `health_check`, `analyze_region`, `delete_take`, `delete_session`, windowed `render_spectrogram`, compact event filtering (`event_kinds`, `max_events`, `include_events`), and strict path allowlisting.
+  - Live `#playheadLine` cursor tracking over spectrograms and waveforms with click-to-seek, interactive `A Diff` / `B Diff` / `A vs B Diff` spectrogram views, and automatic `<= 90 s` Windowed Audition Mode.
+- **Path-Sandboxed MCP Server (`stdio`, 19 Tools):** Includes `health_check`, `analyze_region`, `verify_seams`, `calibrate_sequence`, `process_sequence`, `find_clean_sections`, `delete_take`, `delete_session`, windowed `render_spectrogram`, compact event filtering, and strict path allowlisting.
 
 ---
 
@@ -93,25 +92,29 @@ Configure your MCP host (Claude Desktop, Cursor, Antigravity, etc.) to launch `a
 
 ---
 
-## Built-In MCP Tools
+## Built-In MCP Tools (19 Tools)
 
 | Tool | Purpose |
 | :--- | :--- |
 | `health_check` | Verifies MCP connectivity, allowed roots, `ffmpeg`/`ffprobe`, and workspace free space. |
-| `list_filters` | Returns machine-readable schemas, defaults, and tuning hints for all 15 DSP filters. |
-| `create_session` | Ingests a recording into `take_000` in bounded RAM, archives `events.json`, renders `n_fft=8192` overview PNG, returns compact event summary. |
+| `list_filters` | Returns machine-readable schemas, defaults, and tuning hints for all 16 DSP filters. |
+| `create_session` | Ingests (or links in-place via `copy_source=False`) a recording into `take_000` in bounded RAM, archives `events.json`, renders `n_fft=8192` overview PNG, returns compact event/metric summary. |
 | `list_sessions` | Lists active restoration sessions in the workspace. |
-| `get_session_summary` | Returns take DAG, metrics (LRA, noise floor, short-term LUFS), bounded events (`max_events`, `event_kinds`), and A/B test history. |
-| `analyze_take` | Streaming analysis with configurable sensitivity, duration filters, frequency band, and `event_kinds`/`max_events` filtering. |
+| `get_session_summary` | Returns take DAG, metrics (LRA, noise floor, tick rate, short-term LUFS), bounded events (`max_events`, `event_kinds`, `compact_metrics`), and A/B test history. |
+| `analyze_take` | Streaming analysis with configurable sensitivity, duration filters, frequency band gating (`freq_range_hz`), temporary localized tone discovery, and `event_kinds`/`max_events` filtering. |
 | `analyze_region` | Analyzes a specific `[start_s, end_s]` window with custom sensitivity, frequency band, and event filtering. |
-| `render_spectrogram` | Generates overview or zoomed `[start_s, end_s]` spectrogram (`n_fft=8192`) and gain-matched 3-panel diff PNG (`Patched` spans shaded). |
-| `process_take` | Applies an ordered filter recipe to a parent take, producing an immutable child take with `step_metrics`, donor provenance, and residual. |
+| `render_spectrogram` | Generates overview or zoomed `[start_s, end_s]` spectrogram (`n_fft=8192`) and timeline-aligned 3-panel diff PNG (`Patched` spans shaded). |
+| `process_take` | Applies an ordered filter recipe to a parent take, producing an immutable child take with `step_metrics`, `donor_quality`, and residual. |
 | `create_ab_test` | Registers a timeline-aware, candidate-first (`match_original=False` default) A/B test and returns `ui_url`. |
 | `list_ab_tests` | Lists all A/B tests and verdicts in a session. |
 | `get_ab_feedback` | Retrieves user verdict, artifact tags, and comments so the AI model can refine the recipe. |
 | `delete_take` | Deletes an abandoned non-root take (with optional `cascade=True`) and orphaned A/B tests to reclaim disk space. |
-| `delete_session` | Permanently removes a session folder and all its takes and A/B tests. |
+| `delete_session` | Permanently removes a session folder and all its takes and A/B tests (preserving external `copy_source=False` raw audio). |
 | `export_take` | Exports a chosen take to WAV, FLAC, MP3, or OGG inside allowed roots. |
+| `find_clean_sections` | Ranks largest untouched and minimal-edit stretches in round YouTube ASMR durations (`15 min`–`10 hr`), separating edits from residual distractions. |
+| `verify_seams` | Measures LUFS delta, `2 s` RMS delta, sample step, `40–8000 Hz` spectral diff, and renders stitched `[-10 s, +10 s]` seam spectrograms across file splits. |
+| `calibrate_sequence` | Solves one shared master gain across a continuous split sequence on clean interior slices. |
+| `process_sequence` | Single-call seam-padded batch processor for split recordings with outer edge fades, export, QC, and optional internal WAV dedup (`discard_take_audio_after_export`). |
 
 ---
 

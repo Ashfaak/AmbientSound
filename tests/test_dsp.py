@@ -27,13 +27,14 @@ def _rms_db(x: np.ndarray) -> float:
 def test_filter_specs_registered() -> None:
     specs = list_filter_specs()
     names = {s["name"] for s in specs}
-    assert len(specs) == 15
+    assert len(specs) == 16
     assert {
         "highpass_rumble",
         "dehum_notch",
         "drone_notch",
         "declick_impulse",
         "spectral_denoise",
+        "spectral_match_suppress",
         "band_attenuate",
         "ambience_patch",
         "trim_range",
@@ -619,3 +620,119 @@ def test_split_file_seam_continuity_and_validation(tmp_path: Path) -> None:
             [{"filter_name": "trim_range", "params": {"start_s": 0.5, "end_s": 2.0}}],
             next_audio_path=part2_wav,
         )
+
+
+def test_spectral_match_suppress_and_ambience_patch_v2(tmp_path: Path) -> None:
+    sr = 16000
+    n = sr * 12
+    t = np.arange(n, dtype=np.float64) / sr
+    rng = np.random.default_rng(777)
+    # Pink/hive bed with steady 250 Hz hive buzz + moving car harmonics across [4.0..6.5 s]
+    bed = rng.normal(0.0, 0.012, size=(n, 2)) + (0.025 * np.sin(2.0 * np.pi * 250.0 * t))[:, None]
+    noisy = bed.copy()
+    v0, v1 = int(4.0 * sr), int(6.5 * sr)
+    env = np.hanning(v1 - v0)
+    f_sweep = np.linspace(75.0, 165.0, v1 - v0)
+    phase = 2.0 * np.pi * np.cumsum(f_sweep) / sr
+    vehicle = (
+        0.16 * env * np.sin(phase)
+        + 0.09 * env * np.sin(2.0 * phase)
+        + 0.08 * env * np.sin(2.0 * np.pi * 1340.0 * t[v0:v1])
+    )[:, None]
+    noisy[v0:v1, :] += vehicle
+    # Secondary distraction at [1.8..2.6 s] that exclude_events must protect from donor selection
+    b0, b1 = int(1.8 * sr), int(2.6 * sr)
+    noisy[b0:b1, :] += (0.14 * np.sin(2.0 * np.pi * 110.0 * t[b0:b1]))[:, None]
+
+    # 1. spectral_match_suppress (in-memory & streaming)
+    sup_step = {
+        "filter_name": "spectral_match_suppress",
+        "params": {
+            "start_s": 3.8,
+            "end_s": 6.7,
+            "low_hz": 40.0,
+            "high_hz": 3000.0,
+            "strength": 1.0,
+            "max_attenuation_db": -30.0,
+            "texture_fill": 0.6,
+            "context_s": 2.0,
+            "fade_ms": 400.0,
+            "n_fft": 2048,
+        },
+    }
+    sup_mem, tele_mem = apply_recipe_with_telemetry(noisy, sr, [sup_step])
+    assert tele_mem[0].details["suppressed_spans"]
+    assert (
+        _rms_db(sup_mem[int(4.5 * sr) : int(6.0 * sr)])
+        < _rms_db(noisy[int(4.5 * sr) : int(6.0 * sr)]) - 7.0
+    )
+    assert abs(_rms_db(sup_mem[: int(1.2 * sr)]) - _rms_db(noisy[: int(1.2 * sr)])) < 0.5
+
+    src_wav = save_wav(tmp_path / "noisy_sup.wav", noisy, sr, subtype="PCM_24")
+    dst_wav = tmp_path / "sup_out.wav"
+    tele_str: list = []
+    apply_recipe_streaming(
+        src_wav,
+        dst_wav,
+        [
+            sup_step,
+            {
+                "filter_name": "band_attenuate",
+                "params": {
+                    "start_s": 1.8,
+                    "end_s": 2.6,
+                    "low_hz": 70.0,
+                    "high_hz": 160.0,
+                    "attenuation_db": -16.0,
+                    "envelope_mode": "adaptive",
+                },
+            },
+        ],
+        telemetry_out=tele_str,
+        block_seconds=4.0,
+    )
+    assert tele_str[0].details["suppressed_spans"]
+    assert tele_str[1].details["attenuated_spans"]
+    sup_disk, _ = load_audio(dst_wav)
+    assert (
+        _rms_db(sup_disk[int(4.5 * sr) : int(6.0 * sr)])
+        < _rms_db(noisy[int(4.5 * sr) : int(6.0 * sr)]) - 7.0
+    )
+
+    # 2. ambience_patch v2: non-repeating donors + exclude_events avoidance + donor_quality
+    noisy2 = bed.copy()
+    noisy2[b0:b1, :] += (0.14 * np.sin(2.0 * np.pi * 110.0 * t[b0:b1]))[:, None]
+    patch_step = {
+        "filter_name": "ambience_patch",
+        "params": {
+            "crossfade_ms": 60.0,
+            "spans": [
+                {"start_s": 4.0, "end_s": 5.0},
+                {"start_s": 8.2, "end_s": 9.2},
+            ],
+        },
+    }
+    _, p_tele_mem = apply_recipe_with_telemetry(
+        noisy2, sr, [patch_step], exclude_events=[(1.8, 2.6)]
+    )
+    p_spans_mem = p_tele_mem[0].details["patched_spans"]
+    assert len(p_spans_mem) == 2
+    assert p_spans_mem[0]["donor_start_s"] != p_spans_mem[1]["donor_start_s"]
+    for sp in p_spans_mem:
+        assert sp["donor_quality"]["overlaps_event"] is False
+        assert sp["donor_quality"]["crest_factor"] is not None
+
+    src_p_wav = save_wav(tmp_path / "noisy_patch.wav", noisy2, sr, subtype="PCM_24")
+    p_tele_str: list = []
+    apply_recipe_streaming(
+        src_p_wav,
+        tmp_path / "patch_out.wav",
+        [patch_step],
+        telemetry_out=p_tele_str,
+        exclude_events=[(1.8, 2.6)],
+        block_seconds=4.0,
+    )
+    p_spans_str = p_tele_str[0].details["patched_spans"]
+    assert len(p_spans_str) == 2
+    assert p_spans_str[0]["donor_start_s"] != p_spans_str[1]["donor_start_s"]
+    assert all(sp["donor_quality"]["overlaps_event"] is False for sp in p_spans_str)

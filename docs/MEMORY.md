@@ -5,12 +5,13 @@ Persistent architecture decisions, verified environment facts, invariants, and a
 ---
 
 ## 1. Confirmed Decisions
-- **Date:** 2026-11-21 (`v0.3.2` multi-file continuity, RF64 temp streaming cleanup, and default YouTube ASMR clean-section reporting)
+- **Date:** 2026-11-21 (`v0.4.0` A/B playhead & diffs, `spectral_match_suppress`, non-repeating `ambience_patch` v2, and continuous sequence tools)
 - **Repository:** `Ashfaak/AmbientSound` (Public GitHub repo, `main` branch, `git@github.com:Ashfaak/AmbientSound.git`).
 - **License:** `Apache-2.0` (`LICENSE` + `NOTICE`). Strictly permissive runtime/dev dependencies only (no GPL/AGPL Python imports).
 - **Primary Stack:** Python 3.12 (`uv` environment), `mcp>=2.0.0` (`MCPServer`, `stdio`), `numpy`, `scipy`, `soundfile`, `pyloudnorm`, `matplotlib`, `fastapi`, `uvicorn`, `pydantic`.
-- **Streaming Architecture:** Recordings `> 120.0 s` (`STREAMING_THRESHOLD_S`) automatically execute block-wise on disk (`PCM_24` takes, zero full-file 2.76 GB arrays or duplicate `residual.wav`), with dynamic loudness-matched sliced residuals and Windowed Audition Mode (`<= 90 s` slices) in the Web UI.
-- **Compact Event Storage & Transport (`v0.3.0`):** Full detected event lists persist in `takes/take_NNN/events.json`; `session.json` caps inline `take.events` (`<= 200`), and MCP/UI responses default to `max_events=50` prioritizing non-click events alongside complete `event_counts`.
+- **Zero-Copy Reference Mode (`v0.4.0`):** `create_session(..., copy_source=False)` links allowed WAV sources in-place (saving 10 GB+ on multi-file workflows; `delete_take("take_000")` stays blocked and `delete_session` removes only the session directory), while `process_sequence(..., discard_take_audio_after_export=True)` can unlink duplicate internal `audio.wav` files after verified WAV export.
+- **Streaming Architecture:** Recordings `> 120.0 s` (`STREAMING_THRESHOLD_S`) automatically execute block-wise on disk (`PCM_24` takes, zero full-file 2.76 GB arrays or duplicate `residual.wav`, including bounded-window `_stream_spectral_match_suppress`), with dynamic loudness-matched sliced residuals and Windowed Audition Mode (`<= 90 s` slices) in the Web UI.
+- **Compact Event & Metric Transport (`v0.4.0`):** Full detected event lists persist in `takes/take_NNN/events.json`; `session.json` caps inline `take.events` (`<= 200`), MCP tools default to `max_events=50`, and `compact_metrics=True` strips verbose `short_term_lufs_timeline` points for long sessions.
 - **Timeline-Aware & Candidate-First A/B (`v0.3.0`):** `TakeRecord` tracks `source_offset_s` and `timeline_modified`. `create_ab_test` defaults `original_take_id` to the earliest ancestor matching both candidates' timeline and matches candidate loudness (`match_original=False` default) so `-14 LUFS` masters are never pulled down by quiet `-49 LUFS` originals.
 - **Shared Default Workspace (`v0.2.1`):** Default `workspace_dir` is `~/.ambientsound` (override via `AMBIENTSOUND_WORKSPACE` or `ambient-sound-ui --workspace`), ensuring MCP servers and the Web UI share the same session store across working directories.
 - **UI Stack:** Zero-build FastAPI + Web Audio API dark studio served on `127.0.0.1:8765`.

@@ -65,6 +65,7 @@ class AudioMetrics(BaseModel):
     noise_floor_dbfs: float | None = None
     ambient_bed_dbfs: float | None = None
     high_freq_floor_dbfs: float | None = None
+    texture_tick_rate_per_min: float | None = None
     short_term_lufs_stats: dict[str, float] | None = None
     short_term_lufs_timeline: list[dict[str, float]] = Field(default_factory=list)
 
