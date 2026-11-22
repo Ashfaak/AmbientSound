@@ -9,11 +9,18 @@ from scipy import signal
 
 from ambient_sound.analysis import analyze_audio, compute_clean_sections, summarize_events
 from ambient_sound.config import Settings
-from ambient_sound.dsp import apply_recipe, apply_recipe_streaming, apply_recipe_with_telemetry
+from ambient_sound.dsp import (
+    apply_recipe,
+    apply_recipe_streaming,
+    apply_recipe_with_telemetry,
+    list_filter_specs,
+)
 from ambient_sound.engines import (
     assess_do_no_harm,
+    compute_bird_protect_mask,
     compute_comparison_guardrails,
     detect_channel_layout,
+    detect_synthetic_beeps,
     fractional_shift_channel,
 )
 from ambient_sound.io_audio import load_audio, save_wav
@@ -697,4 +704,67 @@ def test_v052_bird_retention_gain_normalized_and_local_minutes_all_tiers() -> No
     t_1hr = next(t for t in rep["asmr_targets"] if t["duration_min"] == 60)
     assert t_1hr["start_local_s"] % 60.0 < 1e-3
     assert "eligible" in t_1hr and isinstance(t_1hr["violations"], list)
+
+
+def test_v053_beep_gain_invariance_narrowband_and_10min_target() -> None:
+    sr = 48000
+    n = sr * 5
+    # Quiet field recording (-45 dBFS bed) with 90 ms 2982 Hz watch beep + FM birds
+    quiet = _pinkish_bed(n, sr, seed=503, level=0.0025)
+    _add_fm_bird_chirp(quiet, sr, 0.8, 0.16, 2600.0, 4800.0, amp=0.012)
+    t = np.arange(n, dtype=np.float64) / sr
+    b0, b1 = int(2.20 * sr), int(2.29 * sr)
+    env = np.hanning(b1 - b0)
+    tone = 0.045 * np.clip(env * 2.5, 0.0, 1.0) * np.sin(2.0 * np.pi * 2982.0 * t[b0:b1])
+    quiet[b0:b1, 0] += tone
+    quiet[b0:b1, 1] += tone
+
+    beeps_q = detect_synthetic_beeps(np.mean(quiet, axis=1), sr, sensitivity="medium")
+    beeps_boost = detect_synthetic_beeps(np.mean(quiet * 10.0, axis=1), sr, sensitivity="medium")
+    assert any(b.freq_band_hz[1] >= 2940.0 and b.freq_band_hz[0] <= 3020.0 for b in beeps_q)
+    assert len(beeps_q) == len(beeps_boost)
+
+    # At n_fft=4096 / 48 kHz, 90 ms 2982 Hz piezo tone must NOT be protected by bird mask
+    f, tm, zxx = signal.stft(
+        np.mean(quiet, axis=1), fs=sr, nperseg=4096, noverlap=3072, window="hann"
+    )
+    pmask = compute_bird_protect_mask(f, tm, np.abs(zxx))
+    bin_2982 = int(np.argmin(np.abs(f - 2982.0)))
+    in_beep = (tm >= 2.21) & (tm <= 2.28)
+    assert float(np.mean(pmask[bin_2982, in_beep])) < 0.15
+
+    proc = apply_recipe(
+        quiet,
+        sr,
+        [
+            FilterStep(
+                filter_name="spectral_match_suppress",
+                params={
+                    "start_s": 2.0,
+                    "end_s": 2.5,
+                    "low_hz": 2700.0,
+                    "high_hz": 3300.0,
+                    "narrowband_mode": True,
+                    "protect_birds": True,
+                    "n_fft": 4096,
+                    "max_attenuation_db": -36.0,
+                },
+            )
+        ],
+    )
+    sos_bp = signal.butter(4, [2920.0, 3040.0], btype="bandpass", fs=sr, output="sos")
+    before_bp = _rms_db(signal.sosfiltfilt(sos_bp, quiet[b0:b1, 0]))
+    after_bp = _rms_db(signal.sosfiltfilt(sos_bp, proc[b0:b1, 0]))
+    assert (before_bp - after_bp) >= 15.0
+
+    # 35-min recording must include 10 min target in asmr_targets
+    rep35 = compute_clean_sections(
+        [{"label": "Z1.WAV", "session_id": "s1", "take_id": "t1", "duration_s": 2123.367}]
+    )
+    assert any(item["duration_min"] == 10 for item in rep35["asmr_targets"])
+
+    # list_filter_specs exposes 'bark_distance' choice
+    ds_spec = next(sp for sp in list_filter_specs() if sp["name"] == "distance_soften")
+    assert "bark_distance" in ds_spec["params"]["mode"]["choices"]
+
 

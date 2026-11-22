@@ -397,13 +397,17 @@ FILTER_SPECS: list[dict[str, Any]] = [
             "HF rolloff, onset smearing, and bird chirp protection."
         ),
         "ambient_guidance": (
-            "Use mode='distance' for dog barks or close distractions; mode='voice_muffle' "
-            "with formant_blur for speech. Preserves FM bird syllables."
+            "Use mode='distance' or mode='bark_distance' for dog barks and close spikes; "
+            "mode='voice_muffle' with formant_blur for speech. Preserves FM bird syllables."
         ),
         "params": {
             "start_s": {"type": "float | null", "default": None},
             "end_s": {"type": "float | null", "default": None},
-            "mode": {"type": "str", "default": "distance", "choices": ["distance", "voice_muffle"]},
+            "mode": {
+                "type": "str",
+                "default": "distance",
+                "choices": ["distance", "voice_muffle", "bark_distance"],
+            },
             "low_hz": {"type": "float", "default": 150.0, "min": 20.0, "max": 4000.0},
             "high_hz": {"type": "float", "default": 6000.0, "min": 200.0, "max": 20000.0},
             "attenuation_db": {"type": "float", "default": -14.0, "min": -36.0, "max": -2.0},

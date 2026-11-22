@@ -5,7 +5,7 @@ Persistent architecture decisions, verified environment facts, invariants, and a
 ---
 
 ## 1. Confirmed Decisions
-- **Date:** 2026-11-21 (`v0.5.2` hardened diagnostics, gain-normalized bird retention, parent-offset event reporting, single-pass WAV master export + heartbeats, `wait_for_job`, `distinct_regions`; building on `v0.5.0`/`v0.5.1`)
+- **Date:** 2026-11-22 (`v0.5.3` gain-invariant `synthetic_beep` detection, short-beep zero-drift `protect_birds` rejection at `n_fft=4096`, `bark_distance` schema parity, and `10 min` target availability on 30+ min files; building on `v0.5.0`–`v0.5.2`)
 - **Repository:** `Ashfaak/AmbientSound` (Public GitHub repo, `main` branch, `git@github.com:Ashfaak/AmbientSound.git`).
 - **License:** `Apache-2.0` (`LICENSE` + `NOTICE`). Strictly permissive runtime/dev dependencies only (no GPL/AGPL Python imports; zero extra package dependencies added in v0.5.0/v0.5.1).
 - **Clean Section Compilation & Unified Output Layout (`v0.5.1`):** `compile_clean_sections` (sync and async via `start_compile_clean_sections_job`) and `process_sequence(..., output_dir=..., compile_clean_targets=...)` consolidate overall per-file masters, optional full combined exports, `<output_dir>/clean_sections/*` ASMR cuts, and `<output_dir>/clean_sections_manifest.json` in one validated directory outside `workspace/sessions`, auto-switching WAV containers to `RF64` above `3.8 GB`.

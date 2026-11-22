@@ -22,7 +22,7 @@ flowchart LR
     E --> H[Export Winning Take\nWAV / FLAC / MP3 / OGG]
 ```
 
-## Key Features (v0.5.2)
+## Key Features (v0.5.3)
 
 - **21 Ambient-First CPU DSP Filters (Streaming & In-Memory, Zero Extra Deps):**
   - `highpass_rumble`: Zero-phase Butterworth high-pass for wind/traffic rumble.
@@ -113,7 +113,7 @@ Configure your MCP host (Claude Desktop, Cursor, Antigravity, etc.) to launch `a
 | `delete_take` | Deletes an abandoned non-root take (with optional `cascade=True`) and orphaned A/B tests. |
 | `delete_session` | Permanently removes a session folder and all its takes and A/B tests. |
 | `export_take` | Exports a chosen take and returns verified size, duration, loudness/true peak, SHA-256, and optional internal audio cleanup (`discard_take_audio=True`). |
-| `find_clean_sections` | Ranks largest untouched and minimal-edit stretches in round YouTube ASMR durations (`15 min`–`10 hr`), with optional `round_to_file_local_minutes=True`. |
+| `find_clean_sections` | Ranks largest untouched and minimal-edit stretches in round YouTube ASMR durations (`10 min`–`10 hr`), with optional `round_to_file_local_minutes=True`. |
 | `verify_seams` | Measures LUFS delta, `2 s` RMS delta, slew-normalized `sample_step_excess_db`, and `40–8000 Hz` spectral diff across file splits. |
 | `calibrate_sequence` | Solves one shared master gain across a continuous split sequence on clean interior slices. |
 | `process_sequence` | Single-call seam-padded batch processor for split recordings with outer edge fades, unified `output_dir` master export, optional `compile_clean_targets`, QC, and temp dedup. |

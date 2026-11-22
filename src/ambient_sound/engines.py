@@ -558,18 +558,20 @@ def compute_bird_protect_mask(
                     g_t = t_start_i + tj
                     peak_hz.append(_parabolic_peak_freq(freqs, db[:, g_t], g_r))
 
-            if len(peak_rows) >= 4:
-                row_ptp = max(peak_rows) - min(peak_rows)
-                f_center = float(np.median(peak_hz))
-                f_ptp = max(peak_hz) - min(peak_hz)
+            if len(peak_rows) >= 2:
+                core_rows = peak_rows[1:-1] if len(peak_rows) >= 4 else peak_rows
+                core_hz = peak_hz[1:-1] if len(peak_hz) >= 4 else peak_hz
+                row_ptp = max(core_rows) - min(core_rows)
+                f_center = float(np.median(core_hz))
+                f_ptp = max(core_hz) - min(core_hz)
                 amp_arr = np.asarray(peak_amps, dtype=np.float64)
                 mid_lo = max(0, len(amp_arr) // 5)
                 mid_hi = min(len(amp_arr), max(mid_lo + 2, (4 * len(amp_arr)) // 5))
-                mid_std = float(np.std(amp_arr[mid_lo:mid_hi]))
+                mid_std = float(np.std(amp_arr[mid_lo:mid_hi])) if mid_hi > mid_lo else 0.0
                 # Zero-drift flat piezo beep: stays at constant frequency (even with Hann skirt)
                 if (
                     f_center >= 1400.0
-                    and dur_comp_s >= 0.045
+                    and dur_comp_s >= 0.04
                     and row_ptp <= 1
                     and f_ptp <= max(18.0, 0.008 * f_center)
                 ):
@@ -757,7 +759,14 @@ def detect_synthetic_beeps(
     exc_req = {"low": 13.0, "medium": 10.5, "high": 8.0}.get(sensitivity, 10.5)
 
     band_m = (freqs >= 1400.0) & (freqs <= min(8000.0, sample_rate * 0.45))
-    cand = (prom >= prom_req) & (excess >= exc_req) & (db > -88.0) & band_m[:, np.newaxis]
+    global_bed = float(np.percentile(db[band_m], 25.0)) if np.any(band_m) else -95.0
+    min_level_db = max(-110.0, global_bed + 8.0)
+    cand = (
+        (prom >= prom_req)
+        & (excess >= exc_req)
+        & (db > min_level_db)
+        & band_m[:, np.newaxis]
+    )
     if not np.any(cand):
         return []
 
@@ -778,7 +787,7 @@ def detect_synthetic_beeps(
             sub = labeled[f_sl, t_sl] == cid
             t_len = sub.shape[1]
             dur_s = t_len * dt
-            if dur_s < 0.035 or dur_s > 2.0:
+            if dur_s < 0.045 or dur_s > 2.0:
                 continue
             f_start = f_sl.start
             sub_db = db[f_sl, t_sl]
@@ -792,20 +801,19 @@ def detect_synthetic_beeps(
                 g_idx = f_start + r
                 p_freqs.append(_parabolic_peak_freq(freqs, db[:, t_sl.start + tj], g_idx))
                 p_amps.append(float(db[g_idx, t_sl.start + tj]))
-            if len(p_freqs) < 2:
+            if len(p_freqs) < 4:
                 continue
-            f_arr = np.asarray(p_freqs, dtype=np.float64)
-            f_med = float(np.median(f_arr))
-            f_std = float(np.std(f_arr))
-            f_ptp = float(np.ptp(f_arr))
+            core_f = np.asarray(p_freqs[1:-1] if len(p_freqs) >= 5 else p_freqs, dtype=np.float64)
+            core_a = np.asarray(p_amps[1:-1] if len(p_amps) >= 5 else p_amps, dtype=np.float64)
+            f_med = float(np.median(core_f))
+            f_std = float(np.std(core_f))
+            f_ptp = float(np.ptp(core_f))
             # Zero-drift crystal-oscillator piezo signature vs bird FM glide
             if f_std > 2.5 or f_ptp > max(6.0, 0.25 * df):
                 continue
 
             amp_arr = np.asarray(p_amps, dtype=np.float64)
-            mid_lo = max(0, amp_arr.size // 4)
-            mid_hi = min(amp_arr.size, max(mid_lo + 1, (3 * amp_arr.size) // 4))
-            mid_std = float(np.std(amp_arr[mid_lo:mid_hi])) if mid_hi > mid_lo else 0.0
+            mid_std = float(np.std(core_a)) if core_a.size >= 2 else 0.0
             if mid_std > 2.2:
                 continue
 

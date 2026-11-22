@@ -12,6 +12,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Phase 3: Text-queried target distraction separation (`AudioSep` / `CLAPSep`) behind license-aware model opt-in controls.
 - Phase 4: Multi-take history DAG visualizer and optional external `ferraus` CLI backend adapter.
 
+## [0.5.3] - 2026-11-22
+
+### Fixed
+- **Gain-Invariant Piezo Beep Detection & Narrowband Protection (`engines.py`):**
+  - Replaced the fixed `-88.0 dBFS` floor inside `detect_synthetic_beeps` with a recording-relative bed threshold (`max(-110.0, bed_p25 + 8.0)`) and interior-frame stability evaluation (`dur_s >= 0.045`, `len >= 4`), eliminating gain-amplified false positives after normalizing while catching real `75–120 ms` watch piezo beeps (`~2982 Hz`).
+  - Updated `compute_bird_protect_mask` to evaluate zero-drift piezo rejection down to `2+` frame components and across interior frames so `48 kHz` `n_fft=4096` `spectral_match_suppress(narrowband_mode=True, protect_birds=True)` suppresses `90 ms` piezo tones instead of partially guarding them.
+- **Filter Schema & `10 min` Clean Target Completeness (`dsp.py`, `analysis.py`):**
+  - Exposed `"bark_distance"` in `distance_soften`'s `list_filters` `mode.choices` schema.
+  - Enabled `"10 min"` ASMR clean-section targets on all recordings `>= 10 min` (previously omitted once duration exceeded 30 min).
+
 ## [0.5.2] - 2026-11-21
 
 ### Fixed

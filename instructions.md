@@ -1,4 +1,4 @@
-# AmbientSound MCP — Agent Operational Instructions (`v0.5.2`)
+# AmbientSound MCP — Agent Operational Instructions (`v0.5.3`)
 
 This guide configures any AI coding or audio agent (Claude Code, Cursor, Antigravity, etc.) to restore ambient and outdoor nature recordings using the **AmbientSound** MCP server cleanly and conservatively.
 
@@ -6,7 +6,7 @@ This guide configures any AI coding or audio agent (Claude Code, Cursor, Antigra
 
 ## 0. Preflight: Verify MCP Connection Before Starting
 1. Call `health_check` immediately. Verify:
-   - `status == "ok"` and `version == "0.5.2"`
+   - `status == "ok"` and `version == "0.5.3"`
    - `filter_count == 21` and `tool_count == 26`
    - `workspace_dir` is writable (`workspace_free_gb` sufficient — long 2 GB+ split recordings create large takes; free space via `export_take(..., discard_take_audio=True)` or `delete_take` when done)
    - Your target audio directory is inside `allowed_roots` (`AMBIENTSOUND_ALLOWED_ROOTS`).

@@ -2325,9 +2325,7 @@ def compute_clean_sections(
     largest_untouched_raw_min = int(longest_gap_s // 60.0)
 
     cand_durations = [
-        d
-        for d in YOUTUBE_ASMR_DURATIONS_MIN
-        if d * 60.0 <= total_dur + 1e-6 and (d > 10 or total_dur < 1800.0)
+        d for d in YOUTUBE_ASMR_DURATIONS_MIN if d * 60.0 <= total_dur + 1e-6
     ]
 
     top_gaps_src = [g for g in untouched_gaps if (g[1] - g[0]) >= 60.0] or untouched_gaps
