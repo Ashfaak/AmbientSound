@@ -804,7 +804,6 @@ def detect_synthetic_beeps(
             if len(p_freqs) < 4:
                 continue
             core_f = np.asarray(p_freqs[1:-1] if len(p_freqs) >= 5 else p_freqs, dtype=np.float64)
-            core_a = np.asarray(p_amps[1:-1] if len(p_amps) >= 5 else p_amps, dtype=np.float64)
             f_med = float(np.median(core_f))
             f_std = float(np.std(core_f))
             f_ptp = float(np.ptp(core_f))
@@ -813,7 +812,9 @@ def detect_synthetic_beeps(
                 continue
 
             amp_arr = np.asarray(p_amps, dtype=np.float64)
-            mid_std = float(np.std(core_a)) if core_a.size >= 2 else 0.0
+            mid_lo = max(0, amp_arr.size // 4)
+            mid_hi = min(amp_arr.size, max(mid_lo + 1, (3 * amp_arr.size) // 4))
+            mid_std = float(np.std(amp_arr[mid_lo:mid_hi])) if mid_hi > mid_lo else 0.0
             if mid_std > 2.2:
                 continue
 
